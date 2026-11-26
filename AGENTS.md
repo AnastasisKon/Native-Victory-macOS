@@ -52,6 +52,7 @@ You need your own copy of the game. Windowed, for a person: `tools/macos/run-nat
 
 ## How to work
 
+0. If several agents share this machine or repository, read [docs/multi-agent.md](docs/multi-agent.md) first (branch naming, claiming issues, the game-run lock).
 1. Reproduce with a headless run and the trace variables. Read the log and the image dumps.
 2. Hold one hypothesis at a time and prove it with a trace or dump before changing code.
 3. Fix it in the shared code, with a unit test that fails without the fix.

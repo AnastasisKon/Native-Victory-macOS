@@ -16,6 +16,8 @@ use victory_metal::metal::Metal;
 
 #[path = "addr_tests.rs"]
 mod addr_tests;
+#[path = "scaled_vertex_tests.rs"]
+mod scaled_vertex_tests;
 #[path = "shader_tests.rs"]
 mod shader_tests;
 #[path = "state_tests.rs"]

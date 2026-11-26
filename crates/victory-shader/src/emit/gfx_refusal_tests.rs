@@ -1366,8 +1366,8 @@ fn refusal6_all_42_vertex_fetch_formats_and_partial_loads_lower() {
 #[test]
 fn refusal6_unsupported_vertex_fetch_formats_remain_refused() {
     let bad_tbuffer: &[(u8, u32, &str)] = &[
-        (58, 4, "8_8_8_8 Uscaled"),
-        (59, 4, "8_8_8_8 Sscaled"),
+        (9, 1, "16 Uscaled"),
+        (10, 1, "16 Sscaled"),
         (44, 4, "2_10_10_10 Unorm (low 2-bit)"),
         (43, 3, "10_11_11 Float (reversed)"),
         (54, 4, "10_10_10_2 Uint"),
@@ -1406,4 +1406,33 @@ fn refusal6_unsupported_vertex_fetch_formats_remain_refused() {
             .contains("a vertex fetch format the host's vertex layout lacks"),
         "untyped buffer_load_format: got `{err}`"
     );
+}
+
+#[test]
+fn scaled_byte_vertex_fetches_lower_with_integer_inputs() {
+    for (format, channels, name, comp) in [
+        (3, 1, "VBB1", 5), (4, 1, "VBC1", 4),
+        (16, 2, "VBB2", 5), (17, 2, "VBC2", 4),
+        (58, 4, "VBB4", 5), (59, 4, "VBC4", 4),
+    ] {
+        for count in 1..=channels {
+            for rect in [false, true] {
+                for wave64 in [false, true] {
+                    let code = tbuffer_fetch_vs(format, count);
+                    let out = lower_vs(&code, wave64, vertex_table_layout(), rect).unwrap();
+                    let inputs = parsed_isg1(&out.dxil);
+                    let elements: Vec<_> = inputs.iter().filter(|e| e.name == name).collect();
+                    assert_eq!(elements.len(), if rect { 3 } else { 1 });
+                    for e in elements {
+                        assert_eq!(e.comp, comp);
+                        assert_eq!(u32::from(e.cols), channels);
+                    }
+                }
+            }
+        }
+        if channels < 4 {
+            let code = tbuffer_fetch_vs(format, channels + 1);
+            assert!(lower_vs(&code, true, vertex_table_layout(), false).is_err());
+        }
+    }
 }

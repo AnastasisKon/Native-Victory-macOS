@@ -11007,6 +11007,11 @@ impl<'a> Lower<'a> {
         if !by_index || offset >= 0x1000 {
             return Err("a vertex fetch that is not indexed or has a large offset");
         }
+        let scaled = match (typed, format.and_then(buffer_format)) {
+            (true, Some((_, Numeric::Uscaled))) => Some(Cast::UiToFp),
+            (true, Some((_, Numeric::Sscaled))) => Some(Cast::SiToFp),
+            _ => None,
+        };
         let (kind, comp, channels) = match (typed, format.and_then(buffer_format)) {
             (false, _) if inst.name() == "buffer_load_ubyte" => ('B', 5, 1),
             (false, _) if inst.name() == "buffer_load_sbyte" => ('C', 4, 1),
@@ -11033,8 +11038,8 @@ impl<'a> Lower<'a> {
                     ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Sint) => ('K', 4),
                     ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Unorm) => ('N', 9),
                     ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Snorm) => ('Q', 9),
-                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Uint) => ('B', 5),
-                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Sint) => ('C', 4),
+                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Uint | Numeric::Uscaled) => ('B', 5),
+                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Sint | Numeric::Sscaled) => ('C', 4),
                     ([10, 10, 10, 2], Numeric::Unorm) => ('P', 9),
                     ([10, 10, 10, 2], Numeric::Snorm) => ('T', 9),
                     ([11, 11, 10], Numeric::Float) => ('G', 9),
@@ -11079,11 +11084,21 @@ impl<'a> Lower<'a> {
                 let Val::I32(v) = self.load_any_input(id, k as u8) else {
                     return Err("a vertex input");
                 };
+                // Fetch scaled formats through the existing integer vertex layout, then
+                // convert their numeric value (not normalize or reinterpret the bits).
+                // Do this before rectangle reconstruction, which must see float values.
+                let v = if let Some(cast) = scaled {
+                    let f32t = self.s.t.f32;
+                    let f = self.s.m.cast(self.cur, cast, v, f32t);
+                    self.as_int(f)
+                } else {
+                    v
+                };
                 x[corner] = Some(v);
             }
             loaded.push(x);
         }
-        let float = !matches!(kind, 'U' | 'I' | 'W' | 'K' | 'B' | 'C');
+        let float = scaled.is_some() || !matches!(kind, 'U' | 'I' | 'W' | 'K' | 'B' | 'C');
         if let ([[Some(a0), Some(b0), Some(d0)], [Some(a1), Some(b1), Some(d1)], ..], true, None) =
             (&loaded[..], float, self.rect_corner)
         {

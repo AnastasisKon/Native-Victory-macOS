@@ -521,3 +521,19 @@ The title's texture formats are DXGI numbers (`resource::pc_format` only renames
 | 54 | R16_FLOAT | 512x512 | R16Float |
 
 Integer render targets never blend (Metal refuses a pipeline that blends one), whatever the state says. B5G5R5A1_UNORM (86, a 1024x4096 render target) and B4G4R4A4_UNORM (115, a 2560x1440 render target) map to Metal's packed formats. A GPU test (`victory-metal` `packed_16_bit_channel_order`) pins their bit order. `BGR5A1Unorm` matches DXGI: blue in bits 0-4, green in 5-9, red in 10-14, alpha in bit 15. `ABGR4Unorm` holds alpha in bits 0-3, blue in 4-7, green in 8-11 and red in 12-15, where DXGI has blue, green, red, alpha from the low nibble up. So title bytes of format 115 are rotated left by 4 bits as they are uploaded (`textures::to_host`). The host's own render writes and samples agree with each other, and host textures never go back to title memory, so only uploads need the conversion. Before the story loads, no draw or dispatch binds any of these textures (the targets traced are formats 28, 29 and 19), so which shaders write and read them is still to be seen. With the mapping, the presented images up to the loading screen look the same.
+
+### Scaled byte vertex fetches
+
+The shared shader translator supports GFX10 `8`, `8_8`, and `8_8_8_8` USCALED/SSCALED
+vertex fetches, including partial channel loads. The existing unsigned/signed integer
+stage-in formats supply zero/sign-extended values, which the shader converts to float
+before rectangle reconstruction. Scaling here is numeric conversion, not normalization:
+unsigned 255 becomes 255.0 and signed byte 0x80 becomes -128.0. The GFX10 encodings were
+checked with LLVM's `gfx1030` assembler; the conversion also follows the existing
+`Numeric::Uscaled`/`Sscaled` buffer decoding in `emit/lower.rs`.
+
+Synthetic tests cover translation in wave32/wave64 and rectangle modes, all 256 byte
+values in every loaded channel through Metal readback, preserved registers after partial
+loads, and reconstructed rectangles compared with explicit floating-point quads. 16-bit
+and packed scaled formats remain unsupported by vertex fetches. No game shaders were
+used, so this does not establish which of issue #4's reported title shaders now translate.

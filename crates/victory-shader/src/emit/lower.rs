@@ -7659,7 +7659,7 @@ impl<'a> Lower<'a> {
         }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
             let r = if v.dpp.is_some() {
-                Err("a compare with DPP")
+                self.compare_dpp(inst, rest)
             } else {
                 self.compare(inst, rest)
             };
@@ -9991,6 +9991,33 @@ impl<'a> Lower<'a> {
                 .entry(w)
                 .or_insert(Val::Missing("a lane mask read as data"));
         }
+    }
+
+    /// A compare whose first source is read from another lane (`_dpp`): the
+    /// permuted source takes source 0's place, as for any other DPP
+    /// operation. What a lane the DPP masks leave out keeps of its old
+    /// destination bit the instruction does not read (only a guarded VGPR
+    /// write reads its old value), so a mask that leaves lanes out is
+    /// refused; with `bound_ctrl` every lane reads 0 there instead, and the
+    /// compare lowers. The always-true and always-false compares write a
+    /// constant mask, and stay refused: what the masked-out lanes keep of
+    /// one is not documented.
+    fn compare_dpp(&mut self, inst: &Inst, rest: &str) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let (op, _) = rest.rsplit_once('_').ok_or("a compare")?;
+        if matches!(op, "f" | "t") {
+            return Err("a compare with DPP");
+        }
+        let (x, enable) = self.dpp(inst, v.dpp.ok_or("a compare with DPP")?)?;
+        if enable.is_some() {
+            return Err("a compare with DPP");
+        }
+        self.src0 = Some(x);
+        let r = self.compare(inst, rest);
+        self.src0 = None;
+        r
     }
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {

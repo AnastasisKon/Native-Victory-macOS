@@ -2277,3 +2277,81 @@ fn whole_wave_sections_name_the_step_they_do_not_follow() {
         );
     }
 }
+// =========================================================================
+// "a compare with DPP"
+// =========================================================================
+
+/// A compare whose first source is read from another lane (`_dpp`) lowers:
+/// the permuted source takes source 0's place, within a quad and across a
+/// row with `bound_ctrl` (compute reaches any lane, and the lanes whose
+/// source lies outside the row read 0). A row shift whose masked-out lanes
+/// keep their old destination bit stays refused: the compare does not read
+/// the mask it keeps (nor does the always-false compare, a constant mask).
+/// In a pixel shader a quad permutation lowers (the pixel layout shares the
+/// quad); a row shift is still the cross-lane operation outside compute it
+/// was.
+#[test]
+fn compares_with_dpp_lower() {
+    // v_cndmask_b32_e64 v1, 0, 1, vcc: the mask the compare holds is
+    // read, so a refusal surfaces.
+    let consume = [
+        0xD501_0001, // v_cndmask_b32_e64 v1, 0, 1, vcc
+        0x01A9_0280,
+    ];
+    let cs = |compare: &[u32]| {
+        let mut setup = compare.to_vec();
+        setup.extend_from_slice(&consume);
+        store_cs(8, &setup, [0xE010_2000, 0x8002_0100])
+    };
+    // v_cmp_gt_u32 vcc, v1, v0 quad_perm:[3,2,0,1]
+    let quad = [0x7D88_02FA, 0xFF00_4B00];
+    // v_cmp_gt_u32 vcc, v1, v0 row_shr:1 bound_ctrl:1
+    let shr_zero = [0x7D88_02FA, 0xFF09_1100];
+    for (asm, compare) in [("quad_perm", &quad[..]), ("bound_ctrl:1", &shr_zero[..])] {
+        let l = cs(compare).unwrap_or_else(|e| panic!("{asm}: {e}"));
+        assert!(!l.dxil.is_empty(), "{asm}");
+    }
+
+    // Without `bound_ctrl` the masked-out lanes keep their old destination
+    // bit, which the compare does not read.
+    let shr_keep = [0x7D88_02FA, 0xFF01_1100]; // row_shr:1
+    let err = cs(&shr_keep).err().expect("expected refusal");
+    assert!(
+        err.to_string().contains("a compare with DPP"),
+        "got `{err}`"
+    );
+    // The always-false compare writes a constant mask.
+    let always_f = [0x7C00_00FA, 0xFF00_4B00]; // v_cmp_f_f32 vcc, v0, v0 quad_perm
+    let err = cs(&always_f).err().expect("expected refusal");
+    assert!(
+        err.to_string().contains("a compare with DPP"),
+        "got `{err}`"
+    );
+
+    // In a pixel shader a quad permutation lowers (the pixel layout shares
+    // the quad), a row shift does not.
+    let mut quad_ps = quad.to_vec();
+    quad_ps.extend([
+        0x8782_7E6A, // s_and_b64 s[2:3], vcc, exec
+        0x8504_8987, // s_cselect_b32 s4, 7, 9
+        0x7E00_0204, // v_mov_b32 v0, s4
+        0xF800_180F,
+        0x0000_0000, // exp mrt0 v0, v0, v0, v0 done vm
+        0xBF81_0000,
+    ]);
+    for wave32_host in [false, true] {
+        let out = lower_ps(&quad_ps, true, vec![], vec![], 0, 0, vec![], wave32_host)
+            .unwrap_or_else(|e| panic!("wave32_host={wave32_host}: {e}"));
+        assert!(!out.dxil.is_empty());
+    }
+    let mut shr_ps = shr_keep.to_vec();
+    shr_ps.extend(quad_ps[2..].to_vec());
+    let err = lower_ps(&shr_ps, true, vec![], vec![], 0, 0, vec![], false)
+        .err()
+        .expect("expected refusal");
+    assert!(
+        err.to_string()
+            .contains("a cross-lane operation outside compute"),
+        "got `{err}`"
+    );
+}

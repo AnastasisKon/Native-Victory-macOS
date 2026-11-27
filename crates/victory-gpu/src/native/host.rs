@@ -503,6 +503,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// (`HEAP_VIEWS`: a translated shader reads no entry past it, and reads the host's null
     /// buffer views just below it, see [`Self::write_null_buffers`]). A heap too long for the
     /// pairs ([`addr::fits`]) stays as long as it is.
+    ///
+    /// shortcut: every such heap is `HEAP_VIEWS` long (48 MiB of Metal entries, and its stride
+    /// table 8 MiB, both resident from its first dispatch) because a translated shader's clamp
+    /// and its null view index are constants, not the heap's length: sizing heap and table to
+    /// `count` needs the shader to read a per-heap bound (a root constant, say) instead.
     fn resource_entries(count: usize) -> usize {
         let entries = count + addr::RESERVED;
         if addr::fits(count) {

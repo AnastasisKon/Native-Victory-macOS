@@ -59,15 +59,7 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Shared>> {
     TITLE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// `VICTORY_TRACE_TITLE_LOCK=1`: once a second, how long `TITLE` was waited for and held, by the
-/// line of this file that took it (the 12 that held it longest).
-pub(super) fn lock_traced() -> bool {
-    env_set!("VICTORY_TRACE_TITLE_LOCK")
-}
-
-/// With [`lock_traced`]: microseconds a submission's first taking of the lock spent in
-/// `keep_named`, `keep_to_budget`, `give_up_covered` and the probes (`Title::sync_jobs`).
-pub(super) static SYNC_PHASES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+use super::textures::{lock_traced, SYNC_PHASES};
 
 /// Adds one taking of `TITLE` at `at` (file, line) to the trace, and logs it once a second.
 fn note_lock(at: (&'static str, u32), wait: std::time::Duration, hold: std::time::Duration) {

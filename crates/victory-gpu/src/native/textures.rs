@@ -1265,10 +1265,10 @@ impl<B: PresentBackend> Title<B> {
         for key in self.host.take_wanted() {
             self.realize(key);
         }
-        let timed = super::glue::lock_traced();
+        let timed = lock_traced();
         let phase = |i: usize, since: std::time::Instant| {
             if timed {
-                super::glue::SYNC_PHASES[i].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                SYNC_PHASES[i].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             std::time::Instant::now()
         };
@@ -1593,6 +1593,16 @@ impl SyncCost {
     }
 }
 
+/// `VICTORY_TRACE_TITLE_LOCK=1`: once a second, how long the macOS host's `TITLE` lock was waited
+/// for and held, by the line of `glue.rs` that took it (the 12 that held it longest).
+pub(super) fn lock_traced() -> bool {
+    env_set!("VICTORY_TRACE_TITLE_LOCK")
+}
+
+/// With [`lock_traced`]: microseconds submissions spent in `keep_named`, `keep_to_budget`,
+/// `give_up_covered` and the probes (`Title::sync_jobs`).
+pub(super) static SYNC_PHASES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// The texture budget: how many bytes of sampled host texture copies the host keeps before it
 /// gives up the least recently used of those it may ([`Title::keep_to_budget`]).
 #[derive(Default)]
@@ -1745,8 +1755,8 @@ impl<B: PresentBackend> Title<B> {
         let mut all: Vec<&NativeList<B>> = lists.collect();
         all.extend(held.iter().map(|l| &**l));
         let named = self.host.resources_named(all.into_iter());
-        if super::glue::lock_traced() {
-            super::glue::SYNC_PHASES[0].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        if lock_traced() {
+            SYNC_PHASES[0].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         for &key in &named {
             if self.host.is_evicted(key) {

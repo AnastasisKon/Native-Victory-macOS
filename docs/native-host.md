@@ -644,6 +644,22 @@ a cycle. Of the 9,995 dumped pixel programs, 273 more translate (7,606 to 7,879)
 24 lane-mask joins stay refused (285 before); the vertex corpus is unchanged. Test:
 `emit::gfx_refusal_tests::a_pixel_program_joins_data_an_else_part_clears_with_its_exec`.
 
+A join of SGPR data whose every edge brings copies of one value is that value, whatever edges
+the lanes took (`Lower::copy_leaf`, `copied_number`): the copies followed are `s_mov`, a swap's
+last XOR (`structure::xored_back`) and a spill read back that the structure proved is the same
+value on every path (`restored`). This follows from the instructions alone: a copy keeps every
+bit, so the register holds the one number on each path. With console lanes (compute) a lane mask
+leaf gives its ballot. The 32-lane programs that rotate a value through a mask's register by two
+XOR swaps hit it: the second swap's last XOR gives back the first one's, which the structure
+counts as a mask (it XORed the mask's register), so the copy had no number and the join was
+refused as "a lane mask read as data". Joins of two different values stay refused. On the
+tmi-agent corpus (21,600, `local/pr-stack` 4cd9e726 with the tile-class commits): 9 more
+translate (compute `28a2afab9c479d55`, `825365a94651e7ea`, `9171e6576a99ef14`,
+`b797dd042ea5b43c`, three pixel and two vertex programs), none regress, 3 outputs change (joins
+now numbers: copies of an EXEC mask in `0ef1184e45342d20`, of a constant-buffer dword in two
+vertex programs), and 137 compute programs move on to "a descriptor read only as data". Tests: `gfx_refusal_tests::a_join_of_swapped_copies_of_one_value_is_that_value`,
+`a_join_of_copies_of_two_values_stays_refused`.
+
 In a mesh shader, a uniform branch can skip a block that replaces a scalar mask with a
 vector compare result. At the join each mesh thread uses its group index modulo the console
 wave size to read its bit. Wave64 takes lanes 32–63 from the high dword on the same edge.
@@ -1794,6 +1810,42 @@ every stage now translates. Tests (`victory-gpu`, Metal): `stale_tests`. Still r
 for now: texture size queries in a waterfall loop that test dword 1 against 0 for a null view
 (the view-address table holds dword 1 as width bits only, so a texture of width 4k + 1 would
 read as null); buffer dwords 2-3 and image dwords 5-7, which no host table holds.
+
+**Null tests of image dword 1.** Before it sizes an image from its descriptor the console
+compiler tests dword 1 against 0 (`s_cmp_eq_i32 d1, 0; s_cselect_b32 size, 0, size`): a null
+descriptor is all zeros, and a view's dword 1 is never 0, since its format field (bits 20-28) is
+nonzero for every image format (RDNA2 `IMG_FORMAT` 0 is invalid). The rebuilt dword 1 of
+`Lower::descriptor_data` held only the width bits (30-31, width - 1), so a view of width 4k + 1
+read as null and was sized 0, and a null view (host size 0) read as one of width 65,536. When the
+code tests the dword against 0 and otherwise reads only its width bits (`s_bfe_u32` or
+`s_lshr_b32` from bit 30) or passes it to an image instruction as the descriptor, and no join
+takes it (`Lower::width_bits_or_null_test`), dword 1 is now 0 for a view of size 0 and has
+format bit 20 set otherwise: exact for such code, which sees no other bit. Anything else that
+reads it keeps the old dword. The view-address table path (`view_addresses`, a size read with no
+use of the view) is unchanged. Test (`victory-gpu`, Metal):
+`heap_tests::an_image_whose_width_bits_in_dword_1_are_0_is_no_null_descriptor` (a 5x8 image
+read as null before). Corpus (tmi-agent, 21,600): 0 newly translated, 0 regressed, 2,739 outputs
+changed (94 compute, 589 pixel, 2,056 vertex), each a program whose rebuilt dword 1 is tested
+against 0.
+
+**A size-only waterfall loop over a shifted heap index.** Many world compute programs (light and
+volume passes) size a 1D image in one waterfall loop and read it in a second: each loop reads the
+first lane's heap index (`v_readfirstlane_b32`), shifts it left by 5 to the byte offset of whole
+descriptors (`s_lshl_b32 s, s, 5`) and loads the descriptor at that offset, the sizing loop only
+its first four dwords. A load read only as data takes its view kind from another load of the
+same descriptor; the two were the same only when the offset was the first-lane read itself, so
+the sizing load fell to the view-address table, which holds no dword 2 or 3 for a four-dword
+load, and the program was refused ("a descriptor read only as data", 705 compute programs). Two
+offsets are now the same also when each is the first-lane read of one VGPR value shifted left by
+one constant: every lane of both loops then names the same heap entry. Test:
+`lower::tests::a_waterfall_loop_that_sizes_by_a_shifted_index_takes_the_kind_of_the_sampled_one`.
+Corpus against the null-test commit: 358 newly translated (355 compute, 3 pixel), 0 regressed, 6
+compute outputs changed (sizes now from the view itself, not the view-address table), 350 refused
+for another reason (153 "a lane-mask join of an untracked mask: data, at a join of several
+edges", 93 "a lane mask holding lanes elsewhere read as data: a program input", 74 "an image's
+dwords N to N", 28 "a value the translation could not make", 2 others). Of the windowed world
+run's 677 dropped compute dispatches a frame (20261127-235056), the 85 programs now translated
+made 181.
 
 ## The device's own memory ceiling, logged at native host startup (issue #8)
 

@@ -12399,6 +12399,10 @@ impl<'a> Lower<'a> {
             loaded.push(x);
         }
         let float = scaled.is_some() || !matches!(kind, 'U' | 'I' | 'W' | 'K' | 'B' | 'C');
+        // shortcut: the first float fetch of two or more channels picks the right-angle corner
+        // (taken to be the position), and a float or scaled attribute fetched before it keeps
+        // the stored order, so its fourth corner is wrong when its corners imply another; to
+        // be upgraded when a title is seen fetching an attribute before the position (#49).
         if let ([[Some(a0), Some(b0), Some(d0)], [Some(a1), Some(b1), Some(d1)], ..], true, None) =
             (&loaded[..], float, self.rect_corner)
         {

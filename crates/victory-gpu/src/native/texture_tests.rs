@@ -213,6 +213,42 @@ fn a_texture_blank_for_thousands_of_submissions_is_still_probed() {
     });
 }
 
+/// A blank texture written in the same submission as other blank textures is still probed in it:
+/// one leaving the round after the wrap moved the last key into its place, which was probed a
+/// second time if the round had probed it already, and the key just before the round's start not
+/// at all.
+#[test]
+fn a_blank_texture_leaving_after_the_wrap_does_not_skip_another() {
+    let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
+    const SIZE: usize = 64 * 64 * 4;
+    let Some(pool) = pool(9141, 8 * SIZE / page_size().max(16384) + 1) else { return };
+    // Four blank textures, only they in the list in this order, the round starting at the last:
+    // it probes 3, wraps to 0. Writing 1 and 2: 1 leaves and its place takes 3, probed already.
+    // Writing 0, 1 and 2: 0 leaves (3 takes its place, probed), then 1 leaves and 2 takes its
+    // place, not probed yet.
+    for (case, written, uploads) in [(0, &[1, 2][..], [1, 2, 2, 1]), (1, &[0, 1, 2][..], [2, 2, 2, 1])] {
+        let at = |i: usize| (4 * case + i) * SIZE;
+        let keys: Vec<usize> = (0..4)
+            .map(|i| crate::resource::test_texture_at(pool.va(at(i)), (64, 64), 1, 28, Swizzle::LINEAR.0, 0) as usize)
+            .collect();
+        with_title(|t| {
+            for &key in &keys {
+                assert!(t.realize(key));
+            }
+            t.sync_dirty_without_probe_deadline();
+            let others = std::mem::replace(&mut t.blank_keys, keys.clone());
+            t.blank_cursor = 3;
+            for &i in written {
+                pool.write(at(i), &[1u8; SIZE]);
+            }
+            t.sync_dirty_without_probe_deadline();
+            let got: Vec<u64> = keys.iter().map(|&k| t.uploads_of(k)).collect();
+            t.blank_keys.extend(others);
+            assert_eq!(got, uploads, "every written texture is uploaded at the next submission (writing {written:?})");
+        });
+    }
+}
+
 /// A texture rewritten whole (a movie's chroma plane) is not read whole at every submission, yet
 /// a small write its samples miss is still seen within `WHOLE_EVERY` submissions, and from then
 /// on at the next one (a glyph atlas).

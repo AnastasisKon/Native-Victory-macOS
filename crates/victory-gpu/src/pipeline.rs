@@ -1611,9 +1611,16 @@ mod tests {
 /// with `user_sgprs` user SGPRs and `records` (32-byte `0x41` records), as the title passes them.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn test_compute_container(code: &[u32], records: &[[u8; 32]], user_sgprs: u32) -> Vec<u8> {
+    test_compute_container_of(code, records, user_sgprs, 32, false)
+}
+
+/// [`test_compute_container`] of `threads` x 1 x 1 in a group, in 64-lane waves if `wave64`.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_compute_container_of(code: &[u32], records: &[[u8; 32]], user_sgprs: u32, threads: u32, wave64: bool) -> Vec<u8> {
     let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-    // Thread-group size 32, 1, 1; wave32; 16 VGPRs.
-    let registers = words(&[0, 0, 0, 32 | 1 << 16, 1 | 1 << 4 << 16, 1, user_sgprs << 1]);
+    // Thread-group size `threads`, 1, 1; the wave size; 16 VGPRs (granules of 8, or 4 in wave64).
+    let (flags, granules) = if wave64 { (0, 3) } else { (1 << 4 << 16, 1) };
+    let registers = words(&[0, 0, 0, threads | 1 << 16, 1 | flags, granules, user_sgprs << 1]);
     let code = words(code);
     let mut metadata = words(&[0x403, 0, code.len() as u32 / 4, 0, 0]);
     metadata.extend([0x40, 4, records.len() as u8, 0]);

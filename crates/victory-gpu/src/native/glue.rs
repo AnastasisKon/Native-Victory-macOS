@@ -2130,6 +2130,14 @@ fn subresource_mip_slice(info: &super::textures::TextureInfo, subresource: u32) 
     (sub < mips * slices).then(|| (sub % mips, sub / mips))
 }
 
+/// The host texture's level for title level `mip`: `None` for a top level the host texture was
+/// made without (`VICTORY_TEXTURE_DROP_TOP_MIP`). Host level `mip - dropped` has the title level's
+/// size. Shortcut: a copy to or from a dropped level is skipped, not scaled; the switch is off by
+/// default.
+fn host_mip(info: &super::textures::TextureInfo, mip: usize) -> Option<usize> {
+    mip.checked_sub(info.dropped_levels())
+}
+
 fn mip_dims(info: &super::textures::TextureInfo, mip: usize) -> [usize; 3] {
     [
         (info.width as usize >> mip).max(1),
@@ -2288,17 +2296,20 @@ pub(crate) fn copy_texture_resource(this: This, dst: This, src: This) -> bool {
         }
         for slice in 0..slices {
             for mip in 0..mips {
+                let (Some(src_mip), Some(dst_mip)) = (host_mip(&src_info, mip), host_mip(&dst_info, mip)) else {
+                    continue;
+                };
                 let s = mip_dims(&src_info, mip);
                 let d = mip_dims(&dst_info, mip);
                 let size = [s[0].min(d[0]), s[1].min(d[1]), s[2].min(d[2])];
                 l.list.copy_texture_region(
                     &src_tex,
-                    mip,
+                    src_mip,
                     slice,
                     [0, 0, 0],
                     size,
                     &dst_tex,
-                    mip,
+                    dst_mip,
                     slice,
                     [0, 0, 0],
                 );
@@ -2355,6 +2366,9 @@ pub(crate) fn copy_texture_region(
             if size.contains(&0) {
                 return true;
             }
+            let (Some(src_mip), Some(dst_mip)) = (host_mip(&src_info, src_mip), host_mip(&dst_info, dst_mip)) else {
+                return true;
+            };
             with_list(this, |t, l| {
                 let (Some(src_tex), Some(dst_tex)) =
                     (t.texture_of(src.resource as usize), t.texture_of(dst.resource as usize))
@@ -2405,6 +2419,9 @@ pub(crate) fn copy_texture_region(
             if (0..3).any(|i| dst_origin[i].saturating_add(size[i]) > dst_dims[i]) {
                 return false;
             }
+            let Some(dst_mip) = host_mip(&dst_info, dst_mip) else {
+                return true;
+            };
             let Some((src_addr, len, row_pitch, slice_pitch)) =
                 footprint_span(src.resource, &src.footprint, src_at, size_u32)
             else {
@@ -2446,6 +2463,9 @@ pub(crate) fn copy_texture_region(
             if size.contains(&0) {
                 return true;
             }
+            let Some(src_mip) = host_mip(&src_info, src_mip) else {
+                return true;
+            };
             let size_u32 = size.map(|v| v as u32);
             let Some((dst_addr, len, row_pitch, slice_pitch)) =
                 footprint_span(dst.resource, &dst.footprint, origin, size_u32)

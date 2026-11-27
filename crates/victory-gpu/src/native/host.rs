@@ -1591,6 +1591,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         let s = format!("{slot}.{k}=placed:{}", d(address as usize, placed_info_of(address, &res)));
                         if u { writes.push(s) } else { reads.push(s) }
                     }
+                    // A constant buffer view: its address, size and first four dwords now.
+                    Some(View::Constant(a, size)) => {
+                        let mut w = [0u8; 16];
+                        let ok = a != 0 && super::safe_read(a as *const u8, &mut w);
+                        let words: Vec<String> = w.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect();
+                        reads.push(format!("{slot}.{k}=cbv:{a:#x}+{size}:{}", if ok { words.join(",") } else { "unreadable".into() }));
+                    }
                     Some(View::Placed(u, res, _)) => {
                         // Dimension 1 is a buffer, which the host reads as memory.
                         let s = match res[0] { 1 => format!("{slot}.{k}=placed:buf"), n => format!("{slot}.{k}=placed-dim{n}") };

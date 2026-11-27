@@ -1740,3 +1740,93 @@ fn a_lane_holding_half_a_wave_maximum_is_refused() {
     let why = refusal(&max_read_at_lane(0));
     assert!(why.as_deref().is_some_and(|w| w.contains("no reduction or prefix")), "{why:?}");
 }
+
+/// A wave32 prefix sum as the title's compute programs end it: an inclusive sum in each row of 16
+/// lanes (`row_shr` 1, 2, 4, 8), then the upper row alone, under `s_bfm_b32 exec_lo, 16, 16`,
+/// adds lane 15 through `v_permlanex16_b32`. The `s_bfm` is a constant lane set, as an `s_mov` of
+/// 0xffff0000 is; it was refused as "s_bfm_b32 is not supported". Lane `i` stores the sum of
+/// `1..=i + 1` over the lanes that were on before the section, the others nothing.
+#[test]
+fn a_wave32_prefix_sum_whose_upper_row_s_bfm_selects_runs() {
+    let section = [
+        0x4A08_0081u32, // v_add_nc_u32 v4, 1, v0
+        0xBE88_3DC1,    // s_or_saveexec_b32 s8, -1
+        0xD501_0001,
+        0x0022_0880, // v_cndmask_b32_e64 v1, 0, v4, s8
+        0x4A02_02FA,
+        0xFF01_1101, // v_add_nc_u32_dpp v1, v1, v1 row_shr:1
+        0x4A02_02FA,
+        0xFF01_1201, // v_add_nc_u32_dpp v1, v1, v1 row_shr:2
+        0x4A02_02FA,
+        0xFF01_1401, // v_add_nc_u32_dpp v1, v1, v1 row_shr:4
+        0x4A02_02FA,
+        0xFF01_1801, // v_add_nc_u32_dpp v1, v1, v1 row_shr:8
+        0x927E_9090, // s_bfm_b32 exec_lo, 16, 16
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+        0xBEFE_0308, // s_mov_b32 exec_lo, s8
+        0x7E04_0301, // v_mov_b32 v2, v1
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let sum = |i: u32| (i + 1) * (i + 2) / 2;
+    let got = run32(&section, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, (0..32).map(sum).collect::<Vec<_>>());
+    // Lanes 20 and up off before the section: their terms are the identity and they store nothing.
+    let mut below_20 = vec![
+        0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+        0xBE8A_3C6A, // s_and_saveexec_b32 s10, vcc_lo
+    ];
+    below_20.extend(section);
+    let got = run32(&below_20, 0);
+    let want: Vec<u32> = (0..32).map(|i| if i < 20 { sum(i) } else { CANARY }).collect();
+    assert_eq!(got, want);
+}
+
+/// The wave64 form of the title's prefix sums: an inclusive sum in each row of 16 lanes, then the
+/// upper row of each half (`s_bitreplicate_b64_b32 exec, 0xff00ff00`) adds lane 15 of its half
+/// through `v_permlanex16_b32`, then the upper half (`s_bfm_b64 exec, 32, 32`) adds lane 31. Lane
+/// `i` stores the sum of `1..=i + 1`, across the two host waves of the console wave.
+#[test]
+fn a_wave64_prefix_sum_whose_rows_s_bitreplicate_and_s_bfm_select_runs() {
+    let words = [
+        0x4A08_0081u32, // v_add_nc_u32 v4, 1, v0
+        0xBE88_25C1,    // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0001,
+        0x0022_0880, // v_cndmask_b32_e64 v1, 0, v4, s[8:9]
+        0x4A02_02FA,
+        0xFF01_1101, // v_add_nc_u32_dpp v1, v1, v1 row_shr:1
+        0x4A02_02FA,
+        0xFF01_1201, // v_add_nc_u32_dpp v1, v1, v1 row_shr:2
+        0x4A02_02FA,
+        0xFF01_1401, // v_add_nc_u32_dpp v1, v1, v1 row_shr:4
+        0x4A02_02FA,
+        0xFF01_1801, // v_add_nc_u32_dpp v1, v1, v1 row_shr:8
+        0xBEFE_3BFF,
+        0xFF00_FF00, // s_bitreplicate_b64_b32 exec, 0xff00ff00
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+        0x92FE_A0A0, // s_bfm_b64 exec, 32, 32
+        0xD760_0009,
+        0x0001_3F01, // v_readlane_b32 s9, v1, 31
+        0x4A02_0209, // v_add_nc_u32_e32 v1, s9, v1
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0x7E04_0301, // v_mov_b32 v2, v1
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let got = run_io(&words, 0, 64, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, (0..64u32).map(|i| (i + 1) * (i + 2) / 2).collect::<Vec<_>>());
+}

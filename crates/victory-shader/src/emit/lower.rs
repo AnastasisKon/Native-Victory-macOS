@@ -16688,6 +16688,71 @@ mod tests {
         );
     }
 
+    /// The title's wave32 prefix sums finish their upper row with `v_permlanex16_b32` (lane 15 of
+    /// the row below), under EXEC set by `s_bfm_b32 exec_lo, 16, 16`: a constant lane set, as
+    /// `s_mov_b32 exec_lo, 0xffff0000` is. The section lowers to one unsigned prefix sum; it was
+    /// refused as "s_bfm_b32 is not supported".
+    #[test]
+    fn a_wave32_prefix_sum_may_set_its_upper_row_with_s_bfm() {
+        let sop1 = |sdst: u8, op: u8, ssrc0: u8| -> u32 {
+            0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | ssrc0 as u32
+        };
+        let vop2 = |vdst: u8, op: u8, src0: u16, vsrc1: u8| -> u32 {
+            (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+        };
+        let mut w = vec![sop1(0, 0x3D, 193)]; // s_or_saveexec_b32 s0, -1
+        w.extend([0xD501_0001, 0x0002_0080]); // v_cndmask_b32 v1, 0, v0, s0
+        for shift in [1u32, 2, 4, 8] {
+            // v_add_nc_u32_dpp v1, v1, v1 row_shr:shift
+            w.extend([vop2(1, 0x25, 0xFA, 1), 0xFF00_0001 | (0x110 + shift) << 8]);
+        }
+        w.push(0x8000_0000 | 0x24 << 23 | 126 << 16 | 0x90 << 8 | 0x90); // s_bfm_b32 exec_lo, 16, 16
+        w.extend([0xD778_0002, 0x0305_8301]); // v_permlanex16_b32 v2, v1, -1, -1
+        w.push(vop2(1, 0x25, 256 + 1, 2)); // v_add_nc_u32 v1, v1, v2
+        w.push(sop1(126, 0x03, 0)); // s_mov_b32 exec_lo, s0
+        w.push(0x3404_0082); // v_lshlrev_b32 v2, 2, v0
+        w.extend([0xD834_0000, 0x0000_0102]); // ds_write_b32 v2, v1
+        w.push(S_ENDPGM);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo { rsrc2: 1 << 15, threads: [32, 1, 1] }),
+            code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
+        assert_eq!(p.blocks[0].insts[6].name(), "s_bfm_b32");
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let l = super::lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+            atomic_locks: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
+            wave32_host: true,
+            zero_copy_memory: false,
+            rect_list: false,
+            copy_params: [0; 32],
+        })
+        .expect("the section lowers");
+        assert_eq!(
+            l.wave_prefix_calls,
+            vec![("dx.op.wavePrefixOp.i32".to_string(), vec![Some(121), None, Some(0), Some(1)])]
+        );
+    }
+
     #[test]
     fn unneeded_edges_propagates_across_deep_sgpr_phi_chains_without_quadratic_scans() {
         // 160 sequential per-lane diamonds carrying 32 live SGPRs (`s10..s41`) as SSA phis at

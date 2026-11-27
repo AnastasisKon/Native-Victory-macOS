@@ -2140,6 +2140,27 @@ impl<'a> Lower<'a> {
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
             Input::FrontFace => (13, 0),
+            // Guess (docs/native-host.md, "Pixel input enables"): the line stipple coordinate is 0.
+            // shortcut: right for triangles only, upgrade if a line draw reads it.
+            Input::LineStipple => return Val::I32(self.s.m.i32(0)),
+            // Guess (docs/native-host.md, "Pixel input enables"): the fixed-point position
+            // (`POS_FIXED_PT`) is the pixel's integer x in bits 0-15 and y in bits 16-31, as
+            // the programs read it (16-bit halves, and as an `a16` image address).
+            Input::FixedPosition => {
+                // The float position's bits (an input is loaded as i32).
+                let (Val::I32(x), Val::I32(y)) = (self.input(Input::Position(0)), self.input(Input::Position(1)))
+                else {
+                    return Val::Missing("a pixel system input the signature lacks");
+                };
+                let (entry, i32t, f32t) = (self.s.entry, self.s.t.i32, self.s.t.f32);
+                let x = self.s.m.cast(entry, Cast::Bitcast, x, f32t);
+                let y = self.s.m.cast(entry, Cast::Bitcast, y, f32t);
+                let x = self.s.m.cast(entry, Cast::FpToUi, x, i32t);
+                let y = self.s.m.cast(entry, Cast::FpToUi, y, i32t);
+                let k16 = self.s.m.i32(16);
+                let y = self.s.m.bin(entry, Bin::Shl, y, k16);
+                return Val::I32(self.s.m.bin(entry, Bin::Or, x, y));
+            }
             Input::Ancillary => {
                 let Some(e) = self.s.inputs.iter_mut().find(|e| e.kind == 12) else {
                     return Val::Missing("a pixel system input the signature lacks");
@@ -2200,7 +2221,6 @@ impl<'a> Lower<'a> {
                 let k24 = self.s.m.i32(24);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Shl, w, k24));
             }
-            _ => return Val::Missing("a pixel system input"),
         };
         let free = self
             .s

@@ -615,3 +615,54 @@ fn a_pixel_program_writes_exact_bits_to_an_r32uint_target() {
     // 1.0, 0.5, 0.5, 1.0 as halves.
     assert_eq!(&h[..8], &[0x00, 0x3c, 0x00, 0x38, 0x00, 0x38, 0x00, 0x3c]);
 }
+
+/// The bits of input VGPR `v` an R32Uint target gets, per texel of an 8x8 target, from a pixel
+/// program whose register image gives input enables `ena`.
+fn exported_input(ena: u32, v: u32) -> Option<Vec<u32>> {
+    let code = [
+        0xF800_1801, v, // exp mrt0 v<v>, off, off, off done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let bytes: Vec<_> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut meta = [0; 0x10];
+    meta[12] = 0x40;
+    let c = victory_shader::emit::graphics::container_with_inputs(HwStage::Ps, &bytes, &meta, Some(ena)).unwrap();
+    let ms = translate(HwStage::Vs, TRIANGLE);
+    let mut t = title()?;
+    let state = Graphics::guess_base().for_draw(vec![Format::R32Uint], None, vec![], &[], false);
+    let ps = shaders::translate_targets(&c, 1).unwrap();
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "pixel input") else {
+        panic!("{:?}", t.shaders);
+    };
+    let mut desc = TextureDesc::d2(Format::R32Uint, 8, 8);
+    desc.render_target = true;
+    let ids = t.host.texture(&desc).unwrap();
+    let mut list = NativeList::default();
+    list.set_render_targets(std::slice::from_ref(&ids), None);
+    list.clear_render_target(&ids, [1.0; 4]);
+    list.set_graphics_pipeline(&pso, Topology::Triangles);
+    list.set_graphics_binding(binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    let mut p = [0u8; 8 * 8 * 4];
+    t.host.backend.read_texture(&ids, 0, 0, &mut p, 8 * 4, 0);
+    Some(p.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+}
+
+/// A pixel program whose register image enables the fixed-point position (`SPI_PS_INPUT_ENA`
+/// 0x8080: line stipple in v0, unread, the fixed-point position in v1) gets the pixel's x | y << 16
+/// in v1: each texel holds its own coordinates. Guessed from the VGPRs it reads, v1 was the float y
+/// position.
+#[test]
+fn a_pixel_program_reads_its_fixed_point_position_where_the_register_image_says() {
+    let Some(words) = exported_input(0x8080, 1) else { return };
+    let want: Vec<u32> = (0..64u32).map(|i| i % 8 | (i / 8) << 16).collect();
+    assert_eq!(words, want);
+}
+
+/// Line stipple alone enabled (0x80): v0 is its coordinate, 0 for a triangle (a guess).
+#[test]
+fn a_pixel_program_reads_a_zero_line_stipple_coordinate_on_a_triangle() {
+    let Some(words) = exported_input(0x80, 0) else { return };
+    assert_eq!(words, vec![0; 64]);
+}

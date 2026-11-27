@@ -62,13 +62,30 @@ const RECORDS: usize = 0x10;
 /// A container with the part of `stage`'s `code` and `meta`, and the signatures inferred from the
 /// code.
 pub fn container(stage: HwStage, code: &[u8], meta: &[u8]) -> Result<Vec<u8>, ShaderError> {
-    let (program, sigs) = infer(stage, code, meta)?;
+    container_with_inputs(stage, code, meta, None)
+}
+
+/// [`container`], with a pixel program's input enables (`SPI_PS_INPUT_ENA`, [`ps_input_ena`])
+/// when the description's register image gives them: they say which input VGPRs the program
+/// gets, instead of the guess from the VGPRs it reads. The part carries the word after the
+/// metadata.
+pub fn container_with_inputs(
+    stage: HwStage,
+    code: &[u8],
+    meta: &[u8],
+    ps_input: Option<u32>,
+) -> Result<Vec<u8>, ShaderError> {
+    let ps_input = ps_input.filter(|_| stage == HwStage::Ps);
+    let (program, sigs) = infer_with(stage, code, meta, ps_input)?;
     let mut part = MAGIC.to_vec();
     for w in [u32::from(program.stage == HwStage::Ps), code.len() as u32, meta.len() as u32] {
         part.extend(w.to_le_bytes());
     }
     part.extend(code);
     part.extend(meta);
+    if let Some(ena) = ps_input {
+        part.extend(ena.to_le_bytes());
+    }
     let mut parts: Vec<(FourCC, Vec<u8>)> = vec![(FourCC::ACCC, part)];
     parts.push((FourCC::ISG1, signature(&sigs.0, true)));
     parts.push((FourCC::OSG1, signature(&sigs.1, false)));
@@ -85,7 +102,25 @@ pub fn program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         .get(16 + code_len..16 + code_len + meta_len)
         .ok_or(Malformed("FSPG metadata out of bounds"))?;
     let stage = if stage == 0 { HwStage::Vs } else { HwStage::Ps };
-    Ok(infer(stage, code, meta)?.0)
+    // The input enables, when the part carries them (a word after the metadata).
+    let ps_input = u32_at(part, 16 + code_len + meta_len).ok().filter(|&w| stage == HwStage::Ps && w != 0);
+    Ok(infer_with(stage, code, meta, ps_input)?.0)
+}
+
+/// A pixel program's input enables in a 0x1c8 description slot's register image (pair 0):
+/// `SPI_PS_INPUT_ENA`, by the image's kind (word 1, as the host's blend registers are found). `None`
+/// for an image of another kind, or one with no pixel inputs (0: no pixel stage).
+/// Guess (docs/native-host.md, "Pixel input enables"): found by its values across 23,022
+/// images (a word of 16 bits a pixel program's input VGPRs agree with, beside the word with the
+/// interpolant count), not from a console document; the image holds one such word, taken as
+/// both `SPI_PS_INPUT_ENA` and `SPI_PS_INPUT_ADDR` (which lays the VGPRs out).
+pub fn ps_input_ena(image: &[u8]) -> Option<u32> {
+    let at = match u32_at(image, 4).ok()? {
+        4 => 0x58,
+        6 => 0xac,
+        _ => return None,
+    };
+    u32_at(image, at).ok().filter(|&w| w != 0 && w >> 16 == 0)
 }
 
 type Signatures = (Vec<SigElement>, Vec<SigElement>);
@@ -107,10 +142,16 @@ fn element(name: &str, index: u32, kind: u8, row: u32, mask: u8) -> SigElement {
     }
 }
 
-fn infer(
+#[cfg(test)]
+fn infer(stage: HwStage, code: &[u8], meta: &[u8]) -> Result<(NativeProgram, Signatures), ShaderError> {
+    infer_with(stage, code, meta, None)
+}
+
+fn infer_with(
     stage: HwStage,
     code: &[u8],
     meta: &[u8],
+    ps_input: Option<u32>,
 ) -> Result<(NativeProgram, Signatures), ShaderError> {
     if !matches!(stage, HwStage::Vs | HwStage::Ps) {
         return Err(ShaderError::Unsupported {
@@ -477,7 +518,12 @@ fn infer(
                 left -= 1;
             }
         }
-        if addr & (0xF << 8) != 0 {
+        // The register image's enables, when the description gives them, over the guess.
+        if let Some(ena) = ps_input {
+            addr = ena;
+        }
+        // The fixed-point position is made from the float one.
+        if addr & (0xF << 8 | 1 << 15) != 0 {
             ins.push(SigElement {
                 name: "SV_Position".into(),
                 index: 0,
@@ -1233,6 +1279,43 @@ mod tests {
         };
         assert_eq!(input_addr, (1 << 1) | (1 << 8));
         assert!(ins.iter().any(|e| e.kind == 3 && e.name == "SV_Position"));
+    }
+
+    #[test]
+    fn the_pixel_input_enables_are_read_from_the_register_image_by_its_kind() {
+        let image = |kind: u32, at: usize, w: u32| {
+            let mut b = vec![0u8; 0x180];
+            b[4..8].copy_from_slice(&kind.to_le_bytes());
+            b[at..at + 4].copy_from_slice(&w.to_le_bytes());
+            b
+        };
+        assert_eq!(ps_input_ena(&image(4, 0x58, 0x8080)), Some(0x8080));
+        assert_eq!(ps_input_ena(&image(6, 0xac, 0x8c02)), Some(0x8c02));
+        assert_eq!(ps_input_ena(&image(4, 0xac, 0x8080)), None, "kind 4 keeps it at 0x58");
+        assert_eq!(ps_input_ena(&image(5, 0x58, 0x8080)), None, "another kind");
+        assert_eq!(ps_input_ena(&image(4, 0x58, 0)), None, "no pixel inputs");
+        assert_eq!(ps_input_ena(&image(4, 0x58, 0x1_0002)), None, "not a 16-bit enable");
+        assert_eq!(ps_input_ena(&[4, 0, 0, 0, 4, 0, 0, 0]), None, "short image");
+    }
+
+    #[test]
+    fn decoded_pixel_input_enables_replace_the_guess_and_declare_the_position() {
+        // Reads v1 only: the guess takes it as the second barycentric VGPR.
+        let code = words(&[0xF800_180F, 0x0101_0101, ENDPGM]); // exp mrt0 v1, v1, v1, v1 done vm
+        let meta = [0u8; 0x10];
+        let (p, (ins, _)) = infer_with(HwStage::Ps, &code, &meta, Some(0x8080)).unwrap();
+        let StageIo::Ps { input_addr, .. } = p.io else {
+            panic!("not PS");
+        };
+        assert_eq!(input_addr, 0x8080);
+        assert!(ins.iter().any(|e| e.kind == 3 && e.name == "SV_Position"), "{ins:?}");
+        // The enables ride in the container's FSPG part, after the metadata.
+        let c = container_with_inputs(HwStage::Ps, &code, &meta, Some(0x8080)).unwrap();
+        let at = c.windows(4).position(|w| w == MAGIC).unwrap();
+        let StageIo::Ps { input_addr, .. } = program(&c[at..]).unwrap().io else {
+            panic!("not PS");
+        };
+        assert_eq!(input_addr, 0x8080);
     }
 
     #[test]

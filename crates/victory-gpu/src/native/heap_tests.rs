@@ -401,6 +401,57 @@ fn a_compute_shader_stores_through_a_buffer_view_it_takes_from_the_heap() {
     assert_eq!((t.host.unset_roots(), t.host.unmapped(), t.host.failed()), (0, 0, 0));
 }
 
+/// #264 review: the title zeroes a heap record with plain stores (no device call). The host does
+/// not see it: the per-submission table check skips empty records, so the dispatch still finds
+/// the old stride and the old buffer view and stores through it. Only a mirror of that record
+/// (a device write there, or the host mirroring it for another reason) brings the stride to 0,
+/// and then the shader reads the null view.
+#[test]
+fn a_heap_record_the_title_zeroes_with_plain_stores_keeps_its_stride_until_mirrored() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_HEAP_BUFFER, &[uav], 7);
+    let cs = shaders::translate(&c).unwrap();
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let heap = Heap::new(&t);
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "heap buffer") else { panic!("{:?}", t.shaders) };
+    let canary = super::addr_tests::CANARY;
+    let run = |t: &Title<Metal>| {
+        f.put(0x2_0000, &[canary; 3]);
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap.heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap.heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+        f.get(0x2_0000, 3)
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    let slot = heap._records.as_ptr() as u64 + 64;
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
+    assert!(t.host.mirror(slot).unwrap());
+    let stored = [0x3F80_0000, canary, 0x3F80_0000];
+    assert_eq!(run(&t), stored);
+    // The title zeroes entry 2's record with plain stores.
+    // SAFETY: entry 2's 32 bytes inside `heap._records`, which the heap's records are.
+    unsafe { std::ptr::write_bytes(slot as *mut u8, 0, 32) };
+    assert!(crate::descriptor::view(slot).is_none(), "an empty record");
+    // Not seen: the stride and the view stay, and the stores land through the old view.
+    assert_eq!(run(&t), stored, "stale stride and view");
+    // Mirrored again: the stride is 0 and the shader reads the null view.
+    assert!(!t.host.mirror(slot).unwrap());
+    assert_eq!(run(&t), [canary; 3], "after a mirror of the zeroed record");
+    assert_eq!((t.host.unset_roots(), t.host.unmapped(), t.host.failed()), (0, 0, 0));
+}
+
 /// A compute program asking a writable image for its size: a table at user data 4 holds the raw
 /// output UAV (dwords 0-3) and a texture UAV (dwords 8-15), as the title's metadata declares them.
 /// `image_get_resinfo` at level 0 (v0) returns width and height, which go to the output's dwords 0

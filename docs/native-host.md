@@ -659,6 +659,18 @@ now numbers: copies of an EXEC mask in `0ef1184e45342d20`, of a constant-buffer 
 vertex programs), and 137 compute programs move on to "a descriptor read only as data". Tests: `gfx_refusal_tests::a_join_of_swapped_copies_of_one_value_is_that_value`,
 `a_join_of_copies_of_two_values_stays_refused`.
 
+The resource tracer follows a descriptor spilled to VGPR lanes the same way (`Tracer::restored`,
+`spilled`). When the VGPR is a phi, its edges agree when the values they spilled have one origin
+in the copy propagation, not only when they are one value. The title's compiler restores a
+spilled descriptor inside a loop and spills it again, so the loop's edge spills the restored copy:
+another value with the same dwords. Comparing values refused all of these as "a descriptor
+neither loaded nor built" (#400): 309 shaders of a 21,556-shader corpus (305 compute, 4 vertex).
+With origins, 8 vertex programs translate (4 of these and 4 that were "a descriptor outside the
+heaps"), none regress and no output changes. The 305 compute programs move on to "a view address
+field the table gives as 0: a buffer's stride or swizzle" (290), "a descriptor's address or
+format read as data" (14) and "a register joining a lane mask and data, read as data" (1). Test:
+`resource::tests::a_descriptor_spilled_again_in_a_loop_is_still_the_load`.
+
 In a mesh shader, a uniform branch can skip a block that replaces a scalar mask with a
 vector compare result. At the join each mesh thread uses its group index modulo the console
 wave size to read its bit. Wave64 takes lanes 32–63 from the high dword on the same edge.

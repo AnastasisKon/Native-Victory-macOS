@@ -724,6 +724,44 @@ pub struct PassSubmission<'a, B: GraphicsBackend + ?Sized> {
     pub signals: &'a [(&'a B::Fence, u64)],
 }
 
+/// Why a submission was not made as submitted, and what of it did not run: the caller pays for
+/// the lost work (a dropped pass's value writes never happen, and a queue waiting on one has no
+/// other way to go on).
+#[derive(Debug)]
+pub struct SubmitFailure {
+    /// The command buffer committed without the passes in `refused`. `false` when nothing was
+    /// committed at all, so every pass of the submission was lost.
+    pub committed: bool,
+    /// Indices into `PassSubmission::passes` dropped from a committed command buffer (a pass the
+    /// backend could not encode).
+    pub refused: Vec<usize>,
+    /// What failed: the first refusal's message, or why nothing was committed.
+    pub error: String,
+}
+
+impl SubmitFailure {
+    /// Nothing was committed: every pass of the submission was lost.
+    pub fn uncommitted(error: impl Into<String>) -> Self {
+        Self {
+            committed: false,
+            refused: Vec::new(),
+            error: error.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SubmitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.committed {
+            write!(f, "passes {:?} were refused: {}", self.refused, self.error)
+        } else {
+            write!(f, "nothing was committed: {}", self.error)
+        }
+    }
+}
+
+impl std::error::Error for SubmitFailure {}
+
 pub trait GraphicsBackend: ResourceBackend {
     type RenderPipeline;
 
@@ -745,7 +783,9 @@ pub trait GraphicsBackend: ResourceBackend {
         &self,
         queue: &Self::Queue,
         work: &PassSubmission<'_, Self>,
-    ) -> Result<(), String>;
+    ) -> Result<(), SubmitFailure>;
+    /// Names a render pipeline for diagnostics (`VICTORY_TRACE_GPU_FAILS`); the default does nothing.
+    fn name_render_pipeline(&self, _p: &Self::RenderPipeline, _name: &str) {}
 }
 
 /// Showing a texture of the title in a window.
@@ -758,16 +798,17 @@ pub trait PresentBackend: GraphicsBackend {
     fn create_surface(&self, layer: *mut std::ffi::c_void) -> Result<Self::Surface, String>;
     /// Attempts presentation without blocking drawable acquisition. False keeps the FIFO head
     /// pending; callers must retry before submitting later work on this queue.
-    fn try_present(&self, queue: &Self::Queue, surface: &Self::Surface, source: &Self::Texture) -> Result<bool, String> {
-        self.present(queue, surface, source).map(|()| true)
+    fn try_present(&self, queue: &Self::Queue, surface: &Self::Surface, sources: &[&Self::Texture]) -> Result<bool, String> {
+        self.present(queue, surface, sources).map(|()| true)
     }
 
-    /// Draws `source` over the surface's next drawable (scaled to it, whatever the formats) and
-    /// presents it after the work already submitted to `queue`. Never waits for the GPU.
+    /// Draws `sources` over the surface's next drawable (each scaled to it, whatever the formats)
+    /// and presents it after the work already submitted to `queue`: the first as it is, each
+    /// later one blended over by its alpha (straight). Never waits for the GPU.
     fn present(
         &self,
         queue: &Self::Queue,
         surface: &Self::Surface,
-        source: &Self::Texture,
+        sources: &[&Self::Texture],
     ) -> Result<(), String>;
 }

@@ -71,13 +71,23 @@ pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
             Ok(metal) => {
                 let console = crate::console::current();
                 let (gpu_optimal, standard) = console.title_memory();
+                let budget =
+                    super::textures::texture_budget(std::env::var("VICTORY_METAL_TEXTURE_BUDGET_MB").ok().as_deref());
+                let suggested = super::textures::suggested_texture_budget(
+                    metal.recommended_working_set(),
+                    (gpu_optimal + standard) as u64,
+                );
                 tracing::info!(
                     console = console.name(),
                     title_memory_mib = (gpu_optimal + standard) / (1 << 20),
                     recommended_working_set_mib = metal.recommended_working_set() / (1 << 20),
+                    texture_budget_mib = budget >> 20,
+                    suggested_texture_budget_mib = suggested >> 20,
                     "native host: Metal"
                 );
-                *guard = Some(Shared(Title::new(metal, pools().clone())));
+                let mut title = Title::new(metal, pools().clone());
+                title.set_texture_budget(budget);
+                *guard = Some(Shared(title));
                 start_timer();
             }
             Err(e) => {
@@ -174,8 +184,25 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
     // test's submission with textures read but not yet uploaded would upset: there the lock is
     // kept from the probes to the uploads (`Title::submit`).
     let unlocked = !cfg!(test);
+    // The lists' snapshots hold `Rc`s the recording threads share: they are taken and dropped
+    // under the title lock, once here and once for the submission below.
+    let segments = |t: &MetalTitle| {
+        let mut segments = Vec::new();
+        for &l in lists.iter().filter(|l| !l.is_null()) {
+            let list = crate::list::native(l);
+            segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments(t));
+        }
+        segments
+    };
+    let mut named = Default::default();
     if unlocked {
-        let jobs = with_title(|t| t.sync_jobs()).unwrap_or_default();
+        let jobs = with_title(|t| {
+            if t.names_wanted() {
+                named = t.keep_named(segments(t).iter().map(|(l, _)| l));
+            }
+            t.sync_jobs()
+        })
+        .unwrap_or_default();
         for batch in super::textures::batches(jobs) {
             // Without the lock: the title's other threads go on recording.
             let prepared = super::textures::prepare(&batch);
@@ -190,18 +217,16 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
             t.gpu_written(key);
         }
         if t.ensure_queue(queue as usize).is_err() {
+            t.let_named_go(named);
             return;
         }
-        let mut segments = Vec::new();
-        for &l in lists.iter().filter(|l| !l.is_null()) {
-            let list = crate::list::native(l);
-            segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments());
-        }
+        let segments = segments(t);
         if unlocked {
             t.submit_synced(queue as usize, segments);
         } else {
             t.submit(queue as usize, segments);
         }
+        t.let_named_go(named);
         // `VICTORY_TRACE_DESCRIPTORS=sites`: the heaps' pages are closed again for the next
         // interval, so the title's first store into each is seen.
         if super::descriptor_trace::sites() {
@@ -495,6 +520,13 @@ fn tracing_record_writers() -> bool {
     env_set!("VICTORY_TRACE_RECORD_WRITERS")
 }
 
+/// `VICTORY_TRACE_RECORD_WRITERS=<hash>[,<hash>...]`: the records watched are those of the
+/// indirect dispatches of these compute shaders, not the mesh records (`None`: the mesh records).
+fn record_writers_of() -> Option<&'static str> {
+    static OF: OnceLock<Option<String>> = OnceLock::new();
+    OF.get_or_init(|| std::env::var("VICTORY_TRACE_RECORD_WRITERS").ok().filter(|v| v.len() >= 16)).as_deref()
+}
+
 /// The records and zero records of the executions whose first record is inside one of `buffers`.
 fn records_in(buffers: &std::collections::BTreeSet<(u64, u64)>, executions: &std::collections::BTreeMap<u64, [u64; 2]>) -> [u64; 2] {
     executions
@@ -635,12 +667,16 @@ fn trace_present_draw(t: &MetalTitle, l: &MetalList) {
     t.host.trace_args(root, binding);
 }
 
-/// `PresentX` on title queue `queue`: title texture `resource` over the layer.
-pub(crate) fn present(queue: This, resource: This) {
+/// `PresentX` on title queue `queue`: title textures `planes` over the layer, the first under the
+/// others (`Title::present`). The traces name the first.
+pub(crate) fn present(queue: This, planes: &[This]) {
+    let Some(&resource) = planes.first() else { return };
     if present_every().is_some() {
         let mut shown = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
-        if !shown.contains(&(resource as usize)) {
-            shown.push(resource as usize);
+        for &p in planes {
+            if !shown.contains(&(p as usize)) {
+                shown.push(p as usize);
+            }
         }
     }
     // Diagnostic: VICTORY_PRESENT_DELAY_MS slows every present, to tell a trigger that follows
@@ -661,7 +697,8 @@ pub(crate) fn present(queue: This, resource: This) {
     pass_present(resource);
     let shown = with_title(|t| {
         let _ = t.ensure_queue(queue as usize);
-        t.present(queue as usize, resource as usize)
+        let keys: Vec<usize> = planes.iter().map(|&p| p as usize).collect();
+        t.present(queue as usize, &keys)
     });
     match shown {
         Some(Err(e)) => tracing::warn!(error = %e, "a frame was not presented"),
@@ -880,7 +917,7 @@ pub(crate) fn mirror(handle: u64) {
                     && let Some(info) = crate::resource::placed_info(address, &res)
                     && let Some((pool, _)) = t.host.memory().resolve(address, 1)
                 {
-                    t.texture_placed(address, key, pool.id);
+                    t.texture_placed(address, key, pool.id, info.size);
                     if !t.alias_placed(address, key, &info) {
                         t.texture_created(key, info);
                         t.realize(key);
@@ -959,10 +996,86 @@ fn frame_left() -> std::time::Duration {
     BUDGET.lock().unwrap_or_else(|e| e.into_inner()).left(crate::frame::current(), std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET)
 }
 
+/// [`frame_left`] for tests, which read it to see whether a compile spent its frame.
+#[cfg(test)]
+pub(crate) fn frame_left_now() -> std::time::Duration {
+    frame_left()
+}
+
+/// Spends what the current frame has left of its budget for new pipelines: from here on [`pipe`]
+/// puts off the frame's pipelines whose shaders are not translated yet, and [`compile_wait`] waits
+/// 20 ms a pipeline then nothing, until the next frame starts with the budget whole again.
+pub(crate) fn spend_frame_budget() {
+    BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spend(crate::frame::current(), std::time::Instant::now());
+}
+
+/// A pipeline compile that ended in `error`: if Metal's compiler died on it rather than refusing
+/// a shader the host cannot run ([`victory_metal::is_compiler_crash`]), the frame spends the rest
+/// of its pipeline budget. One frame on 27 November spent 7.3 s on nine crashes of the same
+/// pipeline's compiles (issue #181), about 0.85 s each; with the budget spent, that frame's other
+/// new pipelines are put off and retried in later frames, where the crash memory refuses the bad
+/// ones at once. A single crash can still cost the frame the ~0.85 s it takes, or on macOS 15 the
+/// ~30 s the compiler retries for, out of its budget.
+pub(crate) fn compile_failed(name: &str, error: &str) {
+    if !victory_metal::is_compiler_crash(error) {
+        return;
+    }
+    spend_frame_budget();
+    // The frame this was last logged for: one warning a frame, however many pipelines crash.
+    static WARNED: Mutex<u64> = Mutex::new(u64::MAX);
+    let frame = crate::frame::current();
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if *warned != frame {
+        *warned = frame;
+        tracing::warn!(frame, pipeline = name, "a compile crashed Metal's compiler; no new pipelines this frame");
+    }
+}
+
+/// A compile that ended in a crash of Metal's compiler spends the rest of the frame's budget
+/// (issue #181: nine of them held one frame for 7.3 s) and is what `compile_wait` sees, so the
+/// frame is handed no new pipeline; one refused for a reason of the host's spends nothing.
+#[cfg(test)]
+#[test]
+fn a_compiler_crash_spends_the_frame_budget() {
+    fn whole_frame() {
+        *BUDGET.lock().unwrap_or_else(|e| e.into_inner()) = crate::prewarm::FrameBudget::new();
+    }
+    struct Whole;
+    impl Drop for Whole {
+        fn drop(&mut self) {
+            whole_frame();
+        }
+    }
+    // The budget is the process's and every other test reads it under `TITLE`: hold it, and start
+    // the frame here, so no test of theirs runs while this one has spent the budget.
+    let _title = lock();
+    whole_frame();
+    let _whole = Whole;
+    let before = frame_left_now();
+    assert!(!before.is_zero(), "a frame starts with its budget");
+    // A refusal of `make_render`'s, not a crash.
+    compile_failed("a guessed pipeline", "a target format the host does not know");
+    let left = frame_left_now();
+    assert!(!left.is_zero(), "a refusal is not a crash");
+    assert!(left <= before);
+    assert!(!frame_spent_by_crash());
+
+    compile_failed(
+        "a guessed pipeline",
+        "Compilation failed due to an interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED. \
+         This error occurred after multiple retries.",
+    );
+    assert!(frame_left_now().is_zero(), "a crash spends the frame");
+    assert!(frame_spent_by_crash(), "and `compile_wait` tells it from a frame out of time");
+}
+
 /// How long a new pipeline may hold the current frame while Metal makes it: what the frame has
 /// left of its budget; past it, the few ms a pipeline the disk cache and the archive hold takes
 /// (so a warm frame that outlasts its budget puts none off), until one is not made in them; then
-/// nothing. A cold world frame asks for some 800 past its budget: 20 ms each would be 16 s.
+/// nothing. A cold world frame asks for some 800 past its budget: 20 ms each would be 16 s. A
+/// frame a crash spent gets nothing: the compiler service is down for the rest of it, and the
+/// 20 ms window let 12 pipelines of one frame fail within 0.22 s, each refused and remembered as
+/// a crash of its own.
 fn compile_wait(t: &MetalTitle) -> std::time::Duration {
     const ARCHIVED: std::time::Duration = std::time::Duration::from_millis(20);
     /// The frame last past its budget, and the pipelines put off before that.
@@ -971,12 +1084,21 @@ fn compile_wait(t: &MetalTitle) -> std::time::Duration {
     if !left.is_zero() {
         return left;
     }
+    if frame_spent_by_crash() {
+        return std::time::Duration::ZERO;
+    }
     let frame = crate::frame::current();
     let mut past = PAST.lock().unwrap_or_else(|e| e.into_inner());
     if past.0 != frame {
         *past = (frame, t.shaders.put_off);
     }
     if past.1 == t.shaders.put_off { ARCHIVED } else { left }
+}
+
+/// Whether a compile that crashed Metal's compiler spent the current frame ([`frame_left`] is
+/// zero for a frame that is merely past its time too; this tells the two apart).
+fn frame_spent_by_crash() -> bool {
+    BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent_by_crash()
 }
 
 /// When this frame made its first new pipeline, and pipelines put off since ([`pipe`]).
@@ -1129,7 +1251,9 @@ fn pass_present(resource: This) {
             let Some(info) = crate::resource::texture_info(key as This) else { continue };
             let (w, h) = (info.width as usize, info.height as usize);
             let bpp = match info.format { 2 => 16, 10 | 11 | 16 => 8, 24 | 26 | 28 | 29 | 34 | 41 | 42 | 67 | 87 | 91 => 4, 49 | 54 | 56 | 57 => 2, 61 | 62 | 65 => 1, _ => 0 };
-            if bpp == 0 || w * h == 0 || w * h > 3840 * 2160 || info.depth_or_layers > 1 && info.format != 28 {
+            // A 3D texture (a colour grading table) is read whole; arrays are skipped.
+            let d = if info.dimension == victory_formats::texture::Dimension::Tex3d { info.depth_or_layers.max(1) as usize } else { 1 };
+            if bpp == 0 || w * h == 0 || w * h > 3840 * 2160 || d == 1 && info.depth_or_layers > 1 && info.format != 28 {
                 eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} layers={} skipped", info.format, info.depth_or_layers);
                 continue;
             }
@@ -1137,11 +1261,17 @@ fn pass_present(resource: This) {
                 eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} no host texture", info.format);
                 continue;
             };
-            let mut raw = vec![0u8; w * h * bpp];
+            let mut raw = vec![0u8; w * h * d * bpp];
             victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut raw, w * bpp, w * h * bpp);
-            let nonzero = raw.chunks_exact(bpp).filter(|p| p.iter().any(|&b| b != 0)).count() as f64 / (w * h) as f64;
+            let nonzero = raw.chunks_exact(bpp).filter(|p| p.iter().any(|&b| b != 0)).count() as f64 / (w * h * d) as f64;
+            let mut slices = String::new();
+            if d > 1 {
+                let lit = raw.chunks_exact(w * h * bpp).filter(|s| s.iter().any(|&b| b != 0)).count();
+                let distinct = raw.chunks_exact(bpp).collect::<std::collections::HashSet<_>>().len();
+                slices = format!(" depth={d} slices_nonzero={lit} distinct_texels={distinct}");
+            }
             let name = format!("p{num}_{key:x}_f{}_{w}x{h}.ppm", info.format);
-            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            let mut out = format!("P6\n{w} {}\n255\n", h * d).into_bytes();
             let mut extra = String::new();
             match info.format {
                 2 | 10 | 24 | 26 => {
@@ -1157,6 +1287,11 @@ fn pass_present(resource: This) {
                         nan16 = raw.chunks_exact(2).filter(|p| u16::from_le_bytes([p[0], p[1]]) & 0x7c00 == 0x7c00).count();
                     }
                     extra = format!(" max={max} min={min} mean={} notfinite={bad} infnan16={nan16} negative={neg}", sum / (rgb.len() * 3).max(1) as f64);
+                    // A few texels of 32-bit floats (exposure and histogram results): every channel, alpha too.
+                    if info.format == 2 && w * h <= 16 {
+                        let v: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                        extra += &format!(" values={v:?}");
+                    }
                     out.extend(rgb.iter().flat_map(|c| c.map(|v| if v.is_finite() && v > 0.0 { ((v / (1.0 + v)).sqrt() * 255.0) as u8 } else { 0 })));
                 }
                 28 | 29 | 87 | 91 => {
@@ -1169,7 +1304,7 @@ fn pass_present(resource: This) {
                 }
             }
             let _ = std::fs::write(std::path::Path::new(dir).join(&name), out);
-            eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} at={:#x} nonzero={nonzero:.4}{extra} file={name}", info.format, info.memory as usize);
+            eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} at={:#x} nonzero={nonzero:.4}{slices}{extra} file={name}", info.format, info.memory as usize);
         }
     });
 }
@@ -1247,12 +1382,17 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
     let copies_recorded = COPIES[0].load(Ordering::Relaxed);
     let indirect = crate::list::indirect_dropped();
-    let (r, heap_cleared, [dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps]) = with_title(|t| {
+    let (r, heap_cleared, [dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps], metal_mb) = with_title(|t| {
         let h = &t.host;
-        (h.backend.residency_counts(), h.cleared(), [h.unset_roots(), h.unmapped(), h.failed(), h.typed_views(), h.resource_heaps() as u64])
+        (h.backend.residency_counts(), h.cleared(), [h.unset_roots(), h.unmapped(), h.failed(), h.typed_views(), h.resource_heaps() as u64], victory_backend::backend::ComputeBackend::allocated_bytes(&h.backend) >> 20)
     })
     .unwrap_or_default();
-    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps, "native draws so far");
+    // Where the memory is when command buffers stall (#79): Metal's own count and the process footprint.
+    #[cfg(target_os = "macos")]
+    let footprint_mb = victory_platform::mem::footprint() >> 20;
+    #[cfg(not(target_os = "macos"))]
+    let footprint_mb = 0usize;
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, metal_mb, footprint_mb, heap_cleared, dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps, "native draws so far");
     if let Some(n) = super::host::heap_set_trace()
         && let Some([all, idle, never]) = with_title(|t| t.host.heap_set_report(n)).flatten()
     {
@@ -1767,6 +1907,31 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
     });
 }
 
+/// A direct mesh dispatch (`DispatchMesh`, or `DispatchMeshX` without an argument address): the
+/// bound mesh pipeline runs `[x, y, z]` groups, as an indirect one runs its record's (#353). With
+/// no mesh pipeline it is dropped for the reason `graphics` gives, and counted in the frame line's
+/// `mesh=` as before.
+pub(crate) fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+    RECORDED.fetch_add(1, Ordering::Relaxed);
+    with_list(this, |t, l| {
+        if graphics(t, l, true).is_none() {
+            crate::list::DROPPED_KINDS[0].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if pass_on() {
+            pass_note_op(l, &format!("mesh[{x},{y},{z}]"), None, None);
+        }
+        match l.list.dispatch_mesh(x, y, z) {
+            Ok(()) => {
+                ENCODED.fetch_add(1, Ordering::Relaxed);
+                l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                trace_present_draw(t, l);
+            }
+            Err(e) => tracing::warn!(error = %e, "mesh dispatch"),
+        }
+    });
+}
+
 pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
     with_list(this, |t, l| {
@@ -1817,7 +1982,7 @@ pub(crate) fn execute_indirect(
                 if pass_on() {
                     pass_note_op(l, &format!("mesh-records n={max} counted={}", count.is_some()), None, None);
                 }
-                if tracing_record_writers() {
+                if tracing_record_writers() && record_writers_of().is_none() {
                     let zero = (0..max)
                         .filter(|&i| super::textures::read_memory(at(i) as *const u8, 4).iter().all(|&b| b == 0))
                         .count() as u64;
@@ -1848,6 +2013,29 @@ pub(crate) fn execute_indirect(
                     }
                     l.list.set_compute_pipeline(&pso);
                     for i in 0..max {
+                        if let Some(of) = record_writers_of()
+                            && stage_hashes(l.pipeline).iter().any(|h| h.strip_prefix("compute ").is_some_and(|h| of.contains(h)))
+                        {
+                            let zero = super::textures::read_memory(at(i) as *const u8, 4).iter().all(|&b| b == 0);
+                            let mut trace = RECORD_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+                            let n = trace.get_or_insert_default().executions.entry(at(i)).or_default();
+                            n[0] += 1;
+                            n[1] += u64::from(zero);
+                        }
+                        if crate::list::trace_dispatch_flags() {
+                            static SEEN: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+                            let mut seen = SEEN.lock().unwrap();
+                            let key = (l.pipeline as usize, count.is_some());
+                            if seen.iter().filter(|k| **k == key).count() < 3 {
+                                seen.push(key);
+                                // What title memory holds now, not what the GPU will read.
+                                let now: Vec<u32> = super::textures::read_memory(at(i) as *const u8, 12)
+                                    .chunks_exact(4)
+                                    .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                                    .collect();
+                                tracing::warn!(shader = ?stage_hashes(l.pipeline), ?command, counted = count.is_some(), stride, record = format_args!("{:#x}", at(i)), ?now, "an indirect dispatch (the first three of each pipeline)");
+                            }
+                        }
                         let r = match count {
                             Some(c) => l.list.dispatch_indirect_counted(at(i), c, i),
                             None => l.list.dispatch_indirect(at(i)),
@@ -1983,6 +2171,14 @@ fn subresource_mip_slice(info: &super::textures::TextureInfo, subresource: u32) 
     };
     let sub = subresource as usize;
     (sub < mips * slices).then(|| (sub % mips, sub / mips))
+}
+
+/// The host texture's level for title level `mip`: `None` for a top level the host texture was
+/// made without (`VICTORY_TEXTURE_DROP_TOP_MIP`). Host level `mip - dropped` has the title level's
+/// size. Shortcut: a copy to or from a dropped level is skipped, not scaled; the switch is off by
+/// default.
+fn host_mip(info: &super::textures::TextureInfo, mip: usize) -> Option<usize> {
+    mip.checked_sub(info.dropped_levels())
 }
 
 fn mip_dims(info: &super::textures::TextureInfo, mip: usize) -> [usize; 3] {
@@ -2143,17 +2339,20 @@ pub(crate) fn copy_texture_resource(this: This, dst: This, src: This) -> bool {
         }
         for slice in 0..slices {
             for mip in 0..mips {
+                let (Some(src_mip), Some(dst_mip)) = (host_mip(&src_info, mip), host_mip(&dst_info, mip)) else {
+                    continue;
+                };
                 let s = mip_dims(&src_info, mip);
                 let d = mip_dims(&dst_info, mip);
                 let size = [s[0].min(d[0]), s[1].min(d[1]), s[2].min(d[2])];
                 l.list.copy_texture_region(
                     &src_tex,
-                    mip,
+                    src_mip,
                     slice,
                     [0, 0, 0],
                     size,
                     &dst_tex,
-                    mip,
+                    dst_mip,
                     slice,
                     [0, 0, 0],
                 );
@@ -2210,6 +2409,9 @@ pub(crate) fn copy_texture_region(
             if size.contains(&0) {
                 return true;
             }
+            let (Some(src_mip), Some(dst_mip)) = (host_mip(&src_info, src_mip), host_mip(&dst_info, dst_mip)) else {
+                return true;
+            };
             with_list(this, |t, l| {
                 let (Some(src_tex), Some(dst_tex)) =
                     (t.texture_of(src.resource as usize), t.texture_of(dst.resource as usize))
@@ -2260,6 +2462,9 @@ pub(crate) fn copy_texture_region(
             if (0..3).any(|i| dst_origin[i].saturating_add(size[i]) > dst_dims[i]) {
                 return false;
             }
+            let Some(dst_mip) = host_mip(&dst_info, dst_mip) else {
+                return true;
+            };
             let Some((src_addr, len, row_pitch, slice_pitch)) =
                 footprint_span(src.resource, &src.footprint, src_at, size_u32)
             else {
@@ -2301,6 +2506,9 @@ pub(crate) fn copy_texture_region(
             if size.contains(&0) {
                 return true;
             }
+            let Some(src_mip) = host_mip(&src_info, src_mip) else {
+                return true;
+            };
             let size_u32 = size.map(|v| v as u32);
             let Some((dst_addr, len, row_pitch, slice_pitch)) =
                 footprint_span(dst.resource, &dst.footprint, origin, size_u32)

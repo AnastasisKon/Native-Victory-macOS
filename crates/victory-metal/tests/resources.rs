@@ -67,6 +67,12 @@ struct Grid<'a> {
 
 impl Grid<'_> {
     fn run(&self, tex: &<Metal as ResourceBackend>::Texture) -> Vec<[f32; 4]> {
+        self.sample(tex, false)
+    }
+
+    /// [`Self::run`], with the texture's entry cleared (`clear_entry`) before the dispatch when
+    /// `cleared`.
+    fn sample(&self, tex: &<Metal as ResourceBackend>::Texture, cleared: bool) -> Vec<[f32; 4]> {
         let m = self.m;
         let p = m.create_compute_pipeline(self.dxil).unwrap();
         let cells = self.g[0] as usize * self.g[1] as usize * self.z;
@@ -80,6 +86,9 @@ impl Grid<'_> {
         let res = m.create_heap(HeapKind::Resource, 4).unwrap();
         let smp = m.create_heap(HeapKind::Sampler, 2).unwrap();
         m.write_texture(&res, 0, tex, 0.0);
+        if cleared {
+            m.clear_entry(&res, 0);
+        }
         m.write_buffer(&res, 1, &a.buf, a.at(0), (cells * 16) as u32);
         let s = m
             .create_sampler(&SamplerDesc {
@@ -361,6 +370,25 @@ fn sample_2d_array_and_3d() {
     }
 }
 
+/// What a shader samples through an entry `clear_entry` emptied (as the host does for a texture
+/// given up under the texture budget, or released): zeros, a transparent black texel, not the
+/// texture it showed and not a fault.
+#[test]
+fn sampling_a_cleared_entry_reads_transparent_black() {
+    let Some(m) = backend() else { return };
+    let t = m.create_texture(&d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+    m.upload_texture(&t, 0, 0, &[200u8; 16], 8, 0);
+    let g = Grid {
+        m: &m,
+        dxil: &fixture("sample2d"),
+        g: [2, 2],
+        z: 1,
+        filter: Filter::Nearest,
+    };
+    assert!(g.run(&t).iter().all(|c| near(c[0], 200.0 / 255.0)), "shown");
+    assert_eq!(g.sample(&t, true), vec![[0.0; 4]; 4], "cleared");
+}
+
 #[test]
 fn texture_views_and_sampler_filters() {
     let Some(m) = backend() else { return };
@@ -570,6 +598,47 @@ fn indirect_dispatch_reads_its_group_counts_from_title_memory() {
         let out: Vec<u32> = a.read(dst, N);
         assert!(out[..N / 2].iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7));
         assert!(out[N / 2..].iter().all(|v| *v == 0), "groups past the record's count do not run");
+    }
+}
+
+/// One indirect dispatch of `heap_rw` with `record`; returns the destination.
+fn indirect(m: &Metal, record: [u32; 3]) -> Vec<u32> {
+    let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
+    let a = Arena::new(m, INDIRECT_ARENA.div_ceil(page_size()));
+    let (dst, at) = (a.region.len / 2, N * 4);
+    a.write(0, &(0..N as u32).collect::<Vec<_>>());
+    a.write(at, &record);
+    let heap = m.create_heap(HeapKind::Resource, 16).unwrap();
+    m.write_buffer(&heap, 5, &a.buf, a.at(0), (N * 4) as u32);
+    m.write_buffer(&heap, 6, &a.buf, a.at(dst), (N * 4) as u32);
+    let w = [Dispatch {
+        pipeline: &p,
+        root: RootArgs::default().constants(&[5, 7]).address(m.heap_address(&heap, 5)),
+        resources: vec![],
+        heaps: victory_metal::backend::Heaps { resource: Some(&heap), sampler: None },
+        groups: [0, 0, 0],
+        threads_per_group: [64, 1, 1],
+        indirect: Some((&a.buf, a.at(at) as *const u8)),
+        count: None,
+    }];
+    run(m, &w);
+    a.read(dst, N)
+}
+
+/// A record that asks for more than 2^22 groups in all is what its writer left unfinished there:
+/// it dispatches nothing (Metal would run it, for as long as it takes).
+#[test]
+fn an_indirect_dispatch_past_the_most_groups_runs_nothing() {
+    for m in backends() {
+        let half = (N / 128) as u32;
+        for record in [[half, 1 << 20, 1], [half, 1_182_027_346, 1_314_076_063], [1 << 16, 1 << 16, 1 << 16]] {
+            let out = indirect(&m, record);
+            assert!(out.iter().all(|v| *v == 0), "{record:?}: {:?}", &out[..4]);
+        }
+        // More than D3D12's 65,535 groups in one dimension still runs: the title asks for that.
+        let out = indirect(&m, [half, 1, 70_000]);
+        assert!(out[..N / 2].iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "{:?}", &out[..4]);
+        assert!(out[N / 2..].iter().all(|v| *v == 0));
     }
 }
 

@@ -131,6 +131,10 @@ pub struct NativeHeap<B: GraphicsBackend> {
     /// `NativeHost::view_strides`), made the first time a shader needs it and kept current by
     /// every mirrored write after that.
     pub strides: std::cell::RefCell<Option<Rc<super::addr::Pages<B>>>>,
+    /// The view addresses (the translator's root SRV `t1` of the memory space: four dwords an
+    /// entry, see `NativeHost::view_addresses`), made the first time a shader reads them and kept
+    /// current by every mirrored write after that.
+    pub addresses: std::cell::RefCell<Option<Rc<super::addr::Pages<B>>>>,
     /// The title record (tag, view index, generation) each entry was last mirrored from.
     pub mirrored: std::cell::RefCell<std::collections::HashMap<usize, [u8; 12]>>,
     /// Entries whose last mirror attempt could not complete yet, keyed by `(record, pool_gen, res_gen)`
@@ -180,6 +184,12 @@ impl<B: GraphicsBackend> NativeHeap<B> {
         }
     }
 
+    /// Whether an entry shows title texture `resource`.
+    pub fn shows_texture(&self, resource: usize) -> bool {
+        let Shown { of, entries, .. } = &*self.images.borrow();
+        entries.get(&resource).is_some_and(|e| e.iter().any(|i| of.get(i) == Some(&resource)))
+    }
+
     /// The entries that show title texture `resource`, which they stop showing.
     pub fn take_entries(&self, resource: usize) -> Vec<usize> {
         let Shown { of, entries, gone } = &mut *self.images.borrow_mut();
@@ -218,6 +228,9 @@ pub struct Binding {
     /// The shader finds title memory through the page table (`t0` of the memory space), which
     /// follows the views in the argument buffer, and the heap's reserved view pairs.
     pub memory: bool,
+    /// The shader reads views' title addresses or texture sizes from their descriptors: the
+    /// heap's view addresses (`t1` of the memory space) follow the page table, if any.
+    pub view_addresses: bool,
     /// The pixel stage's own arguments, when the pipeline has a pixel shader that reads any
     /// (a stage has an argument block of its own; this one is the vertex stage's).
     pub ps: Option<Rc<Binding>>,
@@ -260,6 +273,7 @@ impl Binding {
                 .chain(shader.root_uavs.iter().map(|&r| (r, View::Uav)))
                 .collect(),
             memory: shader.memory,
+            view_addresses: shader.view_addresses,
             ps: None,
             root_views: shader.user_data.iter().any(|u| {
                 u.root == victory_shader::RootType::Descriptor
@@ -287,7 +301,8 @@ impl Binding {
     }
 
     /// The root signature the converter lays the argument buffer out by, in the order
-    /// `NativeHost::translated_args` fills it: the user-data block, the views, the page table.
+    /// `NativeHost::translated_args` fills it: the user-data block, the views, the page table, the
+    /// view addresses.
     /// `None` when the shader has no arguments (it takes its own signature, if it has one).
     pub fn layout(&self) -> Option<RootLayout> {
         use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, USER_DATA_SPACE};
@@ -310,6 +325,12 @@ impl Binding {
         if self.memory {
             params.push(RootParam::Srv {
                 register: 0,
+                space: MEMORY_SPACE,
+            });
+        }
+        if self.view_addresses {
+            params.push(RootParam::Srv {
+                register: 1,
                 space: MEMORY_SPACE,
             });
         }

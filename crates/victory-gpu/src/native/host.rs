@@ -778,6 +778,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 heap.title_views.borrow_mut().remove(&index);
                 let null = self.null_view()?;
                 self.backend.write_buffer(&heap.heap, index, &null.buf, null.ptr().cast_const(), 0);
+                // No typed view over the null view: one pending from the entry's last record goes.
+                heap.typed_pending.borrow_mut().set(index, false, false);
                 heap.shows(index, None);
             }
             Decoded::Buffer { addr, size } => {

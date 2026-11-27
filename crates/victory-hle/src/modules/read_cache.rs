@@ -30,8 +30,11 @@ pub fn open(host: &Path) -> Option<BlockCache> {
     if !real.starts_with(prefix) {
         return None;
     }
-    let len = real.metadata().ok()?.len();
-    let name = format!("{}-{len}", real.file_name()?.to_string_lossy());
+    let meta = real.metadata().ok()?;
+    let len = meta.len();
+    // The mtime is in the key so a patched file of the same size is not served stale.
+    let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let name = format!("{}-{len}-{mtime}", real.file_name()?.to_string_lossy());
     std::fs::create_dir_all(dir).ok()?;
     let open = |ext: &str| {
         OpenOptions::new()
@@ -87,6 +90,9 @@ impl BlockCache {
         let mut blocks = vec![0; (end - start) as usize];
         source.read_exact_at(&mut blocks, start)?;
         self.data.write_all_at(&blocks, start)?;
+        // Data reaches the disk before the map marks it present, so a crash
+        // can lose blocks but never mark one present with nothing behind it.
+        self.data.sync_data()?;
         self.map.write_all_at(&vec![1; (last - first + 1) as usize], first)?;
         for b in first..=last {
             self.have[b as usize].store(1, Ordering::Release);

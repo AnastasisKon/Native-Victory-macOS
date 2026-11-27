@@ -292,9 +292,19 @@ impl<B: PresentBackend> Title<B> {
                 attributes.insert(at, next);
             }
         }
-        let (Some(color), Ok(depth)) = (g.color_formats(), g.depth_format()) else {
-            self.shaders.refuse(name, "a target format the host does not know".into());
-            return Pipe::Refused;
+        // Resolve colour and depth formats, reporting unknown formats as refusals.
+        let (color, depth) = match (g.color_formats(), g.depth_format()) {
+            (Ok(c), Ok(d)) => (c, d),
+            (Err(dxgi), _) => {
+                self.shaders
+                    .refuse(name, format!("unknown target format {}", dxgi));
+                return Pipe::Refused;
+            }
+            (_, Err(dxgi)) => {
+                self.shaders
+                    .refuse(name, format!("unknown depth format {}", dxgi));
+                return Pipe::Refused;
+            }
         };
         if g.samples > 1 {
             self.shaders.refuse(name, "multisampled targets".into());

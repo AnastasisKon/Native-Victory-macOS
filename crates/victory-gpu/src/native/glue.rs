@@ -1339,7 +1339,7 @@ fn make_host_pipe(
         .join(" ");
     // A pixel shader drawing into integer targets is translated for them (Metal refuses a float
     // output for an integer attachment).
-    let integer = graphics.as_ref().and_then(|g| g.color_formats()).map_or(0, |c| super::shaders::integer_targets(&c));
+    let integer = graphics.as_ref().and_then(|g| g.color_formats().ok()).map_or(0, |c| super::shaders::integer_targets(&c));
     let mut hosts = Vec::new();
     for (stage, shader) in &stages {
         let made = shader.native().map(Arc::clone).map_err(str::to_owned);

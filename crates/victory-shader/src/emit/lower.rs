@@ -410,10 +410,9 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: Set<Value>,
-    /// Section values read at a constant lane (`v_readlane_b32`), and what
-    /// that lane holds where it is one value for the wave.
-    lane_reads: Set<(Value, u32)>,
-    lane_vals: HashMap<(Value, u32), V>,
+    /// Constant-lane reads `(v, lane)` from outside `v`'s section, and their lowered values.
+    section_lane_reads: Set<(Value, u32)>,
+    section_lanes: Map<(Value, u32), Result<V, Why>>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -1143,8 +1142,8 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: Set::default(),
-            lane_reads: Set::default(),
-            lane_vals: HashMap::new(),
+            section_lane_reads: Set::default(),
+            section_lanes: Map::default(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1551,25 +1550,40 @@ impl<'a> Lower<'a> {
                     .extend(phi.args.iter().filter(|a| inside.contains_key(a)));
             }
             for (i, inst) in block.insts.iter().enumerate() {
-                if let Fields::Valu(v) = &inst.fields
-                    && inst.name() == "v_readlane_b32"
-                    && let [Operand::Vector { reg, .. }, at] = v.src[..]
-                    && let Some(lane) = crate::resource::lane_of(at)
-                    && let Some(x) = inst.read(Reg::V(reg))
-                    && let Some(&(sb, start, end)) = inside.get(&x)
-                    && !(sb == b && i > start && i < end)
-                {
-                    self.lane_reads.insert((x, lane));
-                }
                 for &(_, r) in &inst.reads {
                     if let Some(&(sb, start, end)) = inside.get(&r)
                         && !(sb == b && i > start && i < end && !super::wave::scalar_alone(inst))
                     {
                         self.section_out.insert(r);
+                        if inst.name() == "v_readlane_b32"
+                            && let Fields::Valu(v) = &inst.fields
+                            && let [Operand::Vector { reg, .. }, at] = v.src.as_slice()
+                            && inst.read(Reg::V(*reg)) == Some(r)
+                            && let Some(lane) = crate::resource::lane_of(*at)
+                        {
+                            self.section_lane_reads.insert((r, lane));
+                        }
                     }
                 }
             }
         }
+        let more: Vec<(Value, u32)> = self
+            .sections
+            .values()
+            .flat_map(|m| m.values())
+            .flat_map(|sec| {
+                let shapes = sec.shapes.iter().map(|(&v, sh)| (v, sh));
+                shapes.chain(sec.lane_shapes.iter().map(|(&(v, _), sh)| (v, sh)))
+            })
+            // Only shapes of values read outside their section: any other lane would be read at
+            // its section for nothing (across host waves, an exchange with two barriers each).
+            .filter(|&(v, _)| self.section_out.contains(&v))
+            .filter_map(|(_, sh)| match *sh {
+                super::wave::Shape::ReadLane(r, lane) if inside.contains_key(&r) => Some((r, lane)),
+                _ => None,
+            })
+            .collect();
+        self.section_lane_reads.extend(more);
     }
 
     /// An instruction inside a whole-wave section: the values that leave
@@ -1586,8 +1600,8 @@ impl<'a> Lower<'a> {
         let sec = &self.sections[&b][&start];
         let unknown: Why = sec.why.unwrap_or(super::wave::NO_SHAPE);
         for &(_, w) in &inst.writes {
+            let shape = self.sections[&b][&start].shapes.get(&w).copied();
             let val = if self.section_out.contains(&w) {
-                let shape = self.sections[&b][&start].shapes.get(&w).copied();
                 match shape.ok_or(unknown).and_then(|sh| self.shape(sh)) {
                     Ok(x) => Val::I32(x),
                     Err(why) => Val::Missing(why),
@@ -1596,24 +1610,23 @@ impl<'a> Lower<'a> {
                 Val::Missing(unknown)
             };
             self.vals.insert(w, val);
-            // A lane read later of a value whose lanes differ (the last lane
-            // of a reduction the compiler finished only in the lanes that
-            // read the other half, say), made here with the section's lanes.
-            let whole = self.sections[&b][&start].shapes.contains_key(&w);
-            let reads: Vec<u32> = if whole {
-                Vec::new()
-            } else {
-                self.lane_reads.iter().filter(|r| r.0 == w).map(|r| r.1).collect()
-            };
-            for lane in reads {
-                let lanes = &self.sections[&b][&start].lanes;
-                let Some(syms) = lanes.get(&w) else { continue };
-                let all = u64::MAX >> (64 - syms.len());
-                let sym = syms.get(lane as usize).copied();
-                if let Some(sh) = sym.and_then(|s| super::wave::uniform_shape(s, all))
-                    && let Ok(x) = self.shape(sh)
-                {
-                    self.lane_vals.insert((w, lane), x);
+            if self.x.st.masks.contains_key(&w) && shape.is_none() {
+                self.lane_fail.insert(w, unknown);
+            }
+            if self.section_out.contains(&w) && shape.is_none() {
+                let mut lanes: Vec<(u32, super::wave::Shape)> = self.sections[&b][&start]
+                    .lane_shapes
+                    .iter()
+                    .filter_map(|(&(v, lane), &sh)| {
+                        (v == w && self.section_lane_reads.contains(&(w, lane)))
+                            .then_some((lane, sh))
+                    })
+                    .collect();
+                // In lane order: the map's order differs between runs, and so did the output.
+                lanes.sort_unstable_by_key(|&(lane, _)| lane);
+                for (lane, sh) in lanes {
+                    let res = self.shape(sh);
+                    self.section_lanes.insert((w, lane), res);
                 }
             }
         }
@@ -1630,8 +1643,8 @@ impl<'a> Lower<'a> {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::ReadLane(v, _) if self.section_uniform(v) => return self.i32_of(v),
-            Shape::ReadLane(v, lane) if let Some(&x) = self.lane_vals.get(&(v, lane)) => {
-                return Ok(x);
+            Shape::ReadLane(v, lane) if self.section_lanes.contains_key(&(v, lane)) => {
+                return self.section_lanes[&(v, lane)];
             }
             Shape::ReadLane(v, lane) => {
                 self.cross_lane(false, outside_compute!("v_readlane_b32 of a constant lane"))?;
@@ -3316,6 +3329,23 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.bin(c, Bin::LShr, m, k32);
         self.s.flags |= flags::INT64;
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
+    }
+
+    /// `v_fma_legacy_f32` and `v_fmac_legacy_f32`, RDNA2's encodings of what GFX10.1 had as
+    /// `v_mad_legacy_f32` and `v_mac_legacy_f32`: one rounding, with DX9's rule that a zero
+    /// factor makes the product +0 against anything (both factors made 0, so `0 * 0 + c`).
+    /// Denormals, unknown: whether the console reads a denormal factor as 0 here is not measured
+    /// (`semantics_tests` guesses it does, as measured for `v_mul_legacy_f32`); this keeps it, as
+    /// `legacy_mul` does, and the host keeps denormals (#323).
+    fn legacy_fma(&mut self, a: V, b: V, cc: V) -> V {
+        let c = self.cur;
+        let zero = self.s.m.f32(0);
+        let az = self.s.m.cmp(c, pred::OEQ, a, zero);
+        let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
+        let z = self.s.m.bin(c, Bin::Or, az, bz);
+        let a = self.s.m.select(c, z, zero, a);
+        let b = self.s.m.select(c, z, zero, b);
+        self.fmad(a, b, cc)
     }
 
     /// `0 × anything = 0`, as in D3D9.
@@ -8651,7 +8681,7 @@ impl<'a> Lower<'a> {
                 let r = self.fmad(a, bb, cc);
                 float(self, r)
             }
-            "v_fmac_f32" | "v_mac_f32" | "v_mac_legacy_f32" => {
+            "v_fmac_f32" | "v_mac_f32" | "v_fmac_legacy_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("an accumulator");
@@ -8670,20 +8700,18 @@ impl<'a> Lower<'a> {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
-                    _ => {
-                        let m = self.legacy_mul(a, bb);
-                        self.s.m.bin(c, Bin::Add, m, acc)
-                    }
+                    _ => self.legacy_fma(a, bb, acc),
                 };
                 float(self, r)
             }
-            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
+            "v_fma_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let m = if name == "v_mad_legacy_f32" {
-                    self.legacy_mul(a, bb)
-                } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
-                };
+                let r = self.legacy_fma(a, bb, cc);
+                float(self, r)
+            }
+            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" => {
+                let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let m = self.s.m.bin(c, Bin::Mul, a, bb);
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)
             }
@@ -9094,20 +9122,20 @@ impl<'a> Lower<'a> {
                 int(self, a)
             }
             "v_readlane_b32"
-                if let [Operand::Vector { reg, .. }, at] = v.src[..]
-                    && let Some(lane) = crate::resource::lane_of(at)
-                    && let Some(x) = inst.read(Reg::V(reg))
-                    && let Some(&a) = self.lane_vals.get(&(x, lane)) =>
-            {
-                int(self, a)
-            }
-            "v_readlane_b32"
                 if let Some(Operand::Vector { reg, .. }) = v.src.first()
                     && let Some(x) = inst.read(Reg::V(*reg))
                     && self.section_uniform(x) =>
             {
                 let a = self.i32_of(x)?;
                 int(self, a)
+            }
+            "v_readlane_b32"
+                if let [Operand::Vector { reg, .. }, at] = v.src[..]
+                    && let Some(lane) = crate::resource::lane_of(at)
+                    && let Some(x) = inst.read(Reg::V(reg))
+                    && let Some(&res) = self.section_lanes.get(&(x, lane)) =>
+            {
+                int(self, res?)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
@@ -11257,7 +11285,9 @@ impl<'a> Lower<'a> {
         }
         // With a16, two 16-bit components per VGPR, low half first, after
         // the offset, bias and compare value, which keep a VGPR each (an f16
-        // bias in its low half).
+        // bias in its low half), and after explicit gradients, which stay
+        // 32-bit (only the `_g16` opcodes, not translated, pack them; LLVM
+        // sizes `image_sample_d` with a16 so on gfx1010 to gfx1030, #320).
         let extra = name
             .strip_prefix("image_sample")
             .or_else(|| name.strip_prefix("image_gather4"))
@@ -11266,10 +11296,20 @@ impl<'a> Lower<'a> {
                     .filter(|t| matches!(*t, "o" | "b" | "c"))
                     .count()
             });
+        let gradients = name.strip_prefix("image_sample").map_or(0, |rest| {
+            let mut tokens = rest.split('_');
+            if !tokens.clone().any(|t| t == "g16") && tokens.any(|t| t == "d" || t == "cd") {
+                // Two per direction on a cube's face, else one per spatial coordinate.
+                if kind == 5 { 4 } else { 2 * (coords - usize::from(kind == 6 || kind == 7)) }
+            } else {
+                0
+            }
+        });
+        let whole = extra + gradients;
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
-            let packed = *a16 && k >= extra;
+            let packed = *a16 && k >= whole;
             let r = *regs
-                .get(if packed { extra + (k - extra) / 2 } else { k })
+                .get(if packed { whole + (k - whole) / 2 } else { k })
                 .ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
             let x = l.i32_of(v)?;
@@ -11277,7 +11317,7 @@ impl<'a> Lower<'a> {
                 return Ok(x);
             }
             let c = l.cur;
-            let half = (k - extra) as u32 % 2;
+            let half = (k - whole) as u32 % 2;
             let (sh, mask) = (l.s.m.i32(16 * half), l.s.m.i32(0xFFFF));
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
@@ -11802,16 +11842,13 @@ impl<'a> Lower<'a> {
                     )
                 }
                 63 => {
-                    // With a16 each direction's gradients start a VGPR.
-                    if *a16 && spatial % 2 == 1 {
-                        return Err("16-bit gradients of a 1D or 3D image");
-                    }
+                    // The gradients are 32-bit, with a16 too.
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
                         let x = addr_val(self, first + k)?;
-                        g[k] = to_float(self, x);
+                        g[k] = self.as_float(x);
                         let y = addr_val(self, first + spatial + k)?;
-                        g[3 + k] = to_float(self, y);
+                        g[3 + k] = self.as_float(y);
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -12294,6 +12331,11 @@ impl<'a> Lower<'a> {
         if !by_index || offset >= 0x1000 {
             return Err("a vertex fetch that is not indexed or has a large offset");
         }
+        let scaled = match (typed, format.and_then(buffer_format)) {
+            (true, Some((_, Numeric::Uscaled))) => Some(Cast::UiToFp),
+            (true, Some((_, Numeric::Sscaled))) => Some(Cast::SiToFp),
+            _ => None,
+        };
         let (kind, comp, channels) = match (typed, format.and_then(buffer_format)) {
             (false, _) if inst.name() == "buffer_load_ubyte" => ('B', 5, 1),
             (false, _) if inst.name() == "buffer_load_sbyte" => ('C', 4, 1),
@@ -12320,8 +12362,8 @@ impl<'a> Lower<'a> {
                     ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Sint) => ('K', 4),
                     ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Unorm) => ('N', 9),
                     ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Snorm) => ('Q', 9),
-                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Uint) => ('B', 5),
-                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Sint) => ('C', 4),
+                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Uint | Numeric::Uscaled) => ('B', 5),
+                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Sint | Numeric::Sscaled) => ('C', 4),
                     ([10, 10, 10, 2], Numeric::Unorm) => ('P', 9),
                     ([10, 10, 10, 2], Numeric::Snorm) => ('T', 9),
                     ([11, 11, 10], Numeric::Float) => ('G', 9),
@@ -12366,11 +12408,25 @@ impl<'a> Lower<'a> {
                 let Val::I32(v) = self.load_any_input(id, k as u8) else {
                     return Err("a vertex input");
                 };
+                // Fetch scaled formats through the existing integer vertex layout, then
+                // convert their numeric value (not normalize or reinterpret the bits).
+                // Do this before rectangle reconstruction, which must see float values.
+                let v = if let Some(cast) = scaled {
+                    let f32t = self.s.t.f32;
+                    let f = self.s.m.cast(self.cur, cast, v, f32t);
+                    self.as_int(f)
+                } else {
+                    v
+                };
                 x[corner] = Some(v);
             }
             loaded.push(x);
         }
-        let float = !matches!(kind, 'U' | 'I' | 'W' | 'K' | 'B' | 'C');
+        let float = scaled.is_some() || !matches!(kind, 'U' | 'I' | 'W' | 'K' | 'B' | 'C');
+        // shortcut: the first float fetch of two or more channels picks the right-angle corner
+        // (taken to be the position), and a float or scaled attribute fetched before it keeps
+        // the stored order, so its fourth corner is wrong when its corners imply another; to
+        // be upgraded when a title is seen fetching an attribute before the position (#49).
         if let ([[Some(a0), Some(b0), Some(d0)], [Some(a1), Some(b1), Some(d1)], ..], true, None) =
             (&loaded[..], float, self.rect_corner)
         {

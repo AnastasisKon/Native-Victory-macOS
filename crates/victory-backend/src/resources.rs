@@ -248,7 +248,8 @@ pub trait ResourceBackend: ComputeBackend {
     );
     /// A buffer SRV or UAV that also carries a typed `texture_buffer` view (`format`) when the
     /// backend supports one, so both raw/structured accesses (`gpuVA`) and typed `bufferLoad` /
-    /// `bufferStore` (`textureViewID`) work through the same heap entry.
+    /// `bufferStore` (`textureViewID`) work through the same heap entry. Returns whether a typed
+    /// `texture_buffer` view now lives in `index` (`false` when falling back to `write_buffer`).
     #[allow(clippy::too_many_arguments)]
     fn write_typed_buffer(
         &self,
@@ -259,9 +260,10 @@ pub trait ResourceBackend: ComputeBackend {
         size: u32,
         format: Format,
         writable: bool,
-    ) {
+    ) -> bool {
         let _ = (format, writable);
         self.write_buffer(heap, index, buffer, title, size);
+        false
     }
     /// A texture SRV or UAV.
     fn write_texture(&self, heap: &Self::Heap, index: usize, tex: &Self::Texture, min_lod: f32);
@@ -269,6 +271,10 @@ pub trait ResourceBackend: ComputeBackend {
     /// Entry `index` names nothing any more: it reads as one never written, and what it kept
     /// alive and resident is let go.
     fn clear_entry(&self, heap: &Self::Heap, index: usize);
+    /// Entries in `heap` that currently hold a live `texture_buffer` view.
+    fn heap_typed_views(&self, _heap: &Self::Heap) -> usize {
+        0
+    }
     /// Diagnostics: the distinct allocations `heap` keeps resident, each with its bytes, the latest
     /// use of the entries naming it (`last_used[index]`, a frame number; 0: never) and whether it
     /// is a texture. `None` where the backend keeps nothing resident for its heaps.

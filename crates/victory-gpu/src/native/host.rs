@@ -204,6 +204,16 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.heaps.borrow().iter().filter(|h| h.kind == HeapKind::Resource).count()
     }
 
+    /// Buffer heap entries across all resource heaps that currently hold a live `texture_buffer`
+    /// view (overwriting an entry with `write_buffer` / `write_texture` or `clear_entry` drops it).
+    pub fn live_typed_views(&self) -> usize {
+        self.heaps
+            .borrow()
+            .iter()
+            .map(|h| self.backend.heap_typed_views(&h.heap))
+            .sum()
+    }
+
     /// The table the pool observer keeps current; register it as (or call it from) the observer.
     pub fn memory(&self) -> Arc<PoolTable> {
         self.memory.clone()
@@ -922,8 +932,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 .resolve(addr, u64::from(size))
                 .ok()
                 .or_else(|| self.title_alias(addr, u64::from(size)).map(|(b, p, _)| (b, p)));
-            if let Some((buf, ptr)) = resolved {
-                self.backend.write_typed_buffer(
+            if let Some((buf, ptr)) = resolved
+                && self.backend.write_typed_buffer(
                     &h.heap,
                     index,
                     &buf,
@@ -931,7 +941,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     size,
                     format,
                     writable,
-                );
+                )
+            {
                 self.typed_views.set(self.typed_views.get() + 1);
             }
         };

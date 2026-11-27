@@ -906,11 +906,18 @@ only for pending bits inside the draw or dispatch's bound `Root::Table` ranges (
 `ResourceDescriptorHeap` directly), leaving unbound structured buffers unmaterialized. If a view's pool offset is not a multiple of
 `minimumTextureBufferAlignmentForPixelFormat` (16 bytes on Apple Silicon), `write_typed_buffer`
 warns once and falls back to `write_buffer` so raw accesses in word 0 still work without tripping
-Metal validation. 32-bit `SINT` views (`4`, `18`, `43`) map to `Uint` because `victory-shader`
+Metal validation. If `Binding`'s DXIL scan ever missed a `TypedBuffer` operation (or a view fell
+back to `write_buffer`), `write_buffer` leaves word 1 (`textureViewID`) at `0` (also zeroing it and
+dropping the `MTLTexture` whenever an entry is re-mirrored), so `texture_buffer` loads and
+`get_width()` read `0` and `texture_buffer` stores are no-ops without faulting (`wrong_typed_buffer_scan_reads_zero_without_crashing`).
+`NativeHost::live_typed_views` (`Metal::heap_typed_views`) counts the entries currently holding a
+`texture_buffer` view alongside cumulative promotions (`NativeHost::typed_views`), logged together
+in `native typed buffer views`. 32-bit `SINT` views (`4`, `18`, `43`) map to `Uint` because `victory-shader`
 passes raw 32-bit lane bits through `TypedBuffer<float4>` (`bitcast i32 <-> float`) while Metal's
 texture unit unpacks/packs by the view's `MTLPixelFormat` with no sub-32-bit extension; 8- and
 16-bit `SINT` stay unmapped so `Uint` does not zero-extend signed channels. Tested on the GPU in
-`native::tests::heap_tests::formatted_buffer_stores_and_loads_through_structured_and_typed_uavs` and
+`native::tests::heap_tests::formatted_buffer_stores_and_loads_through_structured_and_typed_uavs`,
+`native::tests::heap_tests::wrong_typed_buffer_scan_reads_zero_without_crashing`, and
 `victory-metal` `gfx::heap_set_tests::a_heaps_set_follows_its_entries`.
 The "native draws so far" line counts the promotions so far as `typed_views`
 (an entry mirrored again and promoted again counts twice) and the title's

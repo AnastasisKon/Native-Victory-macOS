@@ -20,6 +20,9 @@ use victory_backend::resources::*;
 /// mappings they were made over, when they were last used, and the buffer.
 type TitleAliases<Buf> = RefCell<HashMap<(u64, u64), (u64, u64, Rc<Buf>)>>;
 
+/// Buffers in the host's own memory by `(start, key)`: their end and their wrap once made.
+type OwnBuffers<Buf> = RefCell<std::collections::BTreeMap<(u64, usize), (u64, Option<Rc<Buf>>)>>;
+
 pub struct NativeHost<B: GraphicsBackend> {
     pub backend: B,
     memory: Arc<PoolTable>,
@@ -34,6 +37,9 @@ pub struct NativeHost<B: GraphicsBackend> {
     /// The pool-table generation [`Self::follow_title_pages`] last looked at.
     followed: Cell<u64>,
     resources: RefCell<HashMap<usize, Res<Rc<B::Texture>>>>,
+    /// Buffers in the host's own memory (committed, or placed in a heap), which no pool holds
+    /// ([`Self::own_buffer`]).
+    own: OwnBuffers<B::Buffer>,
     /// Counts changes to [`Self::resources`], so unrealized table entries retry once registered.
     resources_epoch: std::cell::Cell<u64>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
@@ -154,6 +160,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             followed: Cell::new(0),
             maps: RefCell::default(),
             resources: RefCell::default(),
+            own: RefCell::default(),
             resources_epoch: std::cell::Cell::new(0),
             heaps: RefCell::default(),
             contract: RefCell::default(),
@@ -210,13 +217,36 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     /// The buffer and pool-mapping address of `[addr, addr + len)` of title memory.
+    /// Outside every pool, a buffer in the host's own memory that holds the whole range.
     pub fn resolve(&self, addr: u64, len: u64) -> Result<(Rc<B::Buffer>, *const u8), String> {
         self.forget_released();
-        let (pool, ptr) = self
-            .memory
-            .resolve(addr, len)
-            .ok_or_else(|| format!("title address {addr:#x}+{len:#x} {NOT_MAPPED}"))?;
-        Ok((self.pool_buffer(pool.id, pool.base, pool.len)?, ptr))
+        match self.memory.resolve(addr, len) {
+            Some((pool, ptr)) => Ok((self.pool_buffer(pool.id, pool.base, pool.len)?, ptr)),
+            None => self
+                .own_buffer(addr, len)
+                .ok_or_else(|| format!("title address {addr:#x}+{len:#x} {NOT_MAPPED}")),
+        }
+    }
+
+    /// The wrap of the host-memory buffer ([`Self::register_own_buffer`]) holding all of
+    /// `[addr, addr + len)`, made at first use and dropped when the buffer is released. It is kept
+    /// out of the pool table, so the page table, the view pairs, the pool generation and the
+    /// texture placement that walk it never take host memory for title memory.
+    // shortcut: only the buffer starting nearest below `addr` is tried, so of buffers placed
+    // over one another in a heap an outer one is missed (the command stays refused); look
+    // further back if a title roots views in such a buffer.
+    fn own_buffer(&self, addr: u64, len: u64) -> Option<(Rc<B::Buffer>, *const u8)> {
+        let end = addr.checked_add(len.max(1))?;
+        let mut own = self.own.borrow_mut();
+        let (&(start, _), (stop, wrap)) = own.range_mut(..=(addr, usize::MAX)).next_back()?;
+        if end > *stop {
+            return None;
+        }
+        if wrap.is_none() {
+            let (base, top) = Self::alias_range(start, *stop - start)?;
+            *wrap = Some(Rc::new(self.backend.wrap_title_memory(base as *mut u8, (top - base) as usize).ok()?));
+        }
+        Some((wrap.clone()?, addr as *const u8))
     }
 
     /// Drops what the host keeps of pools released since the last call: their buffers, and their
@@ -443,6 +473,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.resources_epoch.set(self.resources_epoch.get() + 1);
     }
 
+    /// Besides [`Self::register_buffer`]: the buffer's memory is the host's own, not a pool's, and
+    /// root views, copies and buffer views into it reach it ([`Self::resolve`]) until it is released.
+    pub fn register_own_buffer(&self, key: usize, addr: u64, len: u64) {
+        self.register_buffer(key, addr, len);
+        self.own.borrow_mut().insert((addr, key), (addr.saturating_add(len), None));
+    }
+
     pub fn register_texture(&self, key: usize, texture: &Rc<B::Texture>) {
         self.resources
             .borrow_mut()
@@ -576,6 +613,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let removed = self.resources.borrow_mut().remove(&key);
         if removed.is_some() {
             self.resources_epoch.set(self.resources_epoch.get() + 1);
+        }
+        if let Some(Res::Buffer(addr, _)) = removed {
+            self.own.borrow_mut().remove(&(addr, key));
         }
         let texture = matches!(removed, Some(Res::Texture(_)));
         if !texture {

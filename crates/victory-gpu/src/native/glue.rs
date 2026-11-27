@@ -669,8 +669,12 @@ pub fn last_frame() -> Option<(usize, usize, Vec<u8>)> {
 // --- resources and descriptors ---
 
 /// A buffer resource object `res` of `len` bytes at title address `addr`.
-pub(crate) fn buffer_created(res: This, addr: u64, len: u64) {
-    with_title(|t| t.host.register_buffer(res as usize, addr, len));
+/// `own`: its memory is the host's (committed, or in a heap), not title memory a pool holds.
+pub(crate) fn buffer_created(res: This, addr: u64, len: u64, own: bool) {
+    with_title(|t| match own {
+        true => t.host.register_own_buffer(res as usize, addr, len),
+        false => t.host.register_buffer(res as usize, addr, len),
+    });
 }
 
 /// A pipeline object's last reference went: the host pipelines made for it are forgotten, as the

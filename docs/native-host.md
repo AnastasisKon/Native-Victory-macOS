@@ -424,6 +424,10 @@ The G-buffer's six 32-lane compute programs (`4359f972`, `d8ff071a`, `e456bd43`,
 
 A lane mask read as a number is the ballot of its lanes' bits where it is written; a mask that also holds lanes not running there (a complement, a copy made where EXEC is not known) is instead the scalar operation that writes it, applied to its operands' numbers (`Lower::mask_number`). Where that is not possible the refusal now says why: "a lane mask holding lanes elsewhere read as data: " then "in a mesh, hull or geometry program" (any stage but compute, pixel and vertex), "a program input", "not written by a scalar ALU instruction", "written by a scalar instruction of the other width" (a `_b32` operation in a wave64 program, such as `s_and_saveexec_b32`), "the EXEC a saveexec keeps, or a mask written with EXEC", "shifted on the host's lanes", "an operand no SGPR or constant gives" or "a scalar operation not modelled". The story-load log of issue #110 (Series S) has three compute programs refused with the old, single message; the next log says which of these they are. Of the forms tried by hand in a wave64 compute program (`s_and_saveexec_b64`, `s_orn1_saveexec_b64`, `s_brev_b64`, `s_wqm_b64`, `s_cselect_b32`, `s_mov_b32` and `s_not_b32` of `vcc_lo`), only `s_and_saveexec_b32` reaches this refusal; the others lower.
 
+"A program input" was also what a loop's join gave, as the join has no defining instruction: a structurized loop keeps the lanes still looping in an SGPR beside EXEC (a copy of EXEC before the loop, `s_andn2_b64 s, s, exec` and its SCC for "does any lane loop on?" at the head, `s_andn2_wrexec_b64 s, s` at the back edge, which writes the same result to both). Where the structuriser could not prove that every lane arriving at the head has its bit set (an outer loop with lanes that broke out makes the arrivals unprovable), the head's SCC was a number of that join and was refused. That join is EXEC at the head: on every edge it takes EXEC's own incoming value (a copy, or the same `_wrexec` result), so it now counts as the head's EXEC mask and a ballot there gives it (`structure::Lanes::exec_copies_at_joins`). Found on the world's lighting compute `9e5a12054881a74d` (#258), the only writer of a 1280x720 R11G11B10 target the host otherwise never wrote; that program then stops at the next refusal, the lanes that broke out of a loop read back through copies ("a lane-mask join of an untracked mask: data whose high dword is not known"). Of 4,129 refused containers dumped at boot (27 November, Series S), the 15 refused as "a program input" are all such joins; only that compute one changes. Test: `mask_tests::a_loop_register_that_is_exec_on_every_edge_is_exec_at_the_head` (two nested loops of this shape; the inner loop's register was not the head's EXEC mask before).
+
+That program's next refusal was a join, not the lanes that broke out: after a loop that an EXEC skip (`s_cbranch_execz`, `s_cmp_eq_u64 exec, 0` and `s_cbranch_scc1` once lockstep rewrites it) can jump over, an SGPR that holds the loop's mask on one edge and leftover data on the skip's (descriptor dwords, the high one with no value) is read only ANDed with EXEC. On the skip's edge that EXEC is the one the skip found empty, so the AND keeps no lane whatever the SGPR holds: the edge is not needed (`Lower::unneeded_edges` now knows that edge, where the lane algebra could not prove it), and a join that lockstep takes as a number no longer asks for that edge's dwords first. Measured offline (27 November) on the 4,129 refused containers of a boot run: with both changes 28 compute programs translate (`9e5a12054881a74d`, `2fcb1ef0e54c7df4`, an HDR writer, and `113a4779d954d6d2`, `a81f1b5bb0d7ba01`, `dd1d8e07445421e6` among them), 2 more stop at a later refusal, nothing else changes; Metal made the compute pipelines of 21 of the 28 (not run) and the host refused the other 7 as "needs view addresses or write marks". Test: `gfx_refusal_tests::a_join_read_only_with_exec_needs_nothing_from_an_exec_skip` (refused before as "data whose high dword is not known").
+
 ## Shader and pipeline cache on disk (native path)
 
 On by default; `VICTORY_NO_SHADER_CACHE=1` turns it off (an empty value or `0` leaves it on). Everything lives under the cache folder (`cache_subdir("native-shaders")`, for example `~/.cache/victory/native-shaders/<translator>/`), never in the repo, and is never sent anywhere. Three layers, each written to a temporary name and renamed:
@@ -818,12 +822,38 @@ into the same targets with a dropped dispatch between them stay two render
 passes (likewise two dispatches around a dropped draw, and blits), so the
 backend still orders their pool-buffer accesses; a dropped command of the same
 kind as both its neighbours parts nothing, as before. These two are counted
-per host (`NativeHost::unset_roots`, `NativeHost::no_targets`), not in the
-"native draws so far" line, and they warn (once each, "native host drops work:
-...") only with `VICTORY_TRACE_TARGETS=1`. Unknown: what the console gives a
-shader in a root slot the title set nothing in. A title shader's metadata can
-name such a slot (255 observed); the host draws nothing for it, which is a
-fallback, not the console's behaviour.
+per host (`NativeHost::unset_roots`, `NativeHost::no_targets`). The unset-root
+drops are in the "native draws so far" line as `dropped_unset_root` (with
+`dropped_unmapped` and `dropped_failed` for the kinds below) and warn without
+a switch, the first time for each root parameter (at most 16); the no-target
+drops warn once with `VICTORY_TRACE_TARGETS=1`. Unknown: what the console
+gives a shader in a root slot the title set nothing in; the host draws nothing
+for it, which is a fallback, not the console's behaviour.
+
+Root parameter 255 was not such a slot (#258). It is the translator's own
+view-stride table (`victory_shader::emit::VIEW_STRIDES`, root SRV `t255`): a
+shader that takes a buffer view from the resource heap itself looks up the
+entry's stride there before it reads the entry, and reads the host's null
+buffer view where the table holds 0 (`emit`, "Buffer views at computed heap
+indices"). The native host bound no such table, so every draw and dispatch of
+such a shader was dropped at submission, counted only in `unset_roots` and
+warned about only with `VICTORY_TRACE_TARGETS=1`; the title's culling shaders
+are among them. Now each resource heap has a stride table
+(`NativeHost::view_strides`: a dword per heap index up to `HEAP_VIEWS`, 8 MiB,
+from `descriptors::stride_word`, made the first time such a shader is bound
+with the heap, from the title's records, and kept current by
+`NativeHost::mirror`), bound where the shader's layout has `t255`. A resource
+heap is as long as the translator's index clamp (`HEAP_VIEWS` entries of 24
+bytes, 48 MiB of zeroed host memory a heap, as the D3D12 host's heaps are),
+with null buffer views at `NULL_BUFFER_VIEW` and below it: a shader's clamped
+index and its null view must be entries the heap has. shortcut: an entry the
+title copies as bytes outside a bound table keeps its old stride until it is
+mirrored, and a record the title zeroes keeps its stride (the table check
+skips empty records). Not measured: how much of the longer heap and of the
+table becomes resident. Tests:
+`heap_tests::a_compute_shader_stores_through_a_buffer_view_it_takes_from_the_heap`
+(a compute program stores through a buffer view it loads from the heap by
+index, on Metal) and `descriptors::tests::stride_words_of_buffer_views`.
 
 A third kind is dropped the same way: any command (draw, dispatch, copy, fill
 or value write) that names title memory outside every mapped pool ("title
@@ -879,6 +909,44 @@ A 2D shader resource view with `MipLevels = UINT_MAX` exposes every mip from
 views so Metal clamps it to the remaining levels. Previously the decoder returned zero and
 the host bound the whole texture, so a shader reading level 0 saw the base mip even when
 the view started farther down the chain.
+
+#### Typed and structured buffer views lazily carry a Metal `texture_buffer`
+
+`victory-shader` lowers MUBUF `buffer_load_format_*`, `buffer_store_format_*`, and their
+`getDimensions` size queries to DXIL `TypedBuffer` (`bufferLoad.f32` / `bufferStore.f32`), which the
+Metal Shader Converter compiles (tested on a small synthetic DXIL shader) to
+`air.read_texture_buffer_1d.v4f32`, `air.write_texture_buffer_1d.v4f32`, and
+`air.get_width_texture_buffer_1d` reading `textureViewID` (word 1) of the 24-byte
+`IRDescriptorTableEntry`. `Metal::write_buffer` previously left word 1 at `0` (null
+`MTLResourceID`) for every buffer view, so formatted buffer stores wrote nothing and formatted
+buffer loads and size queries returned `0` (`#255`).
+
+To keep `NativeHost::mirror` free of Metal texture allocations across ~40,000-entry world heaps,
+`mirror` continues to write `[gpu, 0, size]` via `write_buffer` and marks two pending bits per
+entry (`list::PendingTyped`, ~10 KiB for 40,000 entries, `descriptors::typed_buffer`) for typed
+buffer SRVs/UAVs and for 4-, 8-, and 16-byte structured buffer SRVs/UAVs (guess, marked in
+`descriptors.rs`: on RDNA2 a structured `V#` of 4-, 8-, or 16-byte elements carries a 1-, 2-, or
+4-dword 32-bit data format, so shaders may access the same descriptor with both
+`buffer_store_format_*` / `buffer_load_format_*` and `buffer_store_dword*` / `buffer_load_dword*`).
+`Binding::of` scans the module's DXIL symbol and constant tables once
+(`list::dxil_uses_typed_buffers`) to flag shaders that use `bufferLoad`, `bufferStore`, or
+`TypedBuffer` `getDimensions`. At draw/dispatch submission, `NativeHost::materialize_typed_buffers`
+is a no-op unless a bound stage sets `typed_buffers`; when set, it calls `Metal::write_typed_buffer`
+only for pending bits inside the draw or dispatch's bound `Root::Table` ranges (plus explicit
+`stride == 0` typed buffer views in the bound heap if the shader also indexes
+`ResourceDescriptorHeap` directly), leaving unbound structured buffers unmaterialized. If a view's pool offset is not a multiple of
+`minimumTextureBufferAlignmentForPixelFormat` (16 bytes on Apple Silicon), `write_typed_buffer`
+warns once and falls back to `write_buffer` so raw accesses in word 0 still work without tripping
+Metal validation. 32-bit `SINT` views (`4`, `18`, `43`) map to `Uint` because `victory-shader`
+passes raw 32-bit lane bits through `TypedBuffer<float4>` (`bitcast i32 <-> float`) while Metal's
+texture unit unpacks/packs by the view's `MTLPixelFormat` with no sub-32-bit extension; 8- and
+16-bit `SINT` stay unmapped so `Uint` does not zero-extend signed channels. Tested on the GPU in
+`native::tests::heap_tests::formatted_buffer_stores_and_loads_through_structured_and_typed_uavs` and
+`victory-metal` `gfx::heap_set_tests::a_heaps_set_follows_its_entries`.
+The "native draws so far" line counts the promotions so far as `typed_views`
+(an entry mirrored again and promoted again counts twice) and the title's
+resource heaps as `resource_heaps`, to weigh what the typed views and the
+longer heaps cost.
 
 #### A command buffer the GPU fails still pays its signals and value writes
 

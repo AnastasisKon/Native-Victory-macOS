@@ -6,7 +6,7 @@
 //! per pool (see [`super::memory`]); nothing is copied to or from it.
 
 use super::addr::{self, Mapping, Pages, Pairs};
-use super::descriptors::{Decoded, Res, decode};
+use super::descriptors::{Decoded, Res, decode, typed_buffer};
 use super::list::{Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
 use super::memory::PoolTable;
 use std::cell::{Cell, RefCell};
@@ -50,6 +50,8 @@ pub struct NativeHost<B: GraphicsBackend> {
     failed: std::cell::Cell<u64>,
     /// Passes handed to the backend.
     passes: std::cell::Cell<u64>,
+    /// Buffer heap entries promoted lazily to `texture_buffer` views so far.
+    typed_views: std::cell::Cell<u64>,
     /// With texture copy-back on: the keys dispatches had bound for unordered access, not yet
     /// taken by [`Self::take_written`].
     written: RefCell<Option<std::collections::HashSet<usize>>>,
@@ -161,6 +163,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             cleared: std::cell::Cell::new(0),
             failed: std::cell::Cell::new(0),
             passes: std::cell::Cell::new(0),
+            typed_views: std::cell::Cell::new(0),
             written: Default::default(),
         }
     }
@@ -189,6 +192,16 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// Passes handed to the backend so far (compute, render and blit; a clear is a render pass).
     pub fn passes(&self) -> u64 {
         self.passes.get()
+    }
+
+    /// Buffer heap entries promoted lazily to `texture_buffer` views so far.
+    pub fn typed_views(&self) -> u64 {
+        self.typed_views.get()
+    }
+
+    /// Resource heaps the title made (the host's own contract heap apart).
+    pub fn resource_heaps(&self) -> usize {
+        self.heaps.borrow().iter().filter(|h| h.kind == HeapKind::Resource).count()
     }
 
     /// The table the pool observer keeps current; register it as (or call it from) the observer.
@@ -462,7 +475,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     "a resource heap too long for title memory views: shaders that find memory by address will not run with it"
                 );
             }
-            count + addr::RESERVED
+            Self::resource_entries(count)
         } else {
             count
         };
@@ -473,14 +486,49 @@ impl<B: GraphicsBackend> NativeHost<B> {
             count,
             pairs: Default::default(),
             table: Default::default(),
+            strides: Default::default(),
             mirrored: Default::default(),
             pending_mirror: Default::default(),
             title_views: Default::default(),
             images: Default::default(),
             used: Default::default(),
+            typed_pending: Default::default(),
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
+    }
+
+    /// The entries of a resource heap of `count` title entries: the title's, the view pairs of
+    /// the pool-offset contract, and then up to the translator's clamp of heap indices
+    /// (`HEAP_VIEWS`: a translated shader reads no entry past it, and reads the host's null
+    /// buffer views just below it, see [`Self::write_null_buffers`]). A heap too long for the
+    /// pairs ([`addr::fits`]) stays as long as it is.
+    fn resource_entries(count: usize) -> usize {
+        let entries = count + addr::RESERVED;
+        if addr::fits(count) {
+            entries.max(victory_shader::emit::HEAP_VIEWS as usize)
+        } else {
+            entries
+        }
+    }
+
+    /// Writes the null raw buffer views a translated shader reads in place of a heap entry that
+    /// holds no buffer view (`victory_shader::emit`, "Buffer views at computed heap indices"):
+    /// the shader view at `NULL_BUFFER_VIEW` and the unordered one just below it. Written with
+    /// the heap's view-stride table ([`Self::view_strides`]), which is what sends a shader there.
+    fn write_null_buffers(&self, heap: &NativeHeap<B>) -> Result<(), String> {
+        if !addr::fits(heap.count) {
+            return Err(format!(
+                "a resource heap of {} entries has no room for the null buffer views",
+                heap.count
+            ));
+        }
+        let null = self.null_view()?;
+        let at = victory_shader::emit::NULL_BUFFER_VIEW as usize;
+        for index in [at - 1, at] {
+            self.backend.write_buffer(&heap.heap, index, &null.buf, null.ptr().cast_const(), 0);
+        }
+        Ok(())
     }
 
     /// Each heap's descriptor records, `[start, end)` in the title's memory (its own view, which
@@ -535,6 +583,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
         for heap in self.heaps.borrow().iter() {
             for index in heap.take_entries(key) {
+                heap.typed_pending.borrow_mut().set(index, false, false);
                 self.backend.clear_entry(&heap.heap, index);
                 self.cleared.set(self.cleared.get() + 1);
             }
@@ -611,7 +660,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let Some((heap, index)) = found else {
             return Ok(false);
         };
-        let Some(view) = crate::descriptor::view(handle) else {
+        let view = crate::descriptor::view(handle);
+        if heap.kind == HeapKind::Resource
+            && let Some(strides) = &*heap.strides.borrow()
+        {
+            strides.write_at(index, &[self.stride_word(view.as_ref())]);
+        }
+        let Some(view) = view else {
             return Ok(false);
         };
         let resources = self.resources.borrow();
@@ -656,6 +711,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             null.ptr().cast_const(),
                             0,
                         );
+                        heap.typed_pending.borrow_mut().set(index, false, false);
                         // The null view has replaced whatever the cached record used to show.
                         heap.mirrored.borrow_mut().remove(&index);
                         heap.pending_mirror.borrow_mut().insert(
@@ -672,6 +728,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 };
                 self.backend
                     .write_buffer(&heap.heap, index, &buf, ptr, size);
+                let (is_typed, is_explicit) = match typed_buffer(&view, &resources) {
+                    Some((_, _, explicit)) => (true, explicit),
+                    None => (false, false),
+                };
+                heap.typed_pending
+                    .borrow_mut()
+                    .set(index, is_typed, is_explicit);
                 heap.shows(index, None);
             }
             Decoded::Image {
@@ -699,11 +762,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
                 }
+                heap.typed_pending.borrow_mut().set(index, false, false);
                 heap.shows(index, Some(resource));
             }
             Decoded::Sampler { desc, lod_bias } => {
                 let s = self.backend.create_sampler(&desc)?;
                 self.backend.write_sampler(&heap.heap, index, &s, lod_bias);
+                heap.typed_pending.borrow_mut().set(index, false, false);
                 heap.shows(index, None);
             }
         }
@@ -817,6 +882,77 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
     }
 
+    /// Promotes unmaterialized buffer entries to `texture_buffer` views lazily when the bound
+    /// shader uses DXIL `TypedBuffer` operations: only the bound `Root::Table` spans, plus
+    /// explicit (`stride == 0`) typed buffer views in `heap` when the shader also indexes
+    /// `ResourceDescriptorHeap` directly.
+    fn materialize_typed_buffers(
+        &self,
+        root: &[Option<Root<B>>],
+        binding: Option<&Binding>,
+        heap: Option<&Rc<NativeHeap<B>>>,
+    ) {
+        let any_typed = binding
+            .is_none_or(|b| b.typed_buffers || b.ps.as_ref().is_some_and(|p| p.typed_buffers));
+        if !any_typed {
+            return;
+        }
+        let promote = |h: &NativeHeap<B>, index: usize| {
+            let handle = h.start + index as u64 * Self::step(h.kind);
+            let Some(view) = crate::descriptor::view(handle) else { return };
+            let resources = self.resources.borrow();
+            let (Some(Decoded::Buffer { addr, size }), Some((format, writable, _))) =
+                (decode(&view, &resources), typed_buffer(&view, &resources))
+            else {
+                return;
+            };
+            drop(resources);
+            let resolved = self
+                .resolve(addr, u64::from(size))
+                .ok()
+                .or_else(|| self.title_alias(addr, u64::from(size)).map(|(b, p, _)| (b, p)));
+            if let Some((buf, ptr)) = resolved {
+                self.backend.write_typed_buffer(
+                    &h.heap,
+                    index,
+                    &buf,
+                    ptr,
+                    size,
+                    format,
+                    writable,
+                );
+                self.typed_views.set(self.typed_views.get() + 1);
+            }
+        };
+        let mut indices = Vec::new();
+        for (slot, r) in root.iter().enumerate() {
+            let Some(Root::Table(h, at)) = r else { continue };
+            if h.kind != HeapKind::Resource {
+                continue;
+            }
+            let check = table_check_count(slot, binding, Self::TABLE_CHECK);
+            let end = (*at + check).min(h.count);
+            indices.clear();
+            h.typed_pending.borrow_mut().drain_range(*at, end, &mut indices);
+            for &index in &indices {
+                promote(h, index);
+            }
+        }
+        let heap_typed = binding.is_some_and(|b| {
+            b.heap_typed_buffers || b.ps.as_ref().is_some_and(|p| p.heap_typed_buffers)
+        });
+        if heap_typed
+            && let Some(h) = heap
+            && h.typed_pending.borrow().has_explicit()
+        {
+            indices.clear();
+            h.typed_pending.borrow_mut().drain_explicit(&mut indices);
+            for &index in &indices {
+                promote(h, index);
+            }
+        }
+    }
+
     /// The arguments of a translated title shader: its user-data block, then its root views.
     /// `threads`: the dispatch's thread counts, for a shader that reads them.
     fn translated_args(
@@ -881,6 +1017,23 @@ impl<B: GraphicsBackend> NativeHost<B> {
             args = args.constants(&values);
         }
         for &(slot, _) in &b.views {
+            // The translator's own table, not a title root parameter: the strides of the views
+            // in the heap the shader indexes.
+            if slot == victory_shader::emit::VIEW_STRIDES {
+                let heap = match (&p.heap, heap) {
+                    (Some(h), _) | (None, Some(h)) => h.clone(),
+                    (None, None) => {
+                        let h = self.host_heap()?;
+                        p.heap = Some(h.clone());
+                        h
+                    }
+                };
+                let pages = self.view_strides(&heap)?;
+                let gpu = self.backend.gpu_address(&pages.buf, pages.ptr());
+                p.bufs.push(pages.buf.clone());
+                args = args.address(gpu);
+                continue;
+            }
             let Root::View(a) = set(slot)? else {
                 return Err(format!("root parameter {slot} is not a root view"));
             };
@@ -891,6 +1044,36 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
         p.root = args;
         Ok(())
+    }
+
+    /// A heap entry's dword of the view-stride table ([`super::descriptors::stride_word`]).
+    fn stride_word(&self, view: Option<&crate::descriptor::View>) -> u32 {
+        view.map_or(0, |v| super::descriptors::stride_word(v, &self.resources.borrow()))
+    }
+
+    /// The view-stride table of `heap` (the translator's root SRV `t255`, which a shader that
+    /// takes a buffer view from the resource heap itself looks up before it reads the entry).
+    /// One dword for every index a shader can compute (`HEAP_VIEWS`): the buffer view's element
+    /// size at the title's entries, 0 elsewhere (the shader then reads the null buffer view).
+    /// Made at first use from the heap as the title's memory has it now and kept current by
+    /// [`Self::mirror`]. shortcut: an entry the title copied as bytes outside a bound table
+    /// keeps its old dword until it is mirrored.
+    fn view_strides(&self, heap: &NativeHeap<B>) -> Result<Rc<Pages<B>>, String> {
+        if let Some(made) = &*heap.strides.borrow() {
+            return Ok(made.clone());
+        }
+        self.write_null_buffers(heap)?;
+        let slots = heap.count.max(victory_shader::emit::HEAP_VIEWS as usize);
+        let pages = Rc::new(Pages::new(&self.backend, slots * 4)?);
+        let step = Self::step(heap.kind);
+        for index in 0..heap.count {
+            let view = crate::descriptor::view(heap.start + index as u64 * step);
+            if view.is_some() {
+                pages.write_at(index, &[self.stride_word(view.as_ref())]);
+            }
+        }
+        *heap.strides.borrow_mut() = Some(pages.clone());
+        Ok(pages)
     }
 
     /// The page table of the pool-offset contract for `heap` and the pool table as it is now:
@@ -1010,17 +1193,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
             return Ok(h.clone());
         }
         let heap = Rc::new(NativeHeap {
-            heap: self.backend.create_heap(HeapKind::Resource, addr::RESERVED)?,
+            heap: self.backend.create_heap(HeapKind::Resource, Self::resource_entries(0))?,
             kind: HeapKind::Resource,
             start: 0,
             count: 0,
             pairs: Default::default(),
             table: Default::default(),
+            strides: Default::default(),
             mirrored: Default::default(),
             pending_mirror: Default::default(),
             title_views: Default::default(),
             images: Default::default(),
             used: Default::default(),
+            typed_pending: Default::default(),
         });
         self.contract.borrow_mut().heap = Some(heap.clone());
         Ok(heap)
@@ -1420,6 +1605,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 self.trace_draw(root, pso.binding.as_ref(), true);
                 self.trace_root_span(root, pso.binding.as_ref(), groups);
                 self.remirror_tables(root, pso.binding.as_ref());
+                self.materialize_typed_buffers(root, pso.binding.as_ref(), heaps.0.as_ref());
                 self.note_written(root, pso.binding.as_ref());
                 match &pso.binding {
                 Some(b) => {
@@ -1455,6 +1641,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     self.trace_draw(root, binding.as_deref(), false);
                 }
                 self.remirror_tables(root, binding.as_deref());
+                self.materialize_typed_buffers(root, binding.as_deref(), heaps.0.as_ref());
                 self.trace_root_span(root, binding.as_deref(), &[0; 3]);
                 self.trace_content(root, vertex, call, binding.as_deref(), targets);
                 match binding {
@@ -1516,9 +1703,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.follow_title_pages();
         // A draw or dispatch that reads a root parameter the title never set is dropped by itself:
         // refusing the whole piece for it also dropped the piece's value writes, and a queue that
-        // waits for one of those then holds everything behind it for good. (A title shader's
-        // metadata can name a root slot the title sets nothing in, 255 observed; what the console
-        // gives such a shader there is not known.) Any other error drops its command alone too.
+        // waits for one of those then holds everything behind it for good. (What the console
+        // gives a shader in a root slot the title set nothing in is not known. Slot 255 is not
+        // one: it is the translator's view-stride table, which `translated_args` binds.) Any
+        // other error drops its command alone too.
         // A dropped command still ends the pass it would have ended: the commands either side of it
         // that it kept apart stay in two passes (`cut`), so the backend still orders their
         // accesses to pool buffers. `VICTORY_TRACE_TARGETS=1` warns at the first drop of each kind.
@@ -1577,12 +1765,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         && matches!(c, Cmd::Draw { .. } | Cmd::Dispatch { .. }) =>
                 {
                     self.unset_roots.set(self.unset_roots.get() + 1);
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    if trace {
-                        ONCE.call_once(|| {
-                            tracing::warn!(error = %e, "native host drops work: a draw or dispatch that reads a root parameter the title never set (first time)");
-                        });
+                    // Logged without a switch (the first of each root parameter): such work was
+                    // dropped for a whole run unseen (every shader that reads root parameter 255,
+                    // the view-stride table, before the host had one).
+                    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+                    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                    if seen.len() < 16 && seen.insert(e.clone()) {
+                        tracing::warn!(error = %e, "native host drops work: a draw or dispatch that reads a root parameter the title never set (first time for this parameter; counted as dropped_unset_root in \"native draws so far\")");
                     }
+                    drop(seen);
                     dropped.push(c);
                 }
                 // The GPU cannot reach that memory, so the command is not encoded (no GPU fault),

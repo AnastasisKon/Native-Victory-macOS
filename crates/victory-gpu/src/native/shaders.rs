@@ -303,15 +303,19 @@ impl<B: PresentBackend> Title<B> {
         if env_set!("VICTORY_TRACE_PIPES") {
             tracing::info!(name, stencil = ?g.stencil(), depth = ?g.depth_test(), ?color_state, "guessed pipeline state");
         }
-        let vs_binding = Binding { name: name.into(), ..Binding::of(vs) };
-        let ps_binding = ps
-            .map(|ps| Binding { name: name.into(), ..Binding::of(ps) })
-            .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
+        let ps_full = ps.map(|ps| Binding { name: name.into(), ..Binding::of(ps) });
+        let mut vs_binding = Binding { name: name.into(), ..Binding::of(vs) };
+        if let Some(p) = &ps_full {
+            vs_binding.typed_buffers |= p.typed_buffers;
+            vs_binding.heap_typed_buffers |= p.heap_typed_buffers;
+        }
         // As for compute: without the host's layout the converter makes the user-data block a
         // root CBV (a pointer), while the host writes its dwords inline, so the shader reads its
         // user data (descriptor table offsets, root constants) from address 0.
         let vs_layout = vs_binding.layout();
-        let ps_layout = ps.map(Binding::of).and_then(|b| b.layout());
+        let ps_layout = ps_full.as_ref().and_then(Binding::layout);
+        let ps_binding = ps_full
+            .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
         let desc = RenderPipelineDesc {
             vs: &vs.dxil,
             ps: ps.map(|p| &p.dxil[..]),

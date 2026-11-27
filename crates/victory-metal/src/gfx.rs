@@ -1279,6 +1279,13 @@ impl GraphicsBackend for Metal {
         made.map(|made| made.and_then(|(pso, mesh)| self.finish_render(d, pso, mesh))).transpose()
     }
 
+    fn name_render_pipeline(&self, p: &RenderPipeline, name: &str) {
+        if self.trace_fails {
+            let key = Retained::as_ptr(&p.pso) as *const u8 as usize;
+            self.pipe_names.borrow_mut().insert(key, name.to_string());
+        }
+    }
+
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
         if self.trace_fails {
             report_in_flight();
@@ -1394,7 +1401,8 @@ impl GraphicsBackend for Metal {
         flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
         // A command buffer the GPU fails is logged (the first few), not silently dropped.
         let trace = self.trace_fails;
-        let tinfo = trace.then(|| (serial, label, self.trace_enc.borrow().join(" | ")));
+        let tinfo = trace.then(|| (serial, label.clone(), self.trace_enc.borrow().join(" | ")));
+        self.trace_commit(serial, queue_id, &label);
         if let Some((s, l, enc)) = &tinfo {
             IN_FLIGHT.lock().unwrap().insert(*s, (std::time::Instant::now(), format!("{l} | {enc}")));
         }
@@ -1402,6 +1410,7 @@ impl GraphicsBackend for Metal {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
+            trace_done(serial, done);
             landed(serial, queue_id, done.error().is_some());
             if let Some((s, l, enc)) = &tinfo {
                 let started = IN_FLIGHT.lock().unwrap().remove(s).map(|(t, _)| t);
@@ -1507,11 +1516,13 @@ impl Metal {
             cb
         };
         flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
+        self.trace_commit(serial, queue_id, &format!("piece {piece}"));
         let trace = self.trace_fails;
         let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
+            trace_done(serial, done);
             let error = done.error();
             landed(serial, queue_id, dropped || error.is_some());
             if let Some(e) = &error
@@ -1976,6 +1987,27 @@ fn wake_and_drain(
     (in_flight, left.len())
 }
 
+/// `VICTORY_TRACE_COMMITS=1` (with `VICTORY_TRACE_GPU_FAILS` for the encoder names): a line for
+/// each command buffer as it is committed (serial, queue, its encoders: pipelines by shader hash,
+/// draw counts, dispatch sizes) and one as it completes, so a command buffer the GPU never
+/// finishes is the one committed and never done (#79).
+fn commits_traced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TRACE_COMMITS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The completion line of [`commits_traced`].
+fn trace_done(serial: u64, done: &ProtocolObject<dyn MTLCommandBuffer>) {
+    if commits_traced() {
+        tracing::info!(
+            "cb done #{serial} t={:.3} gpu_ms={:.1} failed={}",
+            crate::metal::since_start(),
+            (done.GPUEndTime() - done.GPUStartTime()) * 1000.0,
+            done.error().is_some()
+        );
+    }
+}
+
 static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
@@ -2063,6 +2095,15 @@ impl Metal {
         let n = objc2_foundation::NSString::from_str(&s);
         self.trace_enc.borrow_mut().push(s);
         n
+    }
+
+    /// The commit line of [`commits_traced`]: this command buffer's encoders, which are then
+    /// forgotten so the next piece lists only its own.
+    fn trace_commit(&self, serial: u64, queue_id: usize, what: &str) {
+        if commits_traced() {
+            let enc = std::mem::take(&mut *self.trace_enc.borrow_mut()).join(" | ");
+            tracing::warn!("cb commit #{serial} q{queue_id:x} t={:.3} {what} | {enc}", crate::metal::since_start());
+        }
     }
 
     fn encode_blit(
@@ -3053,7 +3094,25 @@ impl Metal {
             started.set(true);
         }
         if self.trace_fails {
-            e.setLabel(Some(&self.cap_label(format!("render: {} draws", rp.draws.len()))));
+            // Each distinct pipeline once, with its draw count: names the pass's shaders.
+            let names = self.pipe_names.borrow();
+            let mut seen: Vec<(usize, usize)> = Vec::new();
+            for d in &rp.draws {
+                let k = Retained::as_ptr(&d.pipeline.pso) as *const u8 as usize;
+                match seen.iter_mut().find(|(p, _)| *p == k) {
+                    Some((_, n)) => *n += 1,
+                    None => seen.push((k, 1)),
+                }
+            }
+            let mut l = format!("render: {} draws", rp.draws.len());
+            for (k, n) in seen {
+                match names.get(&k) {
+                    Some(name) => l.push_str(&format!("; {name} x{n}")),
+                    None => l.push_str(&format!("; {k:#x} x{n}")),
+                }
+            }
+            drop(names);
+            e.setLabel(Some(&self.cap_label(l)));
         }
         e.endEncoding();
         Ok(())

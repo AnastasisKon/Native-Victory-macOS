@@ -77,6 +77,47 @@ pub(crate) fn since_start() -> f64 {
     START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
 }
 
+/// `VICTORY_TRACE_RESIDENCY=1`: times residency-set calls and command buffer commits. Each call over
+/// 50 ms is logged at once; once a second a summary gives count, total and longest per kind, with
+/// the bytes and allocations of the last set seen. Lines up the host's calls with wired memory (#79).
+pub(crate) fn residency_timed<R>(
+    what: &'static str,
+    set: Option<&ProtocolObject<dyn MTLResidencySet>>,
+    f: impl FnOnce() -> R,
+) -> R {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[allow(clippy::type_complexity)]
+    static SUM: Mutex<(f64, BTreeMap<&'static str, (u64, f64, f64)>, u64, usize)> = Mutex::new((0.0, BTreeMap::new(), 0, 0));
+    if !*ON.get_or_init(|| std::env::var("VICTORY_TRACE_RESIDENCY").is_ok_and(|v| v.trim() == "1")) {
+        return f();
+    }
+    let t = std::time::Instant::now();
+    let r = f();
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    let size = set.map(|s| (s.allocatedSize(), s.allocationCount()));
+    if ms > 50.0 {
+        tracing::warn!(what, ms, t = since_start(), set_mb = size.map(|s| s.0 >> 20), allocations = size.map(|s| s.1), "residency: slow call");
+    }
+    let mut g = SUM.lock().unwrap();
+    let e = g.1.entry(what).or_default();
+    e.0 += 1;
+    e.1 += ms;
+    e.2 = e.2.max(ms);
+    if let Some((b, n)) = size {
+        (g.2, g.3) = (b, n);
+    }
+    let now = since_start();
+    if now - g.0 >= 1.0 {
+        let kinds = g.1.iter().map(|(k, (n, tot, max))| format!("{k} {n}x {tot:.0}/{max:.0}ms")).collect::<Vec<_>>().join(", ");
+        tracing::info!(t = now, set_mb = g.2 >> 20, allocations = g.3, "residency: last {:.1} s: {kinds}", now - g.0);
+        g.0 = now;
+        g.1.clear();
+    }
+    r
+}
+
 /// Counters of residency work.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct ResidencyCounts {
@@ -150,7 +191,7 @@ impl Drop for Buffer {
     fn drop(&mut self) {
         if let Some(set) = self.resident.get_mut().take() {
             set.removeAllocation(ProtocolObject::from_ref(&*self.buf));
-            set.commit();
+            residency_timed("pool_commit", Some(&set), || set.commit());
         }
     }
 }

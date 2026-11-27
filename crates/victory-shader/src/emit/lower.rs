@@ -14372,6 +14372,52 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The one value every edge into the joins of `phi` brings, through copies (`s_mov`, a
+    /// swap's last XOR, an SGPR spill read back): the register holds it on every path, so on
+    /// every lane whichever edge it came by.
+    fn copy_leaf(&self, phi: Value) -> Option<Value> {
+        let p = self.x.p;
+        let copy = |v: Value| match self.x.st.restored.get(&v) {
+            Some(&s) => Some(s),
+            None => crate::structure::copied(self.def_inst(v)?, v, |x| self.def_inst(x)),
+        };
+        let (mut seen, mut todo, mut leaf) = (Set::default(), vec![phi], None);
+        while let Some(mut a) = todo.pop() {
+            while let Some(c) = copy(a) {
+                a = c;
+            }
+            if !seen.insert(a) {
+                continue;
+            }
+            // shortcut: a bounded web, as `Lanes::unchanged` (spilled registers' joins are small).
+            if seen.len() > 64 {
+                return None;
+            }
+            match self.phi_at.get(&a) {
+                Some(&(b, i)) => todo.extend(p.blocks[b].phis[i].args.iter().copied()),
+                None if leaf.is_none_or(|x| x == a) => leaf = Some(a),
+                None => return None,
+            }
+        }
+        leaf
+    }
+
+    /// The number `phi` holds when it is [`Self::copy_leaf`]'s value: that value's, or with
+    /// console lanes a lane mask's ballot.
+    fn copied_number(&mut self, phi: Value) -> Option<V> {
+        let leaf = self.copy_leaf(phi)?;
+        match self.vals.get(&leaf) {
+            Some(&Val::I32(x)) => Some(x),
+            _ if self.mask_data == MaskData::Console => {
+                let was_ok = std::mem::replace(&mut self.mask_ok, true);
+                let x = self.i32_of(leaf);
+                self.mask_ok = was_ok;
+                x.ok()
+            }
+            _ => None,
+        }
+    }
+
     /// The instruction writing `v`.
     fn def_inst(&self, v: Value) -> Option<&'a Inst> {
         let b = *self.def_block.get(&v)?;
@@ -14779,6 +14825,13 @@ impl<'a> Lower<'a> {
                                 continue 'phi;
                             }
                         }
+                    }
+                    // Every edge brings one value round copies (a value swapped through a mask's
+                    // register and back on one arm): it, whichever edges the lanes took.
+                    (Some(Val::Missing(_)), false)
+                        if read && let Some(x) = self.copied_number(phi.value) =>
+                    {
+                        x
                     }
                     (Some(Val::Missing(why)), _) if read => {
                         retry.push((phi.value, why));

@@ -1508,6 +1508,42 @@ from its descriptor, the word there stored to the output; refused before, and wi
 refusal lifted the converter refused the pipeline: "Resource SRV in space 2 register 1 ... is not
 referenced by the root signature").
 
+The table gives every field it doesn't hold as 0. The translator refuses a program that can see a
+bit of one of them, rather than let it read 0 (`Lower::view_addresses`, `Lower::seen_bits`).
+Refused fields:
+- a buffer's stride and swizzle (dword 1 bits 16-31) and its dwords 2-3;
+- an image's base address, minimum level and format (dword 0, dword 1 bits 0-29);
+- an image's dword 2 bits 30-31, its tiling (dword 3 bits 20-27) and its dwords 4-7.
+
+The message is "a view address field the table gives as 0: " and the field.
+
+The bits a program can see are followed through its readers:
+- `s_and_b32` with a constant keeps that constant's bits;
+- `s_pack_ll_b32_b16` keeps the low half;
+- `s_or_b32` with a constant and `s_lshr_b64` by a constant (of which the dword is the high half)
+  are followed into their results, four readers deep, as long as nothing reads their SCC;
+- any other reader, or a phi, sees every bit.
+
+Measured offline (27 November, the 4,921-container all-shaders boot set, main 465db23b + #304):
+- 44 translated programs read the table: 42 compute, 2 pixel, no vertex.
+- 40 of them read a buffer's dword 1. 23 keep its low 16 bits with `s_and_b32`, 12 pack them with
+  `s_pack_ll_b32_b16`, and 5 shift the address pair right with `s_lshr_b64` before masking.
+- None reads an image's dwords through the table.
+- With the check, all 44 still translate:
+  - 40 have the same output;
+  - 3 no longer load a dword whose readers are never lowered;
+  - 1 is changed only in its refusal message.
+- 11 programs that were already refused now name the field (10 a buffer's stride or swizzle, 1 its
+  record count or format).
+
+Test: `gfx_refusal_tests::view_address_fields_the_table_gives_as_0_are_refused`. It runs one
+refusal per field class, plus accepted reads of a buffer's address (whole dword 0, dword 1 masked
+to 16 bits, or shifted with `s_lshr_b64` and masked) and of an image's size fields. Without the
+check, a read of a buffer's whole dword 1 translated.
+
+shortcut: the kind of view is the load's (eight dwords at a whole descriptor are an image), and the
+swizzle reads as the identity.
+
 ## Descriptor dwords read as data
 
 The console compiler computes sizes from descriptor bits instead of querying them; those fields

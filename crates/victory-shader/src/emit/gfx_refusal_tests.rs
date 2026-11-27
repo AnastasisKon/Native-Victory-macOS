@@ -873,6 +873,82 @@ fn descriptor_dwords_read_as_data_say_which() {
     }
 }
 
+/// A descriptor read only as data takes its dwords from the view addresses (`t1`), which hold a
+/// buffer's address and an image's size fields and give every other field as 0: a program that
+/// can see a bit of those is refused naming the field, and one that keeps only the address or
+/// the sizes translates.
+#[test]
+fn view_address_fields_the_table_gives_as_0_are_refused() {
+    use crate::native::tests::{fspx, fspx_resource};
+    // The view at table dword 8, loaded as a buffer's four dwords to s[12:15] or an image's
+    // eight to s[12:19]; `read` leaves what it keeps in s20, which is stored.
+    let program = |image: bool, read: &[u32]| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            if image { 0xF40C_0302 } else { 0xF408_0302 },
+            0xFA00_0020, // s_load_dwordx4 (x8) s[12:15] (s[12:19]), s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        code.extend_from_slice(read);
+        code.extend_from_slice(&[
+            0x7E02_0214, // v_mov_b32 v1, s20
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let resources = [
+            fspx_resource(3, 3, 0, 0, 4, 0),
+            fspx_resource(0, 3, 8, 0, 4, 0),
+        ];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let and = |src: u32, mask: u32| vec![0x8714_FF00 | src, mask]; // s_and_b32 s20, s<src>, mask
+    let mov = |src: u32| vec![0xBE94_0300 | src]; // s_mov_b32 s20, s<src>
+    // s_lshr_b64 s[20:21], s[12:13], 8, then s_and_b32 s20, s21, mask: dword 1 bits 8 on.
+    let shifted = |mask: u32| vec![0x9094_880C, 0x8714_FF15, mask];
+    let accepted = [
+        (false, mov(12)),
+        (false, and(13, 0xFFFF)),
+        (false, shifted(0xFF)),
+        (true, and(13, 0xC000_0000)),
+        (true, and(14, 0x3FFF_FFFF)),
+        (true, and(15, 0xF00F_FFFF)),
+    ];
+    for (image, read) in accepted {
+        let shader = translate_with(&program(image, &read), Options::default());
+        assert!(
+            shader.as_ref().is_ok_and(|s| s.view_addresses),
+            "{read:x?}: {:?}",
+            shader.err()
+        );
+    }
+    let prefix = "a view address field the table gives as 0: ";
+    let dword_1 = "an image's base address, minimum level or format (dword 1)";
+    let refused = [
+        (false, mov(13), "a buffer's stride or swizzle"),
+        (false, and(13, 0x3FFF_0000), "a buffer's stride or swizzle"),
+        (false, shifted(0xFFFF), "a buffer's stride or swizzle"),
+        (false, mov(14), "a buffer's record count or format"),
+        (true, mov(12), "an image's base address"),
+        (true, and(13, 0xFF), dword_1),
+        (true, and(13, 0x1FF0_0000), dword_1),
+        (true, mov(14), "an image's dword 2"),
+        (true, and(15, 0x01F0_0000), "an image's tiling"),
+        (true, mov(16), "an image's dwords 4-7"),
+    ];
+    for (image, read, why) in refused {
+        let err = translate_with(&program(image, &read), Options::default()).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { what, .. })
+                if what.strip_prefix(prefix) == Some(why)),
+            "{read:x?}: {err:?}"
+        );
+    }
+}
+
 #[test]
 fn refusal2_pixel_system_inputs_lower_when_declared() {
     // Reads v0..v6 = Position.xyzw, FrontFace, Ancillary, SampleCoverage

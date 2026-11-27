@@ -7128,15 +7128,46 @@ impl<'a> Lower<'a> {
     /// dwords 1-3 (width, height, first and last level, type: size queries
     /// of a texture the program never samples). They come from the host's
     /// view addresses, `t1` in [`super::shader::MEMORY_SPACE`]: four dwords
-    /// per heap index.
-    // shortcut: dword 1 holds the address bits only (stride and swizzle read
-    // 0) or a texture's width bits, dword 3 a texture's size fields (format,
-    // tiling and swizzle choice read 0 or the identity); dword 4 on and a
-    // buffer's dwords 2-3 (record count, format) stop the program when read;
-    // the table offset's computed part is taken as whole descriptors
-    // (32-byte multiples).
+    /// per heap index. The table gives every other field as 0, so a program
+    /// that can see one of their bits (`seen_bits`) is refused: a buffer's
+    /// stride and swizzle (dword 1 bits 16-31) and dwords 2-3, an image's
+    /// base address, minimum level and format (dword 0, dword 1 bits 0-29),
+    /// dword 2 bits 30-31, tiling (dword 3 bits 20-27) and dwords 4-7.
+    // shortcut: the swizzle reads as the identity; the kind of view is the
+    // load's (eight dwords at a whole descriptor: an image) and the table
+    // offset's computed part is taken as whole descriptors (32-byte
+    // multiples).
     fn view_addresses(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor read only as data";
+        // What the table holds of each dword, and why reading the rest stops the program.
+        const BUFFER: [(u32, Why); 2] = [
+            (!0, ""),
+            (
+                0xFFFF,
+                "a view address field the table gives as 0: a buffer's stride or swizzle",
+            ),
+        ];
+        const BUFFER_REST: Why =
+            "a view address field the table gives as 0: a buffer's record count or format";
+        const IMAGE: [(u32, Why); 4] = [
+            (
+                0,
+                "a view address field the table gives as 0: an image's base address",
+            ),
+            (
+                0xC000_0000,
+                "a view address field the table gives as 0: an image's base address, minimum \
+                 level or format (dword 1)",
+            ),
+            (
+                0x3FFF_FFFF,
+                "a view address field the table gives as 0: an image's dword 2",
+            ),
+            (
+                0xF00F_FFFF,
+                "a view address field the table gives as 0: an image's tiling",
+            ),
+        ];
+        const IMAGE_REST: Why = "a view address field the table gives as 0: an image's dwords 4-7";
         let a = *self
             .scalar
             .get(&site)
@@ -7149,30 +7180,86 @@ impl<'a> Lower<'a> {
         }
         // The compiler loads image descriptors whole, buffer ones as four
         // dwords.
-        let known = if count == 8 && a.offset.is_multiple_of(32) {
-            4
+        let (known, rest): (&[(u32, Why)], Why) = if count == 8 && a.offset.is_multiple_of(32) {
+            (&IMAGE, IMAGE_REST)
         } else {
-            2
+            (&BUFFER, BUFFER_REST)
         };
         let views = self.s.view_addresses_handle();
         for k in 0..count {
             let word = (a.offset / 4 + k) % 8;
-            let val = if word < known {
-                let index = self.heap_index(site, k as u8, false)?;
-                let c = self.cur;
-                let four = self.s.m.i32(4);
-                let at = self.s.m.bin(c, Bin::Shl, index, four);
-                let w = self.s.m.i32(4 * word);
-                let at = self.s.m.bin(c, Bin::Add, at, w);
-                Val::I32(self.raw_dword(views, at))
-            } else {
-                Val::Missing(OTHER)
+            let written = inst.write(Reg::S(code + k as u8));
+            let val = match known.get(word as usize) {
+                Some(&(held, why))
+                    if written.is_some_and(|v| self.seen_bits(v, 4) & !held != 0) =>
+                {
+                    Val::Missing(why)
+                }
+                Some(_) => {
+                    let index = self.heap_index(site, k as u8, false)?;
+                    let c = self.cur;
+                    let four = self.s.m.i32(4);
+                    let at = self.s.m.bin(c, Bin::Shl, index, four);
+                    let w = self.s.m.i32(4 * word);
+                    let at = self.s.m.bin(c, Bin::Add, at, w);
+                    Val::I32(self.raw_dword(views, at))
+                }
+                None => Val::Missing(rest),
             };
-            if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+            if let Some(v) = written {
                 self.vals.insert(v, val);
             }
         }
         Ok(())
+    }
+
+    /// The bits of scalar value `v` the program can see: what each reader keeps of it
+    /// (`s_and_b32` with a constant, `s_pack_ll_b32_b16` its low half, `s_or_b32` with a
+    /// constant and `s_lshr_b64` by a constant of which it is the high dword, followed `depth`
+    /// readers deep), and every bit through a phi or any other reader.
+    fn seen_bits(&self, v: Value, depth: u8) -> u32 {
+        let constant = |o: &Operand| match *o {
+            Operand::Literal(x) => Some(x),
+            Operand::Const(c @ 128..=192) => Some(u32::from(c - 128)),
+            _ => None,
+        };
+        // What one reader keeps of `v`; `None`: every bit.
+        let kept = |i: &Inst| -> Option<u32> {
+            let Fields::Sop { src, dst, .. } = &i.fields else {
+                return None;
+            };
+            let deeper = |r: Option<Value>| r.map_or(0, |r| self.seen_bits(r, depth - 1));
+            let result = |n: u8| match *dst {
+                Some(Operand::Scalar { code, .. }) => deeper(i.write(Reg::S(code + n))),
+                _ => 0,
+            };
+            // An SCC something reads sees whether the result is 0.
+            let scc_unread = deeper(i.write(Reg::Scc)) == 0;
+            match (i.name(), &src[..]) {
+                ("s_and_b32", [a, b]) => constant(a).or(constant(b)),
+                ("s_pack_ll_b32_b16", _) => Some(0xFFFF),
+                ("s_or_b32", [a, b]) if scc_unread => {
+                    Some(result(0) & !constant(a).or(constant(b))?)
+                }
+                ("s_lshr_b64", [Operand::Scalar { code, .. }, k]) if scc_unread => {
+                    let k = constant(k)? & 63;
+                    let high =
+                        i.read(Reg::S(code + 1)) == Some(v) && i.read(Reg::S(*code)) != Some(v);
+                    (high && (1..32).contains(&k)).then(|| result(0) >> (32 - k) | result(1) << k)
+                }
+                _ => None,
+            }
+        };
+        let mut seen = 0;
+        for b in &self.x.p.blocks {
+            if b.phis.iter().any(|ph| ph.args.contains(&v)) {
+                return !0;
+            }
+            for i in b.insts.iter().filter(|i| i.reads.iter().any(|r| r.1 == v)) {
+                seen |= if depth == 0 { None } else { kept(i) }.unwrap_or(!0);
+            }
+        }
+        seen
     }
 
     /// `s_load_dword*` from the program's constant table.

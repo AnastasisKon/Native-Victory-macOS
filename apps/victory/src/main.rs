@@ -13,6 +13,8 @@ mod run;
 mod shader;
 #[cfg(windows)]
 mod translate;
+#[cfg(target_os = "macos")]
+mod warm;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod window;
 
@@ -225,7 +227,18 @@ fn main() -> Result<()> {
             {
                 translate::warm(paths, jobs, pipelines)
             }
-            #[cfg(not(windows))]
+            // The native host's warm-up goes from the containers earlier runs
+            // kept, and its Metal libraries and pipelines are made in the run.
+            #[cfg(target_os = "macos")]
+            {
+                anyhow::ensure!(!pipelines, "--pipelines needs a Windows host for now");
+                anyhow::ensure!(
+                    paths.is_empty(),
+                    "on a Mac the warm-up translates the containers earlier runs kept, not files: give no paths"
+                );
+                warm::native(jobs)
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
             {
                 let _ = (paths, jobs, pipelines);
                 anyhow::bail!("translate needs a Windows host for now")

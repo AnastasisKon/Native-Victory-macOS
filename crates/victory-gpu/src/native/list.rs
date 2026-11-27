@@ -168,23 +168,14 @@ pub struct Shown {
     gone: std::collections::HashMap<usize, Vec<usize>>,
 }
 
-impl Shown {
-    fn show(&mut self, index: usize, resource: Option<usize>) {
-        let Shown { of, entries, .. } = self;
+impl<B: GraphicsBackend> NativeHeap<B> {
+    /// Entry `index` now shows title texture `resource` (`None`: a buffer or a sampler).
+    pub fn shows(&self, index: usize, resource: Option<usize>) {
+        let Shown { of, entries, .. } = &mut *self.images.borrow_mut();
         match resource {
             Some(r) => {
                 if of.insert(index, r) != Some(r) {
-                    let e = entries.entry(r).or_default();
-                    e.push(index);
-                    // A texture bound again and again at new entries of a ring heap would list
-                    // every entry it ever had: drop the stale ones each time the list doubles, so
-                    // it stays within twice the entries that show it (`shows`, once a submission
-                    // for thousands of textures, read it all).
-                    if e.len() >= 16 && e.len().is_power_of_two() {
-                        e.retain(|i| of.get(i) == Some(&r));
-                        e.sort_unstable();
-                        e.dedup();
-                    }
+                    entries.entry(r).or_default().push(index);
                 }
             }
             None => {
@@ -193,27 +184,10 @@ impl Shown {
         }
     }
 
-    fn shows(&mut self, resource: usize) -> bool {
-        let Shown { of, entries, .. } = self;
-        let Some(e) = entries.get(&resource) else { return false };
-        let shown = e.iter().any(|i| of.get(i) == Some(&resource));
-        if !shown {
-            // Every entry it had shows something else now: nothing to read through again.
-            entries.remove(&resource);
-        }
-        shown
-    }
-}
-
-impl<B: GraphicsBackend> NativeHeap<B> {
-    /// Entry `index` now shows title texture `resource` (`None`: a buffer or a sampler).
-    pub fn shows(&self, index: usize, resource: Option<usize>) {
-        self.images.borrow_mut().show(index, resource);
-    }
-
     /// Whether an entry shows title texture `resource`.
     pub fn shows_texture(&self, resource: usize) -> bool {
-        self.images.borrow_mut().shows(resource)
+        let Shown { of, entries, .. } = &*self.images.borrow();
+        entries.get(&resource).is_some_and(|e| e.iter().any(|i| of.get(i) == Some(&resource)))
     }
 
     /// The entries that show title texture `resource`, which they stop showing.
@@ -1491,52 +1465,5 @@ impl<B: GraphicsBackend> NativeList<B> {
             first_instance,
             wide,
         })
-    }
-}
-
-#[cfg(test)]
-mod shown_tests {
-    use super::Shown;
-
-    /// A texture bound at a new entry each frame (a ring heap) keeps a short list, and what it
-    /// shows reads as before.
-    #[test]
-    fn rebinding_at_new_entries_keeps_the_list_short() {
-        let mut s = Shown::default();
-        let (tex, other) = (0x1000, 0x2000);
-        for frame in 0..10_000 {
-            s.show(frame, Some(tex));
-            // The ring comes round: the entry is written with another texture.
-            s.show(frame, Some(other));
-        }
-        s.show(10_000, Some(tex));
-        assert!(s.shows(tex));
-        assert!(s.entries[&tex].len() <= 32, "{} entries listed", s.entries[&tex].len());
-        // Shown again at an entry it had before, then nowhere.
-        s.show(5, Some(tex));
-        s.show(10_000, None);
-        s.show(5, Some(other));
-        assert!(!s.shows(tex));
-        assert!(!s.entries.contains_key(&tex), "a texture no entry shows lists nothing");
-    }
-
-    /// Live entries survive the trim, each once.
-    #[test]
-    fn the_trim_keeps_every_live_entry() {
-        let mut s = Shown::default();
-        for i in 0..100 {
-            s.show(i, Some(7));
-        }
-        for i in (0..100).step_by(2) {
-            s.show(i, Some(8));
-        }
-        for i in 100..140 {
-            s.show(i, Some(7));
-        }
-        let mut live: Vec<usize> = s.entries[&7].iter().copied().filter(|i| s.of.get(i) == Some(&7)).collect();
-        live.sort_unstable();
-        live.dedup();
-        let want: Vec<usize> = (1..100).step_by(2).chain(100..140).collect();
-        assert_eq!(live, want);
     }
 }

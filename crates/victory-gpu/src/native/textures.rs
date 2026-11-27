@@ -1144,9 +1144,20 @@ impl<B: PresentBackend> Title<B> {
     /// work in flight reads it through an entry, and no list holds one), and none a submission in
     /// flight names. One still shown waits until the title writes another record over that entry.
     /// One named again later is made again from title memory.
-    fn give_up_covered(&mut self) {
-        let keys: Vec<usize> = self.covered.iter().copied().collect();
+    ///
+    /// shortcut: a sync checks at most [`COVERED_CHECKS`] of them, round-robin (a world keeps ~9,000
+    /// covered copies in use, and checking them all took ~8 ms of each submission under the host's
+    /// lock), so one is given up up to a sweep late (about a second); upgrade to a mark on the
+    /// copies whose entries or lists changed if memory is short.
+    pub(super) fn give_up_covered(&mut self) {
+        if self.covered_queue.is_empty() {
+            self.covered_queue = self.covered.iter().copied().collect();
+        }
+        let keys = self.covered_queue.split_off(self.covered_queue.len().saturating_sub(COVERED_CHECKS));
         for k in keys {
+            if !self.covered.contains(&k) {
+                continue;
+            }
             let Some(t) = self.textures.get(&k) else {
                 self.covered.remove(&k);
                 continue;
@@ -1602,6 +1613,9 @@ pub(super) fn lock_traced() -> bool {
 /// With [`lock_traced`]: microseconds submissions spent in `keep_named`, `keep_to_budget`,
 /// `give_up_covered` and the probes (`Title::sync_jobs`).
 pub(super) static SYNC_PHASES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Covered copies a sync checks at most ([`Title::give_up_covered`]).
+pub(super) const COVERED_CHECKS: usize = 512;
 
 /// The texture budget: how many bytes of sampled host texture copies the host keeps before it
 /// gives up the least recently used of those it may ([`Title::keep_to_budget`]).

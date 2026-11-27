@@ -30,9 +30,9 @@ else ok "rustup"; fi
 MSC="${VICTORY_MSC_DYLIB:-/usr/local/lib/libmetalirconverter.dylib}"
 if [[ -f "$MSC" ]]; then ok "Metal Shader Converter ($MSC)"
 else
-  warn "Metal Shader Converter not found at $MSC"
-  echo "        Download \"Metal shader converter\" from https://developer.apple.com/metal/shader-converter/"
-  echo "        and run its installer. It is free with an Apple ID. Without it shaders cannot be translated."
+  fail "Metal Shader Converter not found at $MSC: without it shaders cannot be translated and the gpu tests fail on the missing dylib (#379).
+        Download \"Metal shader converter\" from https://developer.apple.com/metal/shader-converter/
+        and run its installer. It is free with an Apple ID."
 fi
 
 echo

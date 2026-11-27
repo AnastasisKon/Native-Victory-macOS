@@ -622,6 +622,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
             heap.title_views.borrow_mut().remove(&index);
         }
         match decoded {
+            // A buffer view of address 0 (what D3D12 writes for a null view): the null view, and
+            // mirrored like any other entry. Taken for memory in no pool, it was tried again at
+            // every draw after any change to the pool table, which world streaming makes all the
+            // time (about 10,000 entries a submission in the world).
+            Decoded::Buffer { addr: 0, .. } => {
+                let null = self.null_view()?;
+                self.backend.write_buffer(&heap.heap, index, &null.buf, null.ptr().cast_const(), 0);
+                heap.shows(index, None);
+            }
             Decoded::Buffer { addr, size } => {
                 // Read before resolving: a pool mapped by a title thread after a failed resolve
                 // must bump past these, so the entry is retried.

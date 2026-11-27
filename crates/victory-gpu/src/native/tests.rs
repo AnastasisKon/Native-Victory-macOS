@@ -693,6 +693,47 @@ fn submission_retries_an_unchanged_buffer_descriptor_after_mapping() {
     assert_eq!(host.backend.buffer_writes.borrow().len(), 2);
 }
 
+/// A buffer view of address 0 (a null view) is the null view for good: a change to the pool table
+/// (world streaming maps pages between almost every submission) does not make it be tried again.
+#[test]
+fn a_null_buffer_view_is_not_retried_when_the_pool_table_changes() {
+    let host = super::host::NativeHost::new(super::vertex_tests::Capture::default());
+    let mut slot = [0u32; 8];
+    let handle = slot.as_mut_ptr() as u64;
+    let heap = host.heap(HeapKind::Resource, handle, 1).unwrap();
+    crate::descriptor::create_cbv(std::ptr::null_mut(), &[0, 0, 256, 0], handle);
+
+    let mut list = NativeList::default();
+    list.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
+    list.set_render_targets(
+        &[Rc::new(victory_backend::resources::TextureDesc::d2(victory_backend::resources::Format::Rgba8Unorm, 1, 1))],
+        None,
+    );
+    list.set_heaps(Some(&heap), None);
+    list.set_graphics_root_table(0, &heap, 0);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    let submit = || host.execute(&(), &[&list], &[], &[]).unwrap();
+
+    submit();
+    assert!(matches!(
+        host.backend.buffer_writes.borrow().as_slice(),
+        [(0, _, _, 0)]
+    ));
+
+    // Pages mapped elsewhere move the pool table's generation on.
+    for (n, at) in [0x80000usize, 0x90000].into_iter().enumerate() {
+        let pool = PoolInfo {
+            id: n + 1,
+            base: 0x40000 + n * 0x4000,
+            len: 0x4000,
+            memory_entry: None,
+        };
+        host.memory().mapped(at, pool.len, &pool, 0);
+        submit();
+    }
+    assert_eq!(host.backend.buffer_writes.borrow().len(), 1);
+}
+
 #[test]
 fn submission_retries_an_unrealized_resource_descriptor_once_registered() {
     let host = super::host::NativeHost::new(super::vertex_tests::Capture::default());

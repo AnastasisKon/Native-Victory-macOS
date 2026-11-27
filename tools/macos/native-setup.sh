@@ -32,7 +32,8 @@ if [[ -f "$MSC" ]]; then ok "Metal Shader Converter ($MSC)"
 else
   warn "Metal Shader Converter not found at $MSC"
   echo "        Download \"Metal shader converter\" from https://developer.apple.com/metal/shader-converter/"
-  echo "        and run its installer. It is free with an Apple ID. Without it shaders cannot be translated."
+  echo "        and run its installer. It is free with an Apple ID. Without it shaders cannot be translated"
+  echo "        (tools/macos/test-native.sh fails fast on the same check, #379)."
 fi
 
 echo

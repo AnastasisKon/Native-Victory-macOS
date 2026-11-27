@@ -14,6 +14,8 @@ pub mod io;
 pub mod ir;
 pub mod native;
 pub mod range;
+#[cfg(test)]
+mod range_tests;
 pub mod resource;
 pub mod structure;
 

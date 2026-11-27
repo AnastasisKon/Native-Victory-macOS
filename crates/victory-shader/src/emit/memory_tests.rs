@@ -80,6 +80,8 @@ fn program() -> HostShader {
     // tracers take their BVH's), read through.
     w.extend(s_load(1, 16, 4, 0x20)); // s[16:17] = descriptor 1, dwords 0-1
     w.push(S_WAITCNT_ALL);
+    // Only the address's high bits of dword 1: its stride and swizzle are no address (#311).
+    w.extend([0x8711_FF11, 0x0000_FFFF]); // s_and_b32 s17, s17, 0xffff
     w.extend(s_load(0, 18, 16, 0x100)); // s18 = the dword at +0x100
     w.push(S_WAITCNT_ALL);
     // Pointers into a page no copy holds and into a 256 MiB region with no

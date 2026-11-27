@@ -1669,3 +1669,149 @@ fn a_compute_shader_reads_both_the_view_strides_and_the_view_addresses() {
     assert_eq!((t.host.unset_roots(), t.host.failed()), (0, 0));
     drop(records);
 }
+
+/// [`CS_HEAP`] with a sample at level 0 (`image_sample_lz` at (0.5, 0.5), an immediate sampler
+/// with point mips and no LOD limit in s[24:27]) in place of the load: it stores the sampled
+/// texel's green channel.
+const CS_HEAP_SAMPLE_LZ: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xBE80_0306, // s_mov_b32 s0, s6
+    0xBE81_0380, // s_mov_b32 s1, 0
+    0xF40C_0400, 0xFA00_0020, // s_load_dwordx8 s[16:23], s[0:1], 0x20
+    0xBE98_0380, // s_mov_b32 s24, 0
+    0xBE99_03FF, 0x00FF_F000, // s_mov_b32 s25, 0xfff000 (MAX_LOD 15.99)
+    0xBE9A_03FF, 0x0400_0000, // s_mov_b32 s26, 0x4000000 (MIP_FILTER point)
+    0xBE9B_0380, // s_mov_b32 s27, 0
+    0x7E00_02F0, // v_mov_b32 v0, 0.5
+    0x7E02_02F0, // v_mov_b32 v1, 0.5
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF09C_0F08, 0x00C4_0200, // image_sample_lz v[2:5], v[0:1], s[16:23], s[24:27] dmask:0xf dim:2D
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_0000, 0x8003_0300, // buffer_store_dword v3, off, s[12:15], 0
+    0xBF81_0000, // s_endpgm
+];
+
+/// A sample at an explicit level honours the view's minimum LOD clamp: heap entry 1 shows a 4x4
+/// texture whose mip 0 is green 0 and mip 1 green 1.0, through a view clamped at mip 1. Metal
+/// applies an entry's clamp only to samples that pick their own level, so the translator raises
+/// the level to the clamp the view-stride table holds; before, this read mip 0 (0.0).
+#[test]
+fn a_sample_at_level_zero_reads_no_finer_mip_than_the_views_clamp() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_HEAP_SAMPLE_LZ, &[uav], 7);
+    let cs = shaders::translate(&c).unwrap();
+    assert!(cs.heap);
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let heap = Heap::new(&t);
+    let mut d = TextureDesc::d2(Format::Rgba8Unorm, 4, 4);
+    d.mips = 3;
+    let tex = t.host.texture(&d).unwrap();
+    for (mip, (w, g)) in [(4usize, 0u8), (2, 255), (1, 128)].into_iter().enumerate() {
+        t.host.backend.upload_texture(&tex, mip, 0, &[0, g, 0, 255].repeat(w * w), w * 4, 0);
+    }
+    let key = 0x4EA9_0010;
+    t.host.register_texture(key, &tex);
+    // DXGI_FORMAT_R8G8B8A8_UNORM, TEXTURE2D, every mip, ResourceMinLODClamp 1.0.
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5], srv[7]) = (28, 4, u32::MAX, 1.0f32.to_bits());
+    let records = heap._records.as_ptr() as u64;
+    crate::descriptor::create_srv(std::ptr::null(), key as _, &srv, records + 32);
+    assert!(t.host.mirror(records + 32).unwrap());
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, records + 64);
+    assert!(t.host.mirror(records + 64).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "heap") else { panic!("{:?}", t.shaders) };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap.heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap.heap, 2);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(f.get(0x2_0000, 2), [0x3F80_0000, super::addr_tests::CANARY]);
+}
+
+/// The title's guard before it sizes an image from its descriptor: dword 1 tested against 0 (a
+/// null descriptor), 1 stored for a view and 0 for a null one. The image is written so the load
+/// is a descriptor the program uses.
+const CS_NULL_TEST: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xF40C_0405, 0xFA00_0020, // s_load_dwordx8 s[16:23], s[10:11], 0x20
+    0x7E00_0280, // v_mov_b32 v0, 0
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0x7E0C_0280, // v_mov_b32 v6, 0
+    0x7E0E_0280, // v_mov_b32 v7, 0
+    0x7E10_0280, // v_mov_b32 v8, 0
+    0x7E12_0280, // v_mov_b32 v9, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF020_1F08, 0x0004_0600, // image_store v[6:9], v[0:1], s[16:23] dmask:0xf dim:2D unorm
+    0xBF00_8011, // s_cmp_eq_i32 s17, 0
+    0x8518_8180, // s_cselect_b32 s24, 0, 1
+    0x7E08_0218, // v_mov_b32 v4, s24
+    0xE070_0000, 0x8003_0400, // buffer_store_dword v4, off, s[12:15], 0
+    0xBF81_0000, // s_endpgm
+];
+
+/// An image 5 wide is no null descriptor: its dword 1 (width - 1 in bits 30-31, 0 here) was 0 as
+/// rebuilt, so the program took it for null and sized it 0 (the console's dword 1 holds a nonzero
+/// format as well).
+#[test]
+fn an_image_whose_width_bits_in_dword_1_are_0_is_no_null_descriptor() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let mut image = [0u8; 32];
+    image[0] = 0x41;
+    image[4..6].copy_from_slice(&[3, 3]);
+    image[8] = 8;
+    image[16] = 1;
+    image[20..23].copy_from_slice(&[8, 4, 1]);
+    let c = crate::pipeline::test_compute_container(CS_NULL_TEST, &[uav, image], 7);
+    let cs = shaders::translate(&c).unwrap();
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    // Entry 0: a raw buffer UAV of 64 dwords at `VA_A`; entry 1: a 5x8 RGBA8 texture UAV.
+    let records = vec![0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start);
+    assert!(t.host.mirror(start).unwrap());
+    let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 5, 8);
+    desc.unordered_access = true;
+    let tex = t.host.texture(&desc).unwrap();
+    let key = 0x4EA9_0200;
+    t.host.register_texture(key, &tex);
+    let mut uav_desc = [0u32; 10];
+    (uav_desc[0], uav_desc[1]) = (28, 4);
+    crate::descriptor::create_uav(std::ptr::null(), key as _, std::ptr::null(), &uav_desc, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "null test") else { panic!("{:?}", t.shaders) };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    assert_eq!(f.get(0x2_0000, 1), [1], "a view, not a null descriptor");
+    drop(records);
+}

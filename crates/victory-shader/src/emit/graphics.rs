@@ -1065,6 +1065,45 @@ mod tests {
         r
     }
 
+    /// A pixel program exporting a float colour to mrt0 and, in mrt1.x, the bits of a float it
+    /// made (pi): with mrt1 an integer target (`Options::integer_targets` bit 1), output row 1
+    /// is uint, row 0 stays float (the store is `export_tests::an_integer_target_stores_the_bits`).
+    #[test]
+    fn integer_targets_declare_uint_outputs_and_store_the_bits() {
+        let code = words(&[
+            0x7E00_02F2, // v_mov_b32 v0, 1.0
+            0x7E02_02F0, // v_mov_b32 v1, 0.5
+            0x7E06_02FF, 0x4049_0FDB, // v_mov_b32 v3, pi
+            0x0604_0680, // v_add_f32 v2, 0, v3
+            0xF800_100F, 0x0001_0100, // exp mrt0 v0, v1, v1, v0 vm
+            0xF800_1811, 0x0000_0002, // exp mrt1 v2, off, off, off done vm
+            ENDPGM,
+        ]);
+        let c = container(HwStage::Ps, &code, &[0; 0x10]).unwrap();
+        let rows = |o: super::super::Options| {
+            let dxil = super::super::translate_with(&c, o).unwrap().dxil;
+            let part = crate::Container::parse(&dxil).unwrap().part(FourCC::OSG1).unwrap().data.to_vec();
+            // Each 32-byte element: register (row) at 20, component type at 16.
+            let base = crate::dxbc::u32_at(&part, 4).unwrap() as usize;
+            let n = crate::dxbc::u32_at(&part, 0).unwrap() as usize;
+            let mut rows: Vec<_> = (0..n)
+                .map(|i| (crate::dxbc::u32_at(&part, base + 32 * i + 20).unwrap(), crate::dxbc::u32_at(&part, base + 32 * i + 16).unwrap()))
+                .collect();
+            rows.sort();
+            (rows, dxil)
+        };
+        let int = super::super::Options { integer_targets: 0b10, ..Default::default() };
+        // D3D component types: 1 uint, 3 float.
+        let (r, made) = rows(int);
+        assert_eq!(r, vec![(0, 3), (1, 1)]);
+        let (r, plain) = rows(Default::default());
+        assert_eq!(r, vec![(0, 3), (1, 3)]);
+        assert_ne!(made, plain);
+        // A mask naming targets the program does not export changes nothing, byte for byte.
+        let other = super::super::Options { integer_targets: 0b1100, ..Default::default() };
+        assert_eq!(rows(other).1, plain);
+    }
+
     /// `v_interp_p1_f32 v2, v0, attr0.x`, `v_interp_p2_f32 v2, v1, attr0.x`, then `exp mrt0` of
     /// v2 in x and `s_endpgm`: a pixel shader of one attribute and one colour.
     fn pixel_code() -> Vec<u8> {

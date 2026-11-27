@@ -35,11 +35,19 @@ pub fn translate(container: &[u8]) -> Result<HostShader, String> {
 }
 
 /// [`victory_shader::emit::translate_with`] through the on-disk cache (`shader_cache::native_shader`):
-/// `o` is part of the key.
+/// `o` is part of the key. On a host without one (neither Windows nor macOS) there is no
+/// cache folder, so the translation runs directly.
 fn translate_cached(container: &[u8], o: Options) -> Result<HostShader, String> {
-    crate::shader_cache::native_shader(container, &format!("{o:?}"), |c| {
-        victory_shader::emit::translate_with(c, o).map_err(|e| e.to_string())
-    })
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        crate::shader_cache::native_shader(container, &format!("{o:?}"), |c| {
+            victory_shader::emit::translate_with(c, o).map_err(|e| e.to_string())
+        })
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        victory_shader::emit::translate_with(container, o).map_err(|e| e.to_string())
+    }
 }
 
 /// A compute shader's container translated for dispatches of thread counts
@@ -59,10 +67,19 @@ pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u
     translate_cached(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
 }
 
-/// Whether [`translate_extra`]'s translation is in the disk cache already.
+/// Whether [`translate_extra`]'s translation is in the disk cache already. On a host
+/// without a cache folder (neither Windows nor macOS) nothing is cached.
 pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> bool {
-    let o = Options { rect_list: rect, extra_params: extra, copy_params, ..options() };
-    crate::shader_cache::native_present(container, &format!("{o:?}"))
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let o = Options { rect_list: rect, extra_params: extra, copy_params, ..options() };
+        crate::shader_cache::native_present(container, &format!("{o:?}"))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (container, rect, extra, copy_params);
+        false
+    }
 }
 
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can

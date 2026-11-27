@@ -1977,6 +1977,19 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+/// Mesh dispatches on a host without a host GPU: counted as draws, like the
+/// native host counts them when it drops them.
+#[cfg(not(any(windows, target_os = "macos")))]
+extern "system" fn dropped_mesh(this: This, _x: u32, _y: u32, _z: u32) {
+    draw(this);
+}
+
+/// Indirect mesh dispatches on a host without a host GPU: counted as draws.
+#[cfg(not(any(windows, target_os = "macos")))]
+extern "system" fn dropped_mesh_x(this: This, _x: u32, _flags: u64, _indirect: u64, _payload: u64) {
+    draw(this);
+}
+
 /// Commands the native host drops, by kind: mesh dispatches, indirect mesh dispatches, indirect
 /// executions, texture copies and resolves.
 #[cfg(target_os = "macos")]

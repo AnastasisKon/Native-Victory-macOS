@@ -1648,3 +1648,83 @@ fn a_placed_rgb9e5_view_over_an_r32_uint_object_shares_its_texture() {
     glue::resource_released(object);
     with_title(|t| assert!(!t.host.knows(key), "released with the object"));
 }
+
+/// Compute writes a depth texture through unordered views of its depth plane (the lighting's
+/// material depth), which Metal shaders cannot write: the view shows a colour twin. A colour read
+/// made before the first unordered view stays on the depth texture; one made after reads the twin.
+/// The newer contents move where the use changes: into the twin before compute, into the depth
+/// texture before a render pass into it, once per change.
+#[test]
+fn an_unordered_view_of_a_depth_texture_writes_a_colour_twin() {
+    let Some(pool) = pool(9216, 8) else { return };
+    // DXGI 19 (D32_FLOAT_S8X24_UINT); flags 2 | 4: a depth target compute also writes.
+    let depth = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 19, Swizzle::LINEAR.0, 2 | 4);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    // R32_FLOAT, 2D, mip 0.
+    let srv = [41u32, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+    let uav = [41u32, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::descriptor::create_srv(std::ptr::null(), depth, &srv, start + 64);
+    with_title(|t| {
+        let tex = t.texture_of(depth as usize).expect("the depth texture");
+        t.host.heap(HeapKind::Resource, start, 4).unwrap();
+        assert_eq!(t.host.mirror(start + 64), Ok(true));
+        assert!(t.host.twin_of(&tex).is_none(), "a colour read alone makes no twin");
+    });
+    crate::descriptor::create_uav(std::ptr::null(), depth, std::ptr::null(), &uav, start);
+    with_title(|t| {
+        let tex = t.texture_of(depth as usize).unwrap();
+        assert_eq!(t.host.mirror(start), Ok(true));
+        let twin = t.host.twin_of(&tex).expect("an unordered view of a depth texture makes a colour twin");
+        assert!(!std::rc::Rc::ptr_eq(&twin, &tex));
+        assert_eq!(t.host.twin_copies_for_test(false, &tex), Vec::<bool>::new(), "the depth texture is newer");
+        assert_eq!(t.host.twin_copies_for_test(true, &tex), [false], "into the twin before compute");
+        assert_eq!(t.host.twin_copies_for_test(true, &tex), Vec::<bool>::new(), "the twin is newer already");
+        assert_eq!(t.host.twin_copies_for_test(false, &tex), [true], "into the depth texture before it is drawn into");
+        assert_eq!(t.host.twin_copies_for_test(false, &tex), Vec::<bool>::new(), "the depth texture is newer now");
+    });
+    // A colour read written after the twin exists reads the twin.
+    crate::descriptor::create_srv(std::ptr::null(), depth, &srv, start + 32);
+    with_title(|t| assert_eq!(t.host.mirror(start + 32), Ok(true)));
+    glue::resource_released(depth);
+}
+
+/// The console's 16-bit depth with stencil (DXGI 118, the lighting's material depth), which the
+/// host keeps as 32-bit float depth with stencil, is written through `R16_UNORM` views of its
+/// depth plane: they get a 32-bit float twin. A 16-bit depth texture (the shadow maps: DXGI 53
+/// as a depth target) gets a 16-bit twin. What the twin holds goes into the depth plane and back
+/// unchanged, bit for bit.
+#[test]
+fn a_depth_twin_and_its_depth_plane_hold_the_same_texels() {
+    let Some(pool) = pool(9218, 16) else { return };
+    let heap = crate::descriptor::test_heap(false, 4);
+    let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    with_title(|t| {
+        t.host.heap(HeapKind::Resource, start, 4).unwrap();
+    });
+    // (DXGI format, bytes a texel of the twin); R16_UNORM views (56), 2D, mip 0.
+    for (n, (format, texel)) in [(118u32, 4usize), (53, 2)].into_iter().enumerate() {
+        let depth = crate::resource::test_texture_at(pool.va(n * 65536), (16, 16), 1, format, Swizzle::LINEAR.0, 2 | 4);
+        crate::descriptor::create_uav(std::ptr::null(), depth, std::ptr::null(), &[56u32, 4, 0, 0, 0, 0, 0, 0, 0, 0], start + 32 * n as u64);
+        with_title(|t| {
+            let tex = t.texture_of(depth as usize).expect("the depth texture");
+            assert_eq!(t.host.mirror(start + 32 * n as u64), Ok(true), "{format}");
+            let twin = t.host.twin_of(&tex).expect("an R16_UNORM view of the depth plane makes the twin");
+            // The twin as compute leaves it, after it took the depth texture's contents.
+            assert_eq!(t.host.run_twin_copies_for_test(true, &tex), 1, "{format}: into the twin before compute");
+            let written: Vec<u8> = match texel {
+                4 => (0..256u32).flat_map(|i| (i as f32 / 65535.0).to_le_bytes()).collect(),
+                _ => (0..256u32).flat_map(|i| (i as u16 * 251).to_le_bytes()).collect(),
+            };
+            t.host.backend.upload_texture(&twin, 0, 0, &written, 16 * texel, written.len());
+            assert_eq!(t.host.run_twin_copies_for_test(false, &tex), 1, "{format}: into the depth plane before a draw");
+            // The twin is wiped, then takes the depth plane back before the next compute.
+            t.host.backend.upload_texture(&twin, 0, 0, &vec![0u8; written.len()], 16 * texel, written.len());
+            assert_eq!(t.host.run_twin_copies_for_test(true, &tex), 1, "{format}: into the twin again");
+            let mut out = vec![0u8; written.len()];
+            t.host.backend.read_texture(&twin, 0, 0, &mut out, 16 * texel, 0);
+            assert!(out == written, "{format}: the depth plane did not hold what the twin had");
+        });
+        glue::resource_released(depth);
+    }
+}

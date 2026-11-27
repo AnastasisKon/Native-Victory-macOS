@@ -1571,8 +1571,14 @@ impl<'a> Lower<'a> {
             .sections
             .values()
             .flat_map(|m| m.values())
-            .flat_map(|sec| sec.shapes.values().chain(sec.lane_shapes.values()))
-            .filter_map(|sh| match *sh {
+            .flat_map(|sec| {
+                let shapes = sec.shapes.iter().map(|(&v, sh)| (v, sh));
+                shapes.chain(sec.lane_shapes.iter().map(|(&(v, _), sh)| (v, sh)))
+            })
+            // Only shapes of values read outside their section: any other lane would be read at
+            // its section for nothing (across host waves, an exchange with two barriers each).
+            .filter(|&(v, _)| self.section_out.contains(&v))
+            .filter_map(|(_, sh)| match *sh {
                 super::wave::Shape::ReadLane(r, lane) if inside.contains_key(&r) => Some((r, lane)),
                 _ => None,
             })
@@ -1605,7 +1611,7 @@ impl<'a> Lower<'a> {
                 self.lane_fail.insert(w, unknown);
             }
             if self.section_out.contains(&w) && shape.is_none() {
-                let lanes: Vec<(u32, super::wave::Shape)> = self.sections[&b][&start]
+                let mut lanes: Vec<(u32, super::wave::Shape)> = self.sections[&b][&start]
                     .lane_shapes
                     .iter()
                     .filter_map(|(&(v, lane), &sh)| {
@@ -1613,6 +1619,8 @@ impl<'a> Lower<'a> {
                             .then_some((lane, sh))
                     })
                     .collect();
+                // In lane order: the map's order differs between runs, and so did the output.
+                lanes.sort_unstable_by_key(|&(lane, _)| lane);
                 for (lane, sh) in lanes {
                     let res = self.shape(sh);
                     self.section_lanes.insert((w, lane), res);

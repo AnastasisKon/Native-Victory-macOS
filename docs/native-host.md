@@ -462,6 +462,15 @@ the negated data (`0 - d`): modulo 2^32 the dword left is the same, and the valu
 runs it on Metal, wrapping below zero (1 - 3). The 64-bit, image and global forms are not
 covered: no title shader in the corpus uses them.
 
+## Integer pairs packed to 16 bits
+
+`v_cvt_pk_u16_u32` and `v_cvt_pk_i16_i32` pack two 32-bit integers into one dword: src0 in the
+low half, src1 in the high one, each saturated to 16 bits (unsigned to 0..0xffff, signed to
+-32768..32767). Mesa's ACO selects NIR's `pack_uint_2x16` and `pack_sint_2x16`, which clamp, to
+them. They were refused by name: 9 pixel programs in a 26,849-shader corpus (Series S boot to the
+story load, 27 November). `split_wave_tests::integer_pairs_pack_to_16_bits_with_saturation`
+(`victory-gpu`) runs both on Metal across both limits.
+
 ## Clamped integer sums and differences
 
 The VOP3 clamp bit on `v_add_nc_u32`, `v_sub_nc_u32` and `v_subrev_nc_u32` saturates the result

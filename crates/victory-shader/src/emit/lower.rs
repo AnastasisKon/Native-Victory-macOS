@@ -11106,6 +11106,40 @@ impl<'a> Lower<'a> {
             let mut on_cycle = |x: usize| -> bool {
                 *cycle_cache[x].get_or_insert_with(|| self.on_cycle(x))
             };
+            // What reading a joined mask keeps: `Some(true)` the lanes of EXEC (an AND, a NAND, or
+            // `s_orn2` by EXEC), `Some(false)` the others (`s_andn2` by EXEC), `None` anything else.
+            let keeps_exec_read = |inst: &Inst| -> Option<bool> {
+                let by_exec = matches!(&inst.fields, Fields::Sop { src, .. }
+                    if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
+                match inst.name() {
+                    "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64" => Some(true),
+                    "s_orn2_b32" | "s_orn2_b64" if by_exec => Some(true),
+                    "s_andn2_b32" | "s_andn2_b64" if by_exec => Some(false),
+                    _ => None,
+                }
+            };
+            // Whether the edge from `q` into `b` is the one a `s_cbranch_execz` takes
+            // (`s_cmp_eq_u64 exec, 0` and `s_cbranch_scc1` in the IR) with `exec` the EXEC it
+            // tests: that edge brings it empty.
+            let execz_empties = |q: usize, b: usize, exec: Value| -> bool {
+                let insts = &p.blocks[q].insts;
+                if let Exit::Branch { taken, .. } = p.blocks[q].exit
+                    && taken == b
+                    && let [.., cmp, branch] = &insts[..]
+                    && branch.name() == "s_cbranch_scc1"
+                    // In a wave64 program `s_cmp_eq_u32 exec_lo, 0` sees only the low
+                    // half: the high lanes may still be in EXEC there.
+                    && matches!((cmp.name(), p.wave64), ("s_cmp_eq_u64", _) | ("s_cmp_eq_u32", false))
+                    && cmp.write(Reg::Scc).is_some()
+                    && branch.read(Reg::Scc) == cmp.write(Reg::Scc)
+                    && cmp.read(Reg::S(EXEC)) == Some(exec)
+                    && matches!(&cmp.fields, Fields::Sop { src, .. }
+                        if src.get(1).copied().and_then(scalar_constant) == Some(0))
+                {
+                    return true;
+                }
+                false
+            };
             let mut set = Set::default();
             let mut read_execs = Vec::new();
             for (b, blk) in p.blocks.iter().enumerate() {
@@ -11114,16 +11148,9 @@ impl<'a> Lower<'a> {
                     read_execs.clear();
                     let eligible = reads.iter().all(|&(bb, i)| {
                         let inst = &p.blocks[bb].insts[i];
-                        let by_exec = matches!(&inst.fields, Fields::Sop { src, .. }
-                            if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
                         // The lanes whose bits of the join the result keeps: EXEC's, or
                         // (`s_andn2` by EXEC) the others.
-                        let keeps_exec = match inst.name() {
-                            "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64" => true,
-                            "s_orn2_b32" | "s_orn2_b64" if by_exec => true,
-                            "s_andn2_b32" | "s_andn2_b64" if by_exec => false,
-                            _ => return false,
-                        };
+                        let Some(keeps_exec) = keeps_exec_read(inst) else { return false };
                         // In another block the edge's lanes are the same lanes only where
                         // neither block runs again (the else part of an if, further down).
                         let Some(exec) = inst
@@ -11146,25 +11173,9 @@ impl<'a> Lower<'a> {
                                 .filter(|&&(pb, _)| pb == b)
                                 .map(|&(_, pi)| &blk.phis[pi]);
                             let exec = joined.map_or(exec, |ph| ph.args[n]);
-                            // The edge a `s_cbranch_execz` takes (`s_cmp_eq_u64 exec, 0` and
-                            // `s_cbranch_scc1` in the IR) brings that EXEC empty: a mask ANDed with
-                            // it keeps no lane, whatever the join brings there.
-                            let q = blk.preds[n];
-                            let insts = &p.blocks[q].insts;
-                            if keeps_exec
-                                && let Exit::Branch { taken, .. } = p.blocks[q].exit
-                                && taken == b
-                                && let [.., cmp, branch] = &insts[..]
-                                && branch.name() == "s_cbranch_scc1"
-                                // In a wave64 program `s_cmp_eq_u32 exec_lo, 0` sees only the low
-                                // half: the high lanes may still be in EXEC there.
-                                && matches!((cmp.name(), p.wave64), ("s_cmp_eq_u64", _) | ("s_cmp_eq_u32", false))
-                                && cmp.write(Reg::Scc).is_some()
-                                && branch.read(Reg::Scc) == cmp.write(Reg::Scc)
-                                && cmp.read(Reg::S(EXEC)) == Some(exec)
-                                && matches!(&cmp.fields, Fields::Sop { src, .. }
-                                    if src.get(1).copied().and_then(scalar_constant) == Some(0))
-                            {
+                            // The edge a `s_cbranch_execz` takes brings that EXEC empty: a mask
+                            // ANDed with it keeps no lane, whatever the join brings there.
+                            if keeps_exec && execz_empties(blk.preds[n], b, exec) {
                                 return true;
                             }
                             let Some(&m) = st.masks.get(&exec) else { return false };
@@ -11186,6 +11197,46 @@ impl<'a> Lower<'a> {
                     !st.bools.meet(&path)
                 })
             };
+            // Whether the use `(e, i, k)` of the join `(phi.value, n)` of block `b` needs nothing
+            // from it: the use is the phi of `e` for the edge from `b`, `b` ends in the one
+            // unconditional jump to `e` (a relay of the value, unchanged), and that phi's value is
+            // read only in `e`, each time ANDed (or NANDed, or `s_orn2`ed) with an EXEC that, on
+            // this edge of `b`, is the one an execz skip into `b` found empty. Like the direct case
+            // that is sound: such a read does not depend on the other operand when EXEC is empty.
+            // One hop and same-block reads only: nothing is followed further.
+            let relayed_to_empty_exec = |b: usize, n: usize, reg: Reg, e: usize, i: usize, k: usize| -> bool {
+                if p.blocks[e].preds[k] != b
+                    || e == b
+                    || p.blocks[b].exit != Exit::Jump(e)
+                    || matches!(reg, Reg::S(c) if c == EXEC || c == EXEC + 1)
+                {
+                    return false;
+                }
+                let ve = p.blocks[e].phis[i].value;
+                if uses.get(&ve).is_some_and(|u| !u.is_empty()) {
+                    return false;
+                }
+                let rd = reads.get(&ve).map_or(&[][..], Vec::as_slice);
+                !rd.is_empty()
+                    && rd.iter().all(|&(bb, ii)| {
+                        let inst = &p.blocks[bb].insts[ii];
+                        bb == e
+                            && keeps_exec_read(inst) == Some(true)
+                            && inst.read(Reg::S(EXEC)).is_some_and(|x| {
+                                let y = self
+                                    .phi_at
+                                    .get(&x)
+                                    .filter(|&&(pb, _)| pb == e)
+                                    .map_or(x, |&(_, pi)| p.blocks[e].phis[pi].args[k]);
+                                let z = self
+                                    .phi_at
+                                    .get(&y)
+                                    .filter(|&&(pb, _)| pb == b)
+                                    .map_or(y, |&(_, pi)| p.blocks[b].phis[pi].args[n]);
+                                execz_empties(p.blocks[b].preds[n], b, z)
+                            })
+                    })
+            };
             let mut dependents: Map<(Value, usize), Vec<(Value, usize)>> = Map::default();
             let mut worklist = Vec::new();
             for (b, blk) in p.blocks.iter().enumerate() {
@@ -11198,6 +11249,9 @@ impl<'a> Lower<'a> {
                         }
                         for &(e, i, k) in uses {
                             if p.blocks[e].preds[k] == b && dead_relay(b, n, e) {
+                                continue;
+                            }
+                            if relayed_to_empty_exec(b, n, phi.reg, e, i, k) {
                                 continue;
                             }
                             let next = (p.blocks[e].phis[i].value, k);

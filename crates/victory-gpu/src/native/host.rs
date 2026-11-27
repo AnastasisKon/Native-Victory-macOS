@@ -1598,9 +1598,20 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         let words: Vec<String> = w.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect();
                         reads.push(format!("{slot}.{k}=cbv:{a:#x}+{size}:{}", if ok { words.join(",") } else { "unreadable".into() }));
                     }
-                    Some(View::Placed(u, res, _)) => {
-                        // Dimension 1 is a buffer, which the host reads as memory.
-                        let s = match res[0] { 1 => format!("{slot}.{k}=placed:buf"), n => format!("{slot}.{k}=placed-dim{n}") };
+                    Some(v @ View::Placed(u, res, _)) => {
+                        // Dimension 1 is a buffer, which the host reads as memory: its range and first dwords.
+                        let s = match res[0] {
+                            1 => match super::descriptors::decode(&v, &self.resources.borrow()) {
+                                Some(super::descriptors::Decoded::Buffer { addr, size }) => {
+                                    let mut w = [0u8; 16];
+                                    let ok = addr != 0 && super::safe_read(addr as *const u8, &mut w);
+                                    let words: Vec<String> = w.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect();
+                                    format!("{slot}.{k}=placed:buf:{addr:#x}+{size}:{}", if ok { words.join(",") } else { "unreadable".into() })
+                                }
+                                _ => format!("{slot}.{k}=placed:buf"),
+                            },
+                            n => format!("{slot}.{k}=placed-dim{n}"),
+                        };
                         if u { writes.push(s) } else { reads.push(s) }
                     }
                     Some(_) => {}

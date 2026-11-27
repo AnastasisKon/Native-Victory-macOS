@@ -70,6 +70,30 @@ pub struct NativeHost<B: GraphicsBackend> {
     /// The same keys always, for the title side to stop filling them from title memory
     /// ([`Self::take_gpu_written`]).
     gpu_written: RefCell<std::collections::HashSet<usize>>,
+    /// Colour twins of depth textures compute writes, by the depth texture's address
+    /// ([`Self::depth_twin`]).
+    twins: RefCell<HashMap<usize, Rc<DepthTwin<B>>>>,
+}
+
+/// A colour texture standing in for a depth texture that compute writes ([`NativeHost::depth_twin`]).
+/// Metal does not support shader writes to a depth texture, so the title's unordered views of its depth plane,
+/// and its one-channel colour reads made after the first of those, get this twin. The newer
+/// contents move between the two by copies where the use changes ([`NativeHost::twin_copies`]):
+/// into the twin before a compute pass, into the depth texture before a render pass whose depth
+/// target it is. The lighting's material depth is written by compute and tested by draws; the
+/// shadow maps are drawn into and also read by compute.
+pub(crate) struct DepthTwin<B: GraphicsBackend> {
+    depth: std::rc::Weak<B::Texture>,
+    texture: Rc<B::Texture>,
+    /// A buffer the copies go through: Metal copies a depth plane to and from buffers only.
+    stage: Pages<B>,
+    width: usize,
+    height: usize,
+    /// Bytes of a texel of the depth plane, and of the twin: 2 for 16-bit depth, else 4.
+    texel: usize,
+    /// Whether the twin holds the newer contents (a compute pass may have written it since the
+    /// depth texture was last drawn into or cleared); else the depth texture does.
+    twin_newer: Cell<bool>,
 }
 
 /// Warns that a dropped command was a fill: a bottom-of-pipe value write, which another queue's
@@ -182,6 +206,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             typed_views: std::cell::Cell::new(0),
             written: Default::default(),
             gpu_written: Default::default(),
+            twins: RefCell::default(),
         }
     }
 
@@ -491,6 +516,214 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     pub fn texture(&self, desc: &TextureDesc) -> Result<Rc<B::Texture>, String> {
         self.backend.create_texture(desc).map(Rc::new)
+    }
+
+    /// The colour twin of depth texture `depth` (title texture `resource`) that a view of format
+    /// `format` shows instead of it, and the format of that view; made at the first unordered view
+    /// of the depth plane. `None` for views that stay on the depth texture: depth formats, formats
+    /// other than the one-channel 16- and 32-bit ones a depth plane takes, any view before the
+    /// first unordered one, and every view with `VICTORY_DEPTH_TWINS=0`.
+    ///
+    /// The lighting's material depth (1280x720, DXGI 118, the console's `D16_UNORM_S8_UINT`) is
+    /// written by compute through `R16_UNORM` views of its depth plane and `R8_UINT` views of its
+    /// stencil plane, then tested equal by the tiled light draws. A view of the depth texture
+    /// itself let compute write it, but Metal does not support shader writes to a depth texture:
+    /// a blit reads them, a later render pass's depth test does not (M4 Pro; the test
+    /// `a_draw_tests_against_the_depth_compute_wrote_through_an_unordered_view`).
+    /// The host keeps that format as 32-bit float depth with stencil, so an `R16_UNORM` view of
+    /// it writes the twin as 32-bit floats. Guess: the title writes `k / 65535` there, the very
+    /// float its draws rasterise (VIctory's D3D12 path converts `k` to `k * 0x37800080`). A
+    /// 16-bit depth texture (`D16Unorm`: the shadow maps) has a 16-bit twin, copied bit for bit.
+    fn depth_twin(&self, resource: usize, depth: &Rc<B::Texture>, format: Format, unordered: bool) -> Option<(Rc<B::Texture>, Format)> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_DEPTH_TWINS").is_none_or(|v| v != "0")) {
+            return None;
+        }
+        if !matches!(format, Format::R32Float | Format::R32Uint | Format::R16Unorm | Format::R16Uint) {
+            return None;
+        }
+        let view_on = |texel: usize| match (texel, format) {
+            (2, Format::R16Unorm | Format::R16Uint) | (4, Format::R32Float | Format::R32Uint) => Some(format),
+            (4, Format::R16Unorm) => Some(Format::R32Float),
+            _ => None,
+        };
+        let at = Rc::as_ptr(depth) as usize;
+        let known = self
+            .twins
+            .borrow()
+            .get(&at)
+            .filter(|t| t.depth.upgrade().is_some_and(|d| Rc::ptr_eq(&d, depth)))
+            .map(|t| (t.texture.clone(), t.texel));
+        if let Some((texture, texel)) = known {
+            return view_on(texel).map(|v| (texture, v));
+        }
+        if !unordered {
+            return None;
+        }
+        let info = texture_info_of(resource)?;
+        let desc = info.desc()?;
+        if !desc.format.is_depth() || desc.dim != TexDim::D2 {
+            return None;
+        }
+        let (texel, twin_format) = if desc.format == Format::D16Unorm { (2, Format::R16Unorm) } else { (4, Format::R32Float) };
+        let view = view_on(texel)?;
+        let texture = self
+            .texture(&TextureDesc {
+                dim: TexDim::D2,
+                format: twin_format,
+                width: desc.width,
+                height: desc.height,
+                depth_or_layers: 1,
+                mips: 1,
+                render_target: false,
+                unordered_access: true,
+            })
+            .ok()?;
+        let stage = Pages::new(&self.backend, desc.width * desc.height * texel).ok()?;
+        tracing::info!(format = info.format, w = desc.width, h = desc.height, "a depth texture compute writes gets a colour twin");
+        let twin = DepthTwin {
+            depth: Rc::downgrade(depth),
+            texture: texture.clone(),
+            stage,
+            width: desc.width,
+            height: desc.height,
+            texel,
+            twin_newer: Cell::new(false),
+        };
+        self.twins.borrow_mut().insert(at, Rc::new(twin));
+        // Entries mirrored before still show the depth texture: they are mirrored again, so that
+        // colour reads of the depth plane read the twin.
+        for heap in self.heaps.borrow().iter() {
+            for index in heap.take_entries(resource) {
+                heap.mirrored.borrow_mut().remove(&index);
+            }
+        }
+        Some((texture, view))
+    }
+
+    /// The colour twin of depth texture `depth`, if it has one.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn twin_of(&self, depth: &Rc<B::Texture>) -> Option<Rc<B::Texture>> {
+        let twins = self.twins.borrow();
+        let twin = twins.get(&(Rc::as_ptr(depth) as usize))?;
+        twin.depth.upgrade().is_some_and(|d| Rc::ptr_eq(&d, depth)).then(|| twin.texture.clone())
+    }
+
+    /// The copies between depth textures and their twins that a pass needs before it runs, as
+    /// (twin, its depth texture, whether into the depth texture); notes which side holds the
+    /// newer contents after the pass ([`DepthTwin::twin_newer`]). Before a compute pass
+    /// (`compute`), every twin whose depth texture is newer takes its contents. Before a pass
+    /// that draws into, clears or copies to or from one of the textures `depths` names, a newer
+    /// twin goes into it first (not when the pass writes it whole: a depth clear), and the
+    /// depth texture is the newer side from then on. Guess: a render pass that only reads a twin
+    /// (a shadow map sampled through a colour view) follows a compute pass, not the draws into
+    /// its depth texture alone; else it reads the twin's older contents.
+    #[allow(clippy::type_complexity)]
+    fn twin_copies(&self, compute: bool, depths: &[(&Rc<B::Texture>, bool)]) -> Vec<(Rc<DepthTwin<B>>, Rc<B::Texture>, bool)> {
+        let mut out = Vec::new();
+        let mut twins = self.twins.borrow_mut();
+        if twins.is_empty() {
+            return out;
+        }
+        twins.retain(|_, t| t.depth.strong_count() > 0);
+        if compute {
+            for t in twins.values() {
+                if !t.twin_newer.get()
+                    && let Some(d) = t.depth.upgrade()
+                {
+                    t.twin_newer.set(true);
+                    out.push((t.clone(), d, false));
+                }
+            }
+        }
+        for &(d, whole) in depths {
+            if let Some(t) = twins.get(&(Rc::as_ptr(d) as usize))
+                && t.depth.upgrade().is_some_and(|x| Rc::ptr_eq(&x, d))
+            {
+                if t.twin_newer.get() && !whole {
+                    out.push((t.clone(), d.clone(), true));
+                }
+                t.twin_newer.set(false);
+            }
+        }
+        out
+    }
+
+    /// The depth textures the commands `cmds` draw into, clear, or copy to or from, for
+    /// [`Self::twin_copies`]: with whether the command writes the depth plane whole.
+    fn twin_uses<'a>(&self, cmds: &[&'a Cmd<B>]) -> Vec<(&'a Rc<B::Texture>, bool)> {
+        if self.twins.borrow().is_empty() {
+            return vec![];
+        }
+        let mut uses = vec![];
+        for &c in cmds {
+            match c {
+                Cmd::Draw { targets: Targets { depth: Some(d), .. }, .. } => uses.push((d, false)),
+                Cmd::Clear { depth: Some((d, z, _)), .. } => uses.push((d, z.is_some())),
+                Cmd::CopyTexture { src, dst, .. } => uses.extend([(src, false), (dst, false)]),
+                Cmd::CopyTextureToBuffer { src, .. } => uses.push((src, false)),
+                Cmd::CopyBufferToTexture { dst, .. } => uses.push((dst, false)),
+                _ => {}
+            }
+        }
+        uses
+    }
+
+    /// [`Self::twin_copies`] for one depth texture, before a compute pass (`compute`) or a render
+    /// pass into it: whether each copy it would make goes into the depth texture (`true`) or
+    /// into the twin.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn twin_copies_for_test(&self, compute: bool, depth: &Rc<B::Texture>) -> Vec<bool> {
+        let depths: &[(&Rc<B::Texture>, bool)] = if compute { &[] } else { &[(depth, false)] };
+        self.twin_copies(compute, depths).into_iter().filter(|c| Rc::ptr_eq(&c.1, depth)).map(|c| c.2).collect()
+    }
+
+    /// The blits that make `copies` ([`Self::twin_copies`]): each through the twin's buffer, since
+    /// Metal copies a depth plane only to and from buffers (`DepthFromDepthStencil`).
+    #[allow(clippy::type_complexity)]
+    fn twin_blits<'a>(copies: &'a [(Rc<DepthTwin<B>>, Rc<B::Texture>, bool)]) -> Vec<BlitOp<'a, B>> {
+        let mut ops = Vec::new();
+        for (twin, depth, to_depth) in copies {
+            let (w, h, b) = (twin.width, twin.height, twin.texel);
+            let stage = (&*twin.stage.buf, twin.stage.ptr().cast_const());
+            let (src, dst): (&B::Texture, &B::Texture) = if *to_depth { (&twin.texture, depth) } else { (depth, &twin.texture) };
+            ops.push(BlitOp::CopyTextureToBuffer {
+                src,
+                src_mip: 0,
+                src_slice: 0,
+                src_origin: [0; 3],
+                size: [w, h, 1],
+                dst: stage,
+                len: w * h * b,
+                row_pitch: w * b,
+                slice_pitch: w * h * b,
+            });
+            ops.push(BlitOp::CopyBufferToTexture {
+                src: stage,
+                len: w * h * b,
+                row_pitch: w * b,
+                slice_pitch: w * h * b,
+                size: [w, h, 1],
+                dst,
+                dst_mip: 0,
+                dst_slice: 0,
+                dst_origin: [0; 3],
+            });
+        }
+        ops
+    }
+
+    /// The copies [`Self::twin_copies`] gives, run on the GPU now and waited for.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn run_twin_copies_for_test(&self, compute: bool, depth: &Rc<B::Texture>) -> usize {
+        let depths: &[(&Rc<B::Texture>, bool)] = if compute { &[] } else { &[(depth, false)] };
+        let copies: Vec<_> = self.twin_copies(compute, depths).into_iter().filter(|c| Rc::ptr_eq(&c.1, depth)).collect();
+        let q = self.backend.create_queue().unwrap();
+        let f = self.backend.create_fence(0).unwrap();
+        let passes = [Pass::Blit(Self::twin_blits(&copies))];
+        self.backend.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &[(&f, 1)] }).unwrap();
+        assert!(self.backend.wait(&f, 1, 10_000), "GPU did not finish");
+        copies.len()
     }
 
     /// Names a buffer resource object `key` (what `CreateShaderResourceView` is passed) at title memory.
@@ -850,6 +1083,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
             } => {
                 let Some(Res::Texture(tex)) = resources.get(&resource) else {
                     return Ok(false);
+                };
+                // A colour view of a depth texture that compute writes shows its twin. Twins are
+                // made at unordered views of texture objects only (a placed view's key is no
+                // object to read the description of); a placed view shows an existing one.
+                let unordered = matches!(view, crate::descriptor::View::Unordered(..));
+                let twin = format.and_then(|f| self.depth_twin(resource, tex, f, unordered));
+                let (tex, format) = match &twin {
+                    Some((t, f)) => (t, Some(*f)),
+                    None => (tex, format),
                 };
                 match (mips, format) {
                     (Some((first, count)), Some(format)) if count > 0 => {
@@ -2133,8 +2375,23 @@ impl<B: GraphicsBackend> NativeHost<B> {
             })
             .collect();
 
+        // Copies between depth textures and their twins, before the passes that need them
+        // ([`Self::twin_copies`]).
+        #[allow(clippy::type_complexity)]
+        let twin_copies: Vec<Vec<(Rc<DepthTwin<B>>, Rc<B::Texture>, bool)>> = groups
+            .iter()
+            .map(|g| match *g {
+                Group::Compute(..) => self.twin_copies(true, &[]),
+                // A render pass has one depth target, its first draw's.
+                Group::Render(a, _) | Group::Clear(a) => self.twin_copies(false, &self.twin_uses(&cmds[a..a + 1])),
+                Group::Blit(a, b) => self.twin_copies(false, &self.twin_uses(&cmds[a..b])),
+            })
+            .collect();
         let mut passes: Vec<Pass<'_, B>> = vec![];
         for (n, g) in groups.iter().enumerate() {
+            if !twin_copies[n].is_empty() {
+                passes.push(Pass::Blit(Self::twin_blits(&twin_copies[n])));
+            }
             passes.push(match g {
                 Group::Compute(..) => Pass::Compute(&compute[n]),
                 Group::Blit(a, b) => Pass::Blit(

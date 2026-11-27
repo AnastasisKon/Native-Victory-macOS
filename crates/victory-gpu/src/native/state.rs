@@ -928,8 +928,7 @@ mod tests {
     fn unknown_color_format_is_propagated() {
         // This value is not a known DXGI format.
         let unknown_dxgi = 0xFFFF_FFFFu32;
-        let mut g = Graphics::default();
-        g.rt_formats = vec![unknown_dxgi];
+        let g = Graphics { rt_formats: vec![unknown_dxgi], ..Default::default() };
         assert_eq!(g.color_formats(), Err(unknown_dxgi));
     }
 

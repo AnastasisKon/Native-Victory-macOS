@@ -23,6 +23,8 @@ jobs:
       - run: rustup toolchain install
       - name: Cargo target-directory script regressions (Bash 3.2)
         run: /bin/bash tools/macos/tests/target-directory.sh
+      - name: Default console model by RAM (Bash 3.2)
+        run: /bin/bash tools/macos/tests/console-default.sh
       - name: Run-log summary self-test (Bash 3.2)
         run: /bin/bash tools/macos/run-summary.sh --self-test
 

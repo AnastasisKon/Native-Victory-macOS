@@ -627,6 +627,9 @@ fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
         .collect()
 }
 
+/// Integer operations whose clamp bit `Lower::integer` follows (unsigned saturation).
+const SATURATING: [&str; 3] = ["v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32"];
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -4549,7 +4552,8 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        // `integer` saturates the results of `SATURATING` itself.
+        if (v.clamp && !SATURATING.contains(&inst.name())) || v.omod != 0 {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -10145,7 +10149,22 @@ impl<'a> Lower<'a> {
                     "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
-                self.s.m.bin(c, op, a, b)
+                let r = self.s.m.bin(c, op, a, b);
+                if !matches!(&inst.fields, Fields::Valu(v) if v.clamp) || !SATURATING.contains(&name) {
+                    return Ok(r);
+                }
+                // The clamp bit saturates an unsigned sum or difference (`uaddsat` and `usubsat`
+                // are selected to these with clamp, LLVM's AMDGPU backend): a sum that wraps is
+                // 0xffffffff, a difference below zero is 0.
+                if op == Bin::Add {
+                    let wrapped = self.s.m.cmp(c, pred::IULT, r, a);
+                    let max = k(self, u32::MAX);
+                    self.s.m.select(c, wrapped, max, r)
+                } else {
+                    let below = self.s.m.cmp(c, pred::IULT, a, b);
+                    let zero = k(self, 0);
+                    self.s.m.select(c, below, zero, r)
+                }
             }
             "v_xnor_b32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);

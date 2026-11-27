@@ -451,6 +451,18 @@ Slow work shows in the log: a translation or a conversion of 20 ms or more logs 
 
 Translations of 20 to 40 s (27 November; 44 to 48 KB pixel shaders) were lowering done over: `lower_graphics` lowered the whole program again for each join with an incoming value that has no DXIL form (574 times for one shader), and `fill_phis` now reports all the joins a pass finds, so two passes do. The shaders were refused in 30 ms until descriptor tracing followed dwords swapped by XORs, and then reached this. `descriptor_data` also searched every descriptor's sources for each load read as data: one table (`load_use`), worth about a tenth of the heaviest translations. The walk in `live_edges` is bounded separately (see "Liveness of phi edges"). A program with several such joins may now be refused for another of them than before, so tallies of refusals by reason shift without any shader changing between translated and refused. Test: `joins_without_a_value_are_found_in_one_pass` (`gfx_refusal_tests`) bounds the passes, not the time.
 
+## Clamped integer sums and differences
+
+The VOP3 clamp bit on `v_add_nc_u32`, `v_sub_nc_u32` and `v_subrev_nc_u32` saturates the result
+as an unsigned number. LLVM's AMDGPU backend selects `uaddsat` and `usubsat` to these with clamp:
+a sum that wraps gives 0xffffffff, and a difference below zero gives 0 (`Lower::integer`,
+`SATURATING`). It was refused for every integer operation as "integer output modifiers": 8
+compute programs in a 12,020-shader corpus (Series S boot to the menus, 27 November), each a
+`v_sub_nc_u32 ... clamp` whose result goes to LDS. Over that corpus the 8 translate and no other
+output changes. Clamp on other integer operations (the signed `_i32` forms, `v_mad_u32_u24` and
+others) and `omod` stay refused. `split_wave_tests::clamped_unsigned_sums_and_differences_saturate`
+(`victory-gpu`) runs both on Metal.
+
 ## LDS instructions addressed by M0
 
 `ds_append`, `ds_consume`, `ds_read_addtid_b32` and `ds_write_addtid_b32` have no address

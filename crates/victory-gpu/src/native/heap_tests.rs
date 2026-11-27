@@ -420,3 +420,73 @@ fn a_size_query_of_a_writable_image_reads_its_size() {
     assert_eq!(f.get(0x2_0000, 3), [16, 8, 7], "width, height and height - 1 from the descriptor");
     drop(records);
 }
+
+/// A compute program that walks title memory from a buffer view's own address, as the BVH walks
+/// of the title's ray-traced passes do: a table at user data 4 holds the raw output UAV (dwords
+/// 0-3) and a buffer SRV (dwords 8-11); the SRV's descriptor dwords 0-1 are read as its title
+/// address (dword 1's low 16 bits), and the word there is loaded and stored to the output.
+const CS_VIEW_ADDRESS: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xF408_0405, 0xFA00_0020, // s_load_dwordx4 s[16:19], s[10:11], 0x20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x8711_FF11, 0x0000_FFFF, // s_and_b32 s17, s17, 0xffff
+    0x7E00_0280, // v_mov_b32 v0, 0
+    0xDC30_8000, 0x0110_0000, // global_load_dword v1, v0, s[16:17]
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_0000, 0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0
+    0xBF81_0000, // s_endpgm
+];
+
+/// The heap's view addresses (`t1` of the memory space) give a program the title address of a
+/// buffer view in the heap (#306). The native host bound no such table and refused the program
+/// ("needs view addresses or write marks"), as it did 7 compute programs of the world.
+#[test]
+fn a_compute_shader_reads_title_memory_at_a_heap_views_address() {
+    // A raw UAV and a raw SRV (kinds 3 and 0) in a table (root type 3) at user data 4.
+    let record = |kind: u8, offset: u8, register: u8| {
+        let mut r = [0u8; 32];
+        r[0] = 0x41;
+        r[4..6].copy_from_slice(&[kind, 3]);
+        (r[8], r[12], r[16]) = (offset, register, 1);
+        r[20..23].copy_from_slice(&[4, 4, 0]);
+        r
+    };
+    let c = crate::pipeline::test_compute_container(CS_VIEW_ADDRESS, &[record(3, 0, 0), record(0, 8, 1)], 7);
+    let cs = shaders::translate(&c).unwrap();
+    assert!(cs.view_addresses && cs.memory, "{cs:?}");
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    // The word the program finds by the view's address: pool offset 0x2_1000 (`VA_A + 0x1000`).
+    f.put(0x2_1000, &[0x1234_5678u32]);
+    let records = vec![0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let view_at = |address: u64| {
+        let mut v = [0u32; 16];
+        (v[1], v[4], v[6], v[8]) = (1, 64, 64, 1);
+        [v[10], v[11]] = super::addr_tests::halves(address);
+        v
+    };
+    // Entry 0: the output, 64 raw dwords at `VA_A` (pool offset 0x2_0000); entry 1: the SRV.
+    let mut uav = view_at(super::addr_tests::VA_A);
+    uav[6] = 0;
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start);
+    let mut srv = view_at(super::addr_tests::VA_A + 0x1000);
+    srv[4] = 0;
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &srv, start + 32);
+    assert!(t.host.mirror(start).unwrap());
+    assert!(t.host.mirror(start + 32).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "view address") else { panic!("{:?}", t.shaders) };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(f.get(0x2_0000, 2), [0x1234_5678, super::addr_tests::CANARY]);
+    drop(records);
+}

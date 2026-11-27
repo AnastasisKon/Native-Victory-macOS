@@ -85,6 +85,9 @@ mod watch;
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
+/// Wakes and drains the GPU's queued work before the process exits (`victory_metal::gfx::stop_gpu`).
+#[cfg(target_os = "macos")]
+pub use victory_metal::gfx::stop_gpu;
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, title_memory_aliased, title_memory_remapped,

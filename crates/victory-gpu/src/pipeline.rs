@@ -203,6 +203,8 @@ impl Shader {
         self.native
             .get_or_init(|| {
                 let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+                // For `victory translate --cache`, once the translator has changed.
+                crate::native::shaders::keep(&container);
                 let made = crate::native::shaders::translate(&container).map(Arc::new);
                 if (made.is_err() || std::env::var_os("VICTORY_DUMP_ALL_SHADERS").is_some())
                     && let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED")

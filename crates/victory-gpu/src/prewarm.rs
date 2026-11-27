@@ -2,9 +2,15 @@
 //! bound (the list of first binds, `shader_cache::first_binds_file`), then the rest in the order
 //! the title registers them. A cold first world frame binds about 1,300 shaders; registered in
 //! order, they wait behind most of the title's ~21,600.
+//!
+//! And the containers a run translates, kept as the title passed them ([`keep`]), so that
+//! `victory translate --cache` can translate them again after the translator changed, with no
+//! title running. On the native host the title hands the device pieces (code, metadata) and the
+//! container is put together here, so the containers in the game's files are other bytes with
+//! other cache keys: the warm-up has to go from what a run saw.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -132,6 +138,47 @@ pub(crate) fn write(path: &Path, text: &str) {
     }
 }
 
+/// The folder of kept containers: beside the list of first binds, outside the build folders, so
+/// it outlives a changed translator. `None` with the shader cache off.
+pub(crate) fn kept_dir() -> Option<PathBuf> {
+    Some(crate::shader_cache::first_binds_file()?.parent()?.join("containers"))
+}
+
+/// Keeps `container` in `dir` under `hash` (its short hash), once, through a temporary name.
+/// Failures are not fatal: a warm-up translates what was kept, the run the rest.
+pub(crate) fn keep(dir: &Path, hash: &str, container: &[u8]) {
+    let path = dir.join(hash);
+    if container.is_empty() || path.exists() {
+        return;
+    }
+    let tmp = dir.join(format!("{hash}.{}.tmp", std::process::id()));
+    let made = std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(&tmp, container))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if made.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// The kept containers' files in `dir`: those named by a short hash.
+pub(crate) fn kept(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.len() == 16 && n.bytes().all(|b| b.is_ascii_hexdigit())))
+        .collect();
+    files.sort();
+    files
+}
+
+/// The container kept in `file`; `None` if its bytes are not the ones its name says (cut short
+/// or damaged).
+pub(crate) fn read_kept(file: &Path) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(file).ok()?;
+    (file.file_name()?.to_str()? == &blake3::hash(&bytes).to_hex()[..16]).then_some(bytes)
+}
+
 /// Runs the calling thread at the lowest priority of the default QoS class: below the title's
 /// threads, so its frame work goes first when cores are short. Not the utility class, which
 /// keeps a thread on the efficiency cores: there a pool of 16 translated each shader about twice
@@ -205,5 +252,26 @@ mod tests {
         write(&path, &text);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn kept_containers_read_back_and_damaged_ones_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("containers");
+        let short = |b: &[u8]| blake3::hash(b).to_hex()[..16].to_owned();
+        let (a, b) = (b"one container".as_slice(), b"another".as_slice());
+        keep(&store, &short(a), a);
+        keep(&store, &short(b), b);
+        // Kept once: a second run leaves the file alone.
+        std::fs::write(store.join(short(b)), b"cut").unwrap();
+        keep(&store, &short(b), b);
+        // Nothing to keep, and a file that is no container's.
+        keep(&store, &short(b""), b"");
+        std::fs::write(store.join("notes.txt"), b"x").unwrap();
+        let files = kept(&store);
+        assert_eq!(files.len(), 2);
+        let read: Vec<Option<Vec<u8>>> = files.iter().map(|f| read_kept(f)).collect();
+        assert!(read.contains(&Some(a.to_vec())) && read.contains(&None), "{read:?}");
+        assert!(kept(&dir.path().join("absent")).is_empty());
     }
 }

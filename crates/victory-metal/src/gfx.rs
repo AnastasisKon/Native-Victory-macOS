@@ -616,7 +616,9 @@ impl Metal {
         let cb = self.new_command_buffer(queue)?;
         attached_heaps.clear();
         for (f, v) in waits {
-            cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
+            if let Some((ev, raw)) = f.encode_wait(*v) {
+                cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*ev), raw);
+            }
         }
         if let Some((event, v)) = after {
             cb.encodeWaitForEvent_value(ProtocolObject::from_ref(event), v);
@@ -1308,7 +1310,9 @@ impl GraphicsBackend for Metal {
             cb.setLabel(Some(&objc2_foundation::NSString::from_str(&label)));
         }
         for (f, v) in work.waits {
-            cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
+            if let Some((ev, raw)) = f.encode_wait(*v) {
+                cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*ev), raw);
+            }
         }
         // With residency sets the encoders do not name what they reach through a heap (nor, with
         // the pool's set on the queue, the title's buffers), so Metal cannot order them: this
@@ -1410,14 +1414,23 @@ impl GraphicsBackend for Metal {
         if set_on_queue {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*queue.2), queue.3.get());
         }
-        for (f, v) in work.signals {
-            cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
-        }
         let mut events = Vec::with_capacity(work.signals.len() + 1);
         if set_on_queue {
             events.push((queue.2.clone(), queue.3.get()));
         }
-        events.extend(work.signals.iter().map(|(f, v)| (f.0.clone(), *v)));
+        for (f, v) in work.signals {
+            match f.encode_signal(&self.dev, *v) {
+                Ok(pairs) => {
+                    for (ev, raw) in pairs {
+                        cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*ev), raw);
+                        events.push((ev, raw));
+                    }
+                }
+                Err(e) => {
+                    first_error.get_or_insert_with(|| e.to_string());
+                }
+            }
+        }
         let owed = std::sync::Arc::new(Owed::of(events, &work.passes[first..], work.signals.len()));
         flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
         // A command buffer the GPU fails is logged (the first few), not silently dropped.

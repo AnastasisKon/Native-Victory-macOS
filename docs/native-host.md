@@ -756,6 +756,18 @@ Residency itself: what a descriptor heap names is resident through the heap's ow
 * Two fixes found on the way: title threads get at least 8 MiB of stack (`host_posix::MIN_STACK`; the title's 1 MiB overflowed while the host built a Metal pipeline at the first guessed draw), and a released pipeline object's host pipelines are forgotten (`glue::pipeline_released`), as a new object at a freed one's address got the old one's pipeline.
 * `VICTORY_DUMP_DESC_DIR=<dir>` (with `VICTORY_GUESS_GRAPHICS=1`) writes each guessed pipeline's register image as `regs_<vs>_<ps>_<address>.bin`.
 
+#### Indirect mesh dispatches (`DispatchMeshX`)
+
+`DispatchMeshX(x, flags, indirect, payload)` (list method 0x310) with a non-zero `indirect`
+runs as a one-record `ExecuteIndirect` of a mesh dispatch: on the native host through
+`glue::execute_indirect` (a Metal indirect mesh draw reading the record in title memory), on the
+D3D12 host through `State::execute_indirect` (kind 10). GPU addresses are title addresses, so
+`indirect` is used as it is. Guesses, not confirmed on a console: the record is
+`D3D12_DISPATCH_MESH_ARGUMENTS` (three 32-bit group counts, 12 bytes), `x` is unused when
+`indirect` is set, and `flags` and `payload` change nothing the host needs. "indirect mesh
+dispatches dropped" (D3D12) and "an indirect mesh dispatch" (native) now mean the host could not
+run it. Direct mesh dispatches are still dropped on the native host, counted and warned once.
+
 #### Dropped work is logged loudly
 
 Every kind of work the native host drops now logs one `warn!` the first time it

@@ -142,10 +142,6 @@ fn append_f32(
     written.set(was + bytes.len() as u64);
 }
 
-/// Writes a convolution stream's own impulse response — the title's bytes,
-/// not the synthetic tail — to `<dir>/stream<n>_ir.f32`, to help settle
-/// the hardware's partitioned IR layout (see `trace_ir`). Off by default;
-/// reads are bounded by `ir_floats` and `DUMP_IR_MAX`.
 /// A stream's one-shot impulse-response capture, its size already bounded
 /// by `ir_floats` and [`DUMP_IR_MAX`].
 fn append_ir(path: &std::path::Path, floats: &[f32]) {
@@ -163,6 +159,10 @@ fn append_ir(path: &std::path::Path, floats: &[f32]) {
     let _ = file.write_all(&bytes);
 }
 
+/// Writes a convolution stream's own impulse response — the title's bytes,
+/// not the synthetic tail — to `<dir>/stream<n>_ir.f32`, to help settle
+/// the hardware's partitioned IR layout (see `trace_ir`). Off by default;
+/// reads are bounded by `ir_floats` and `DUMP_IR_MAX`.
 fn dump_ir(dir: &std::path::Path, n: u32, desc: &StreamDesc) {
     let (kind, ir_floats) = (desc.kind, desc.ir_floats as usize);
     if kind != CONVOLUTION || desc.ir.is_null() {

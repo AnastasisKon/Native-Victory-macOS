@@ -1335,6 +1335,23 @@ impl GraphicsBackend for Metal {
         let mut refused: Vec<usize> = Vec::new();
         let mut first_error: Option<String> = None;
         let mut attached_heaps = Vec::new();
+        // Fills of passes refused at encode time, re-encoded below as one blit pass of the same
+        // command buffer (#80): on the console a refused pass's value write ran in the GPU's
+        // order — after the submission's earlier passes, before its fence signals — and a queue
+        // waiting on the fence or polling the memory value must see it there. Paying it on the
+        // CPU at submit time instead lets a waiting queue go on before this command buffer's
+        // earlier GPU passes have run. A blit fill always encodes (it needs no attachments or
+        // pipeline), so the re-encode cannot fail; copies are not re-encoded (a copy may have
+        // partly run, and its source may have changed since — see `Owed::of`).
+        let mut refused_fills: Vec<BlitOp<'_, Metal>> = Vec::new();
+        fn take_fills<'a>(ops: &[BlitOp<'a, Metal>]) -> Vec<BlitOp<'a, Metal>> {
+            ops.iter()
+                .filter_map(|op| match op {
+                    BlitOp::Fill { dst, len, value } => Some(BlitOp::Fill { dst: *dst, len: *len, value: *value }),
+                    _ => None,
+                })
+                .collect()
+        }
         // A submission's passes can go in command buffers of at most `passes_per_buffer` passes
         // (`VICTORY_PASSES_PER_BUFFER`; default 0: all in one). macOS stops a command buffer that
         // runs too long on the GPU (`kIOGPUCommandBufferCallbackErrorTimeout`): a world
@@ -1368,7 +1385,11 @@ impl GraphicsBackend for Metal {
             if let Err(e) = encoded {
                 // A pass that cannot be encoded (a render target with no attachments, a piece
                 // whose root arguments were never set) is dropped; the passes after it still run,
-                // so one bad pass does not cost the frame's whole picture.
+                // so one bad pass does not cost the frame's whole picture. Its fills are
+                // re-encoded below, in the GPU's order (#80).
+                if let Pass::Blit(ops) = pass {
+                    refused_fills.extend(take_fills(ops));
+                }
                 refused.push(n);
                 if first_error.is_none() {
                     first_error = Some(e);
@@ -1379,6 +1400,11 @@ impl GraphicsBackend for Metal {
                 && n + 1 < work.passes.len()
             {
                 let piece = ((n + 1) / per) as u64;
+                // This piece's refused fills first, then its piece event (#80, GPU order).
+                if !refused_fills.is_empty() {
+                    let _ = self.encode_blit(&cb, &refused_fills, order);
+                    refused_fills.clear();
+                }
                 cb.encodeSignalEvent_value(ProtocolObject::from_ref(&**event), piece);
                 let owed = Owed::of(vec![(event.clone(), piece)], &work.passes[first..=n], 0);
                 // The trace names what this piece holds, not the whole submission.
@@ -1386,14 +1412,26 @@ impl GraphicsBackend for Metal {
                     let enc = std::mem::take(&mut *self.trace_enc.borrow_mut()).join(" | ");
                     (format!("{label} piece {piece} | {enc}"), std::mem::take(&mut *self.trace_args.borrow_mut()))
                 });
-                self.commit_piece(queue, &cb, owed, piece, tinfo);
+                let piece_owed = self.commit_piece(queue, &cb, owed, piece, tinfo);
                 first = n + 1;
                 cb = match self.next_piece(queue, work.waits, &mut attached_heaps, Some((&**event, piece))) {
                     Ok(cb) => cb,
                     Err(e) => {
                         // The current piece never started: every pass from `first` on was lost,
-                        // and the earlier pieces did commit.
-                        refused.extend(first..work.passes.len());
+                        // and the earlier pieces did commit. Their fills are paid once the last
+                        // committed piece's passes have run on the GPU (#80): the console's
+                        // order kept, where paying at submit time would let a waiter go on
+                        // before those passes ran. They count as refused for the caller's log.
+                        let mut lost: Vec<usize> = refused.iter().copied().collect();
+                        lost.extend(first..work.passes.len());
+                        let mut refund = std::mem::take(&mut refused_fills);
+                        for n in &lost {
+                            if let Pass::Blit(ops) = &work.passes[*n] {
+                                refund.extend(take_fills(ops));
+                            }
+                        }
+                        piece_owed.attach_refund(refund);
+                        refused = lost;
                         return Err(SubmitFailure {
                             committed: true,
                             refused,
@@ -1409,6 +1447,12 @@ impl GraphicsBackend for Metal {
         }
         if set_on_queue {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*queue.2), queue.3.get());
+        }
+        // The refused passes' fills, in the GPU's order: after the passes that ran (the order
+        // fence above orders each encoder after the one before), before this command buffer's
+        // fence signals, which encode after this.
+        if !refused_fills.is_empty() {
+            let _ = self.encode_blit(&cb, &refused_fills, order);
         }
         for (f, v) in work.signals {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
@@ -1530,7 +1574,7 @@ impl Metal {
         owed: Owed,
         piece: u64,
         tinfo: Option<(String, Vec<(String, usize, usize)>)>,
-    ) {
+    ) -> std::sync::Arc<Owed> {
         let owed = std::sync::Arc::new(owed);
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
@@ -1557,7 +1601,9 @@ impl Metal {
             GATED.lock().unwrap().insert(serial, args);
             d
         });
-        let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+        let failed = {
+            let owed = std::sync::Arc::clone(&owed);
+            block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
@@ -1593,11 +1639,18 @@ impl Metal {
             if dropped || error.is_some() {
                 owed.recover();
             }
-        });
+            // The fills of passes a piece boundary stopped from encoding: paid once this
+            // command buffer's passes have run (completion), failed or not (#80). The flag goes
+            // up first, so an attach that races the completion sees it and pays at once.
+            owed.completed.store(true, std::sync::atomic::Ordering::Release);
+            owed.pay_refund();
+            });
+        };
         // SAFETY: the block is retained by Metal until it has run.
-        unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
+        unsafe { cb.addCompletedHandler(&failed as *const _ as *mut _) };
         crate::metal::residency_timed("cb_commit", None, || cb.commit());
         self.committed.set(self.committed.get() + 1);
+        owed
     }
 
     /// The pipeline of a compiled state `pso`: what the passes set beside it.
@@ -1821,6 +1874,16 @@ pub(crate) struct Owed {
     #[allow(clippy::type_complexity)]
     fills: Vec<(Retained<ProtocolObject<dyn MTLBuffer>>, usize, usize, u8)>,
     signals: usize,
+    /// Fills paid once the GPU has run this command buffer's passes, failed or not (#80): the
+    /// fills of later passes a piece boundary stopped from ever being encoded. On the console
+    /// they ran after this command buffer's passes; paying them in the completion handler keeps
+    /// that order, where paying at submit time would let a waiter go on first. Attached after
+    /// the commit (the failure is known when the next piece fails to start), hence the mutex;
+    /// an attach after the completion pays what is there at once, which is that order kept.
+    #[allow(clippy::type_complexity)]
+    refund: std::sync::Mutex<Vec<(Retained<ProtocolObject<dyn MTLBuffer>>, usize, usize, u8)>>,
+    /// Set by the completion handler before it pays a refund: an attach past it pays at once.
+    completed: std::sync::atomic::AtomicBool,
 }
 
 impl Owed {
@@ -1854,7 +1917,63 @@ impl Owed {
                 }
             }
         }
-        Owed { recovery: std::sync::Once::new(), events, fills, signals }
+        Owed {
+            recovery: std::sync::Once::new(),
+            events,
+            fills,
+            signals,
+            refund: std::sync::Mutex::default(),
+            completed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// What later passes owe if a piece boundary stopped them from ever being encoded: paid once
+    /// the GPU has run this command buffer ([`Self::pay_refund`]). A completion that already ran
+    /// pays at once — its passes have run, so that is the order kept.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn attach_refund(
+        &self,
+        refund: Vec<BlitOp<'_, Metal>>,
+    ) {
+        let fills = refund
+            .iter()
+            .filter_map(|op| match op {
+                BlitOp::Fill { dst, len, value } => {
+                    Some((dst.0.buf.clone(), dst.1 as usize - dst.0.base as usize, *len, *value))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if fills.is_empty() {
+            return;
+        }
+        *self.refund.lock().unwrap_or_else(|e| e.into_inner()) = fills;
+        // The completion handler already ran (the command buffer was done before this call): its
+        // passes have run, so paying at once is the console's order. Else the handler pays.
+        if self.completed.load(std::sync::atomic::Ordering::Acquire) {
+            self.pay_refund();
+        }
+    }
+
+    /// Writes each refunded fill, in order. Called from the completion handler, so a waiter sees
+    /// the writes only after this command buffer's passes have run — the order the console kept.
+    fn pay_refund(&self) {
+        let refund = self.refund.lock().unwrap_or_else(|e| e.into_inner());
+        if refund.is_empty() {
+            return;
+        }
+        for (buf, off, len, value) in refund.iter() {
+            // SAFETY: the range lies inside the wrapped title memory (the caller resolved it).
+            unsafe { std::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>().add(*off), *value, *len) };
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+            tracing::warn!(
+                "metal: paid {} value writes of passes a piece boundary stopped from encoding, after the GPU's earlier passes",
+                refund.len()
+            );
+        }
     }
 
     /// Writes each fill, in order, then raises each event (never lowers it): a waiter that sees
@@ -3712,6 +3831,40 @@ mod owed_tests {
         assert!(SETS.lock().unwrap().0.iter().any(|w| w.load().is_some_and(|t| Retained::as_ptr(&t) == Retained::as_ptr(&set))));
         assert!(release_sets(std::slice::from_ref(&set)) >= 1 << 20);
         assert_eq!(set.allocationCount(), 0);
+    }
+
+    /// Fills attached after a piece commit (a later `next_piece` failed: the piece boundary
+    /// stopped those passes from being encoded) are paid once the piece's GPU passes have run:
+    /// by the completion handler, or at once when it already ran (#80). Either way the waiter
+    /// that released the piece saw the writes only after the GPU's earlier passes.
+    #[test]
+    fn fills_attached_after_a_piece_commit_are_paid_by_the_completion() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        // SAFETY: inside the region; the GPU is idle.
+        unsafe { std::ptr::write_bytes(region.ptr, 0xEE, 16) };
+        let q = m.create_queue().unwrap();
+        let owed = std::sync::Arc::new(Owed::of(vec![], &[], 0));
+
+        // In flight: an attach is stored, not paid (the completion pays it in the GPU's order).
+        owed.attach_refund(vec![BlitOp::Fill { dst: (&buf, region.ptr as *const u8), len: 8, value: 0x11 }]);
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 16) }, [0xEE; 16], "not paid while in flight");
+
+        // The completion handler: the flag goes up, then what is attached is paid.
+        owed.completed.store(true, std::sync::atomic::Ordering::Release);
+        owed.pay_refund();
+        // SAFETY: inside the region; the GPU is done with it.
+        let bytes = unsafe { std::slice::from_raw_parts(region.ptr, 16) };
+        assert_eq!(&bytes[..8], &[0x11; 8], "paid by the completion");
+        assert_eq!(&bytes[8..], &[0xEE; 8], "and only the attached range");
+
+        // An attach that races a finished completion pays at once (the order is the same).
+        owed.attach_refund(vec![BlitOp::Fill { dst: (&buf, unsafe { region.ptr.add(8) } as *const u8), len: 8, value: 0x22 }]);
+        // SAFETY: inside the region.
+        let bytes = unsafe { std::slice::from_raw_parts(region.ptr, 16) };
+        assert_eq!(&bytes[8..], &[0x22; 8], "paid at once past the completion");
     }
 
     #[test]

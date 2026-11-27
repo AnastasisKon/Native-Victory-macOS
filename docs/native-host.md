@@ -1256,21 +1256,31 @@ commits, so the fills of the dropped pass never run and nothing paid them; a pie
 command buffer exists at all loses them the same way.
 
 Now: `submit_passes` reports what it lost (`victory_backend::resources::SubmitFailure`): whether the
-command buffer committed, and which pass indices were dropped from it. When the call in
-`NativeHost::execute` returns an error, the host makes only the lost passes' fills on the CPU, in
-order, with a release fence after them (`crates/victory-gpu/src/native/host.rs`), and warns the first
-time (`native host pays a lost pass's value writes on the CPU`). A committed submission's kept passes
-still run on the GPU: paying their fills too would let a waiting queue go on before this queue's
-earlier GPU passes have run, and the GPU's own later fill could overwrite a newer value the title
-wrote after seeing the CPU write. What a waiting queue can read early from a paid fill is nothing
-harmful: the fill is a plain store of the word range into coherent title memory plus a release
-fence, so a queue polling the barrier word reads the old value (keeps waiting) or the filled one; a
-partial multi-word fill just means it waits on the next word. The hazard closed is the opposite:
-the word staying 0 forever after a refused submission, which held the queue for good. Host policy,
-not console behaviour, like the recoveries above: the console has no refused submissions. Tests:
+command buffer committed, and which pass indices were dropped from it. A committed submission's
+refused fills are re-encoded by the backend as a blit pass of the same command buffer (`gfx.rs`),
+so they land in the GPU's order — after the passes that ran, before the fence signals a waiter
+reads — where paying them on the CPU at submit time would let a waiting queue go on before this
+command buffer's earlier GPU passes have run, and a kept pass's own GPU fill could then overwrite
+a newer value the title wrote after seeing the CPU write. A blit fill always encodes (it needs no
+attachments or pipeline), so the re-encode cannot fail; copies are not re-encoded (a copy may have
+partly run, and its source may have changed since). When a piece boundary stops later passes from
+ever being encoded (`next_piece` failed), their fills are attached to the last committed piece's
+`Owed` and paid from its completion handler — after that piece's GPU passes have run, whether it
+failed or not (`Owed::attach_refund`, `Owed::pay_refund`). A submission that never committed lost
+every pass and has no GPU work in flight: the host pays all of its fills on the CPU, in order,
+with a release fence after them (`crates/victory-gpu/src/native/host.rs`), and warns the first
+time (`native host pays a lost submission's value writes on the CPU`). What a waiting queue can
+read early from a paid fill is nothing harmful: the fill is a plain store of the word range into
+coherent title memory plus a release fence, so a queue polling the barrier word reads the old
+value (keeps waiting) or the filled one; a partial multi-word fill just means it waits on the next
+word. The hazard closed is the opposite: the word staying 0 forever after a refused submission,
+which held the queue for good. Host policy, not console behaviour, like the recoveries above: the
+console has no refused submissions. Tests:
 `vertex_tests::a_submission_that_never_committed_pays_its_value_writes_on_the_cpu`,
-`vertex_tests::only_the_fills_of_refused_passes_are_paid_on_the_cpu` and
-`vertex_tests::a_submitted_piece_leaves_its_value_writes_to_the_gpu`.
+`vertex_tests::a_committed_failure_leaves_the_fills_to_the_backend`,
+`vertex_tests::an_uncommitted_failure_pays_every_fill_on_the_cpu`,
+`vertex_tests::a_submitted_piece_leaves_its_value_writes_to_the_gpu` and
+`owed_tests::fills_attached_after_a_piece_commit_are_paid_by_the_completion`.
 
 #### A pass refused mid-encoding ends its encoder
 

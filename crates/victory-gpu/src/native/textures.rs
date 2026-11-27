@@ -87,7 +87,7 @@ impl TextureInfo {
     /// Top mip levels left off the host texture (0 or 1; see [`drop_top_mip`]).
     pub fn dropped_levels(&self) -> usize {
         dropped_levels(
-            drop_top_mip(),
+            drop_top_mip_levels(),
             self.render_target() || self.flags & UNORDERED_ACCESS != 0,
             self.dimension == Dimension::Tex3d,
             self.layout.mips.len(),
@@ -109,22 +109,38 @@ impl TextureInfo {
 
 /// Largest side (texels) from which a sampled texture loses its top level under [`drop_top_mip`].
 const DROP_TOP_MIP_MIN_SIDE: u32 = 1024;
+/// Largest side (texels) from which, with `VICTORY_TEXTURE_DROP_TOP_MIP=2`, a second level goes too.
+const DROP_SECOND_MIP_MIN_SIDE: u32 = 4096;
 
-/// `VICTORY_TEXTURE_DROP_TOP_MIP=1`: large sampled textures are made on the host without their
-/// top mip (a quarter of the memory of that level, about 75% of the texture's): for hosts whose
-/// unified memory cannot hold the title's full set (an iPad's ~9 GiB before it swaps).
-/// Sampling with implicit LOD then uses the next level, a little blurrier up close. Shortcut, not
-/// console behaviour: explicit-LOD samples come out one level blurrier and integer texel loads
-/// address the smaller texture; render targets, UAV and 3D textures are never touched.
-pub fn drop_top_mip() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_DROP_TOP_MIP").is_ok_and(|v| v == "1"))
+/// `VICTORY_TEXTURE_DROP_TOP_MIP=<n>` (off by default): large sampled textures are made on the host
+/// without their top levels, for hosts whose unified memory cannot hold the title's full set (an
+/// iPad's ~9 GiB before it swaps). `1`: the top level of textures whose larger side is at least
+/// 1024 texels (about 75% of each one's memory). `2`: also a second level of those at least 4096
+/// (about 94% of each of those). Sampling with implicit LOD then uses the next level kept, blurrier
+/// up close. Shortcut, not console behaviour: explicit-LOD samples come out that many levels
+/// blurrier and integer texel loads address the smaller texture; render targets, UAV and 3D
+/// textures are never touched.
+pub fn drop_top_mip_levels() -> usize {
+    static LEVELS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LEVELS.get_or_init(|| match std::env::var("VICTORY_TEXTURE_DROP_TOP_MIP").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
 }
 
-/// Levels to leave off: one for a large, sampled-only 2D texture that has a level below its top.
-fn dropped_levels(enabled: bool, written_by_gpu: bool, volume: bool, mips: usize, largest_side: u32) -> usize {
-    let eligible = enabled && !written_by_gpu && !volume && mips >= 2 && largest_side >= DROP_TOP_MIP_MIN_SIDE;
-    usize::from(eligible)
+/// Levels to leave off a sampled-only 2D texture, given the setting (0 to 2): one when it is
+/// large and has a level below its top, two when the setting allows it and it is very large with
+/// two levels below its top. A texture always keeps at least one level.
+fn dropped_levels(setting: usize, written_by_gpu: bool, volume: bool, mips: usize, largest_side: u32) -> usize {
+    if setting == 0 || written_by_gpu || volume {
+        return 0;
+    }
+    if setting >= 2 && mips >= 3 && largest_side >= DROP_SECOND_MIP_MIN_SIDE {
+        2
+    } else {
+        usize::from(mips >= 2 && largest_side >= DROP_TOP_MIP_MIN_SIDE)
+    }
 }
 
 /// A view's title mip range `(first, count)` on a host texture made without its top `dropped`
@@ -2917,13 +2933,24 @@ mod drop_top_mip_tests {
 
     #[test]
     fn only_large_sampled_2d_textures_with_a_lower_level_lose_their_top() {
-        assert_eq!(dropped_levels(true, false, false, 11, 2048), 1);
-        assert_eq!(dropped_levels(true, false, false, 2, 1024), 1);
-        assert_eq!(dropped_levels(false, false, false, 11, 2048), 0, "off unless asked for");
-        assert_eq!(dropped_levels(true, true, false, 11, 2048), 0, "render targets and UAVs keep it");
-        assert_eq!(dropped_levels(true, false, true, 11, 2048), 0, "3D textures keep it");
-        assert_eq!(dropped_levels(true, false, false, 1, 4096), 0, "no lower level to fall back on");
-        assert_eq!(dropped_levels(true, false, false, 10, 1023), 0, "small textures keep it");
+        assert_eq!(dropped_levels(1, false, false, 11, 2048), 1);
+        assert_eq!(dropped_levels(1, false, false, 2, 1024), 1);
+        assert_eq!(dropped_levels(0, false, false, 11, 2048), 0, "off unless asked for");
+        assert_eq!(dropped_levels(1, true, false, 11, 2048), 0, "render targets and UAVs keep it");
+        assert_eq!(dropped_levels(1, false, true, 11, 2048), 0, "3D textures keep it");
+        assert_eq!(dropped_levels(1, false, false, 1, 4096), 0, "no lower level to fall back on");
+        assert_eq!(dropped_levels(1, false, false, 10, 1023), 0, "small textures keep it");
+        assert_eq!(dropped_levels(1, false, false, 13, 8192), 1, "setting 1 never drops two");
+    }
+
+    #[test]
+    fn setting_two_drops_a_second_level_only_from_very_large_textures() {
+        assert_eq!(dropped_levels(2, false, false, 13, 4096), 2);
+        assert_eq!(dropped_levels(2, false, false, 13, 8192), 2);
+        assert_eq!(dropped_levels(2, false, false, 12, 2048), 1, "large, not very large: one");
+        assert_eq!(dropped_levels(2, false, false, 2, 4096), 1, "keeps at least one level");
+        assert_eq!(dropped_levels(2, false, false, 3, 4096), 2, "two levels below the top: both may go");
+        assert_eq!(dropped_levels(2, true, false, 13, 4096), 0, "GPU-written textures keep everything");
     }
 
     #[test]
@@ -2938,5 +2965,10 @@ mod drop_top_mip_tests {
         assert_eq!(host_mip_range(3, 2, 1, 10), (2, 2));
         // A count past the end is clamped to the host's levels.
         assert_eq!(host_mip_range(5, 99, 1, 10), (4, 6));
+        // Two dropped (13 title levels, 11 on the host): views of either dropped level see the
+        // host's top; lower levels move two down.
+        assert_eq!(host_mip_range(0, 13, 2, 11), (0, 11));
+        assert_eq!(host_mip_range(1, 1, 2, 11), (0, 1));
+        assert_eq!(host_mip_range(4, 3, 2, 11), (2, 3));
     }
 }

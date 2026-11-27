@@ -485,10 +485,11 @@ impl ComputeBackend for Metal {
             match &*slot {
                 Some(s) => s.clone(),
                 None => {
-                    let s = self
-                        .dev
-                        .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
-                        .map_err(|e| e.localizedDescription().to_string())?;
+                    let s = crate::gfx::track_residency_set(
+                        self.dev
+                            .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
+                            .map_err(|e| e.localizedDescription().to_string())?,
+                    );
                     *slot = Some(s.clone());
                     s
                 }

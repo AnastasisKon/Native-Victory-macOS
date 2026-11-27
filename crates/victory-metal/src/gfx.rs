@@ -841,7 +841,7 @@ impl ResourceBackend for Metal {
                 .map_err(|e| e.localizedDescription().to_string())?;
             s.addAllocation(ProtocolObject::from_ref(&*buf));
             s.commit();
-            Some(s)
+            Some(track_residency_set(s))
         } else {
             None
         };
@@ -1907,6 +1907,37 @@ pub(crate) fn track_event(
     event
 }
 
+/// The process's residency sets (each heap's and the pool's), weakly, so a stop can give back what
+/// they hold before the process exits ([`stop_gpu`]).
+struct TrackedSets(Vec<objc2::rc::Weak<ProtocolObject<dyn MTLResidencySet>>>);
+// SAFETY: residency sets may be used from any thread; the list is only touched under its lock.
+unsafe impl Send for TrackedSets {}
+static SETS: std::sync::Mutex<TrackedSets> = std::sync::Mutex::new(TrackedSets(Vec::new()));
+
+/// Remembers `set` for [`stop_gpu`] and returns it.
+pub(crate) fn track_residency_set(
+    set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+) -> Retained<ProtocolObject<dyn MTLResidencySet>> {
+    let mut sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
+    if sets.0.len() % 256 == 255 {
+        sets.0.retain(|w| w.load().is_some());
+    }
+    sets.0.push(objc2::rc::Weak::from_retained(&set));
+    set
+}
+
+/// Empties and commits `sets`: what they held is no longer kept resident. Returns the bytes they
+/// held.
+fn release_sets(sets: &[Retained<ProtocolObject<dyn MTLResidencySet>>]) -> u64 {
+    let mut bytes = 0;
+    for set in sets {
+        bytes += set.allocatedSize();
+        set.removeAllAllocations();
+        set.commit();
+    }
+    bytes
+}
+
 /// A value above any a command buffer waits for: an event raised to it lets every wait on it pass.
 const STOP_VALUE: u64 = 1 << 62;
 
@@ -1927,7 +1958,20 @@ pub fn stop_gpu(wait: std::time::Duration) -> (usize, usize) {
         .iter()
         .filter_map(objc2::rc::Weak::load)
         .collect();
-    wake_and_drain(&events, wait)
+    let drained = wake_and_drain(&events, wait);
+    // Then what the residency sets keep resident is given back before the process goes, not left
+    // to the driver's teardown: a run that hung the GPU at world entry with ~16 GB in its heaps'
+    // sets left 19.7 GB "in use" after it exited (#357). Process exit skips `Heap`'s `Drop`.
+    let sets: Vec<_> = SETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+        .iter()
+        .filter_map(objc2::rc::Weak::load)
+        .collect();
+    let bytes = release_sets(&sets);
+    tracing::warn!(sets = sets.len(), mb = bytes >> 20, "stop: residency sets emptied");
+    drained
 }
 
 /// [`stop_gpu`] for `events` (the tests wake only their own).
@@ -3435,6 +3479,24 @@ mod owed_tests {
             EVENTS.lock().unwrap().0.iter().any(|w| w.load().is_some_and(|t| Retained::as_ptr(&t) == Retained::as_ptr(e)))
         };
         assert!(tracked(&never.0) && tracked(&q.2));
+    }
+
+    /// A stop empties the residency sets it tracks, so nothing it made stays resident.
+    #[test]
+    fn a_stop_empties_the_residency_sets() {
+        use objc2_foundation::NSObjectProtocol;
+        let m = Metal::new().unwrap();
+        if !m.dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:)) {
+            return;
+        }
+        let set = track_residency_set(m.dev.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).unwrap());
+        let buf = m.dev.newBufferWithLength_options(1 << 20, MTLResourceOptions::StorageModePrivate).unwrap();
+        set.addAllocation(ProtocolObject::from_ref(&*buf));
+        set.commit();
+        assert_eq!(set.allocationCount(), 1);
+        assert!(SETS.lock().unwrap().0.iter().any(|w| w.load().is_some_and(|t| Retained::as_ptr(&t) == Retained::as_ptr(&set))));
+        assert!(release_sets(std::slice::from_ref(&set)) >= 1 << 20);
+        assert_eq!(set.allocationCount(), 0);
     }
 
     #[test]

@@ -1222,14 +1222,26 @@ were refused, so their dispatches were dropped and every count stayed 0.
   (`barrier_blocks`). All three translate. Over the same 3,338 dumped containers, four more compute
   shaders translate and no other outcome changes. Test, on the GPU:
   `split_wave_tests::a_whole_wave_or_one_lane_puts_in_lds_reaches_the_group_at_its_barrier` (a
-  synthetic program of the culler's shape, the second console wave ending early, flags in both
-  host halves). Not a block
-  reached past a branch on an SCC computed from a `v_readfirstlane` (`split_scc`), which
-  `wave_blocks` already excludes: the console wave takes such a branch whole, so a title may put one
-  before its barrier, but each host wave reads its own first lane, so one half could skip the block
-  while the other waits at the exchange's group barrier, a hang (test
+  synthetic program of the culler's shape, the second console wave ending early, flags in both host
+  halves). Not a block reached past a branch on an SCC computed from a `v_readfirstlane`
+  (`split_scc`), which `wave_blocks` already excludes: the console wave takes such a branch whole,
+  so a title may put one before its barrier, but each host wave reads its own first lane, so one
+  half could skip the block while the other waits at the exchange's group barrier, a hang (test
   `wave32_tests::a_barrier_block_behind_a_first_lane_branch_is_no_exchange_site`). Once the first
-  lane read is the console wave's (#254), the exclusion is only conservative for compute.
+  lane read is the console wave's (#254), the exclusion is only conservative for compute. But the
+  culling shaders branch exactly this way: after the title's barrier, every lane reads LDS word 0
+  (the group flag) and the branch is on its first lane. A first lane read of a `ds_read_b32`
+  therefore splits nothing when its address is a constant, it follows one of the title's
+  `s_barrier`s in its block with no LDS write between, and no LDS write that can follow it before a
+  barrier can touch the word (one at constant bytes elsewhere is fine): the group barrier brings
+  every thread there with the same LDS, and nothing changes the word until all have passed the next
+  one (`barrier_reads`; test
+  `wave32_tests::a_barrier_block_behind_a_branch_on_an_lds_word_read_after_a_barrier`, which also
+  refuses a write to the word before the read or before the next barrier). Over the 4,129 refused
+  compute and graphics containers of a boot run (Series S, offline, both with and without thread
+  counts), `4e2edbd69fe414f1` and `f44473ebe75e0047` now translate and nothing else changes;
+  `898d9c1a5605ad81` stays refused, as two LDS writes at computed addresses can follow its read
+  before the next barrier.
 
 `VICTORY_TRACE_TARGETS=1` cannot show this: an indirect draw counts as drawn when it is encoded,
 whatever the GPU later reads as its count.

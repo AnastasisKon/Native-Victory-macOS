@@ -330,6 +330,64 @@ fn a_barrier_block_behind_a_first_lane_branch_is_no_exchange_site() {
     );
 }
 
+#[test]
+fn a_barrier_block_behind_a_branch_on_an_lds_word_read_after_a_barrier() {
+    // Two console waves (no lockstep). After a barrier, every lane reads LDS word 0 and branches
+    // on its first lane; the branch skips a block holding a barrier and a lane read across the
+    // halves. Both halves read that word after the same group barrier: an exchange site, unless
+    // a write to the word can come between the barrier and either half's read.
+    const WRITE_WORD_0: [u32; 2] = [0xD834_0000, 0x0000_1614]; // ds_write_b32 v20, v22
+    const WRITE_WORD_1: [u32; 2] = [0xD834_0000, 0x0000_1617]; // ds_write_b32 v23, v22
+    let program = |after_barrier: &[u32], in_block: &[u32]| {
+        let mut w = vec![
+            0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+            0x7E10_0280, // v_mov_b32_e32 v8, 0
+            0x7E12_0280, // v_mov_b32_e32 v9, 0
+            0x7E28_0280, // v_mov_b32_e32 v20, 0
+            0x7E2A_0285, // v_mov_b32_e32 v21, 5
+            0x7E2C_0287, // v_mov_b32_e32 v22, 7
+            0x7E2E_0284, // v_mov_b32_e32 v23, 4
+            0xD834_0000,
+            0x0000_1514, // ds_write_b32 v20, v21
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF8A_0000, // s_barrier
+        ];
+        w.extend(after_barrier);
+        // s_cbranch_scc0 over the block, to the s_endpgm.
+        let skip = 0xBF84_0006 + in_block.len() as u32;
+        w.extend([
+            0xD8D8_0000,
+            0x0C00_0014, // ds_read_b32 v12, v20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E04_050C, // v_readfirstlane_b32 s2, v12
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0
+            skip,
+        ]);
+        w.extend(in_block);
+        w.extend([
+            0xBF8A_0000, // s_barrier
+            0xD760_0004,
+            0x0001_5101, // v_readlane_b32 s4, v1, 40
+            0x7E0A_0204, // v_mov_b32_e32 v5, s4
+            0xDC70_8000,
+            0x007D_0508, // global_store_dword v[8:9], v5, off
+            S_ENDPGM,
+        ]);
+        lowered(&w, 128, true, true)
+    };
+    let refused = |r: Result<Lowered, crate::ShaderError>| match r {
+        Err(crate::ShaderError::Unsupported { what, .. }) => what == lower::DIVERGENT_EXCHANGE,
+        _ => false,
+    };
+    assert!(program(&[], &[]).expect("lowers").exchanges);
+    // A write to another word before the next barrier changes nothing.
+    assert!(program(&[], &WRITE_WORD_1).expect("lowers").exchanges);
+    // A write to the word between the barrier and the read: the halves may read apart.
+    assert!(refused(program(&WRITE_WORD_0, &[])));
+    // A write to the word one half can make before the other has read it.
+    assert!(refused(program(&[], &WRITE_WORD_0)));
+}
+
 /// A sum over the 64 lanes the way a compiler expands `WaveActiveSum`: all
 /// lanes on, butterflies inside each row of 16, then the rows' sums by lane.
 const REDUCE: &[u32] = &[

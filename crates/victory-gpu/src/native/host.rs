@@ -1570,10 +1570,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
             // Not past the heap's end.
             for k in 0..n.min(h.count.saturating_sub(*at)) as u64 {
                 match crate::descriptor::view(h.start + (*at as u64 + k) * Self::step(HeapKind::Resource)) {
-                    Some(View::Shader(r, _)) => match texture_info_of(r) {
+                    Some(View::Shader(r, desc)) => match texture_info_of(r) {
                         Some(i) => { keys.push(r); reads.push(format!("{slot}.{k}={}", d(r, Some(i)))); }
                         // Named too, so a table entry the host cannot draw from shows in the trace.
-                        None => reads.push(format!("{slot}.{k}={r:#x}:untracked")),
+                        None => {
+                            let buffer = matches!(self.resources.borrow().get(&r), Some(Res::Buffer(..)));
+                            reads.push(format!("{slot}.{k}={}", untextured_srv(r, buffer, desc)));
+                        }
                     },
                     Some(View::Unordered(r, _, _)) => {
                         if texture_info_of(r).is_some() { keys.push(r); }
@@ -1585,7 +1588,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         if u { writes.push(s) } else { reads.push(s) }
                     }
                     Some(View::Placed(u, res, _)) => {
-                        let s = format!("{slot}.{k}=placed-dim{}", res[0]);
+                        // Dimension 1 is a buffer, which the host reads as memory.
+                        let s = match res[0] { 1 => format!("{slot}.{k}=placed:buf"), n => format!("{slot}.{k}=placed-dim{n}") };
                         if u { writes.push(s) } else { reads.push(s) }
                     }
                     Some(_) => {}
@@ -2341,6 +2345,27 @@ fn texture_info_of(r: usize) -> Option<super::textures::TextureInfo> {
 #[cfg(not(target_os = "macos"))]
 fn texture_info_of(_: usize) -> Option<super::textures::TextureInfo> {
     None
+}
+
+/// The pass trace's name for a shader-resource view the host has no texture for: a buffer the host
+/// knows (`<key>:buf`), a null resource with its view description's format and dimension
+/// (`null:f<format>:dim<dimension>`, read as zeros), or anything else (`<key>:untracked`).
+#[cfg(any(test, target_os = "macos"))]
+fn untextured_srv(r: usize, buffer: bool, desc: Option<[u32; 10]>) -> String {
+    match (r, desc) {
+        (0, Some(d)) => format!("null:f{}:dim{}", d[0], d[1]),
+        (0, None) => "null".into(),
+        _ if buffer => format!("{r:#x}:buf"),
+        _ => format!("{r:#x}:untracked"),
+    }
+}
+
+#[test]
+fn the_pass_trace_names_views_without_a_texture_by_kind() {
+    assert_eq!(untextured_srv(0, false, Some([34, 4, 0, 0, 0, 0, 0, 0, 0, 0])), "null:f34:dim4");
+    assert_eq!(untextured_srv(0, false, None), "null");
+    assert_eq!(untextured_srv(0x1000, true, None), "0x1000:buf");
+    assert_eq!(untextured_srv(0x1000, false, None), "0x1000:untracked");
 }
 
 #[cfg(target_os = "macos")]

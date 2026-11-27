@@ -12,6 +12,8 @@ pub mod emit;
 pub mod gfx10;
 pub mod io;
 pub mod ir;
+#[cfg(test)]
+mod ir_tests;
 pub mod native;
 pub mod range;
 pub mod resource;

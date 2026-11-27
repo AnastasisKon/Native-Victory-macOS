@@ -781,3 +781,26 @@ fn an_rgb9e5_view_reads_what_compute_stored_as_r32_uint() {
         assert_eq!(*c, [(256 + i) as f32 / 256.0, 0.5, 0.25, 1.0], "texel {i}");
     }
 }
+
+/// The B5G5R5A1 sun-mask lead: a compute store into a `BGR5A1Unorm` texture through a converted
+/// shader lands, quantized to 5 bits a channel.
+#[test]
+fn a_compute_store_into_bgr5a1() {
+    let Some(m) = backend() else { return };
+    let mut d = d2(Format::Bgr5a1Unorm, 8, 8);
+    d.unordered_access = true;
+    let t = m.create_texture(&d).unwrap();
+    m.upload_texture(&t, 0, 0, &[0u8; 128], 16, 0);
+    fill(&m, &fixture("tex_fill"), &t, &[], [8, 8, 1], 8, 8);
+    let mut bytes = [0u8; 128];
+    m.read_texture(&t, 0, 0, &mut bytes, 16, 0);
+    let out: Vec<u16> = bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    // (x, y, 64, 255) / 255 in 5 bits: blue = 64 * 31 / 255 = 8 (rounded), alpha 1.
+    let want: Vec<u16> = (0..64u32)
+        .map(|i| {
+            let five = |v: u32| (v * 31 + 127) / 255;
+            (8 | five(i / 8) << 5 | five(i % 8) << 10 | 1 << 15) as u16
+        })
+        .collect();
+    assert_eq!(out, want);
+}

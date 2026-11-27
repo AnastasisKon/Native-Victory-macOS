@@ -25,6 +25,8 @@ jobs:
         run: /bin/bash tools/macos/tests/target-directory.sh
       - name: Run-log summary self-test (Bash 3.2)
         run: /bin/bash tools/macos/run-summary.sh --self-test
+      - name: Corpus sweep comparison self-test (Bash 3.2)
+        run: /bin/bash tools/corpus/compare.sh --self-test
 
   check:
     runs-on: windows-latest

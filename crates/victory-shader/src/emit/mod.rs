@@ -216,6 +216,8 @@ mod bitcode;
 #[cfg(all(test, windows))]
 mod bvh_tests;
 mod container;
+#[cfg(test)]
+mod container_tests;
 pub mod graphics;
 #[cfg(all(test, windows))]
 mod diff_tests;

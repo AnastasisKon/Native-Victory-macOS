@@ -944,6 +944,7 @@ const PAGE_DESTINATION: u64 = 1 << 21;
 const MEMORY_SOURCE: u64 = 1 << 22;
 // Bits 5-20 select a further transform, bit 23 a source in physical pages;
 // Grand Theft Auto VI's packages need neither, so requests with them fail.
+const SUPPORTED: u64 = ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE;
 
 const PAGE: usize = 64 * 1024;
 
@@ -1112,7 +1113,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     }
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| failed(request, hr, why);
-    if options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) != 0 {
+    if options & !SUPPORTED != 0 {
         return Err(fail(E_NOTIMPL, "unsupported options"));
     }
     if request.source.is_null() || request.destination.is_null() {
@@ -1376,6 +1377,10 @@ fn into_destination(
 
 /// The file a request reads, as the title named it, or "memory".
 fn source_name(request: &Request) -> &str {
+    // With an option `execute` refuses, `source` need not be one of our files (bit 23: pages).
+    if request.options & !SUPPORTED != 0 {
+        return "<unsupported source>";
+    }
     if request.options & MEMORY_SOURCE != 0 {
         return "memory";
     }
@@ -1914,6 +1919,15 @@ mod tests {
         }
         l.finish(&job, Ok(()));
         assert!(running_reads(&l).is_empty());
+    }
+
+    /// A request with an option `execute` refuses is named without reading its source, which need
+    /// not be one of our files (bit 23: a source in physical pages).
+    #[test]
+    fn an_unsupported_source_is_not_read_for_its_name() {
+        let pages = 0x10 as *const c_void;
+        let r = request(1 << 23, std::ptr::null_mut(), 16, pages, 0, 16);
+        assert_eq!(source_name(&r), "<unsupported source>");
     }
 
     #[test]

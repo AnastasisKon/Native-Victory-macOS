@@ -1089,11 +1089,15 @@ impl<'a> Lanes<'a> {
         }
     }
 
-    /// The key `k` copies ([`copied`]), each half, or both halves of a 32-lane key.
+    /// The key the last XORs of a swap ([`xored_back`]) give back in `k`, each half, or both
+    /// halves of a 32-lane key.
     fn copy_key(&self, k: Key) -> Option<Key> {
         let p = self.p;
         let def = |x: Value| self.defs.get(&x).map(|&(b, i)| &p.blocks[b].insts[i]);
-        let copy = |v: Value| copied(def(v)?, v, def);
+        let copy = |v: Value| {
+            let inst = def(v)?;
+            xored_back(inst, inst.writes.iter().position(|&(_, x)| x == v)? as u8, def)
+        };
         let lo = copy(k.0)?;
         let hi = if p.wave64 { copy(k.1)? } else { lo };
         Some((lo, hi))
@@ -1546,7 +1550,7 @@ impl<'a> Lanes<'a> {
                     (m, d || exec_w)
                 } else if let Some(src) = self.copy_key(k) {
                     // The last XOR of a swap (also of a pair a 32-lane program swaps with
-                    // `s_xor_b64`): the mask it gives back, bit for bit.
+                    // `s_xor_b64`): the mask it gives back, bit for bit. (Moves are `sop`'s.)
                     let (m, d) = self.mask(src);
                     (m, d || exec_w)
                 } else {

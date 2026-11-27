@@ -825,6 +825,36 @@ fn formatted_buffer_stores_and_loads_through_structured_and_typed_uavs() {
     );
     assert_eq!(t.host.typed_views(), 8, "8 promotions across the 8 mirrored descriptors");
     assert_eq!(t.host.live_typed_views(), 1, "only 1 entry holds a typed view at the end");
+
+    // A typed view over a committed buffer (host memory no pool holds) is made over the host's
+    // wrap of that buffer ([`NativeHost::resolve`]), at the right offset into it.
+    let layout = std::alloc::Layout::from_size_align(1 << 16, 1 << 16).unwrap();
+    // SAFETY: non-zero size; freed below, after the GPU is done with it.
+    let mem = unsafe { std::alloc::alloc_zeroed(layout) };
+    let at = mem as u64 + 0x100;
+    t.host.register_own_buffer(0xC0FFEE, mem as u64, layout.size() as u64);
+    f.put(0x2_1000, &[0u32; 8]);
+    f.put(0x2_1800, &bits);
+    let mut view_own = [0u32; 16];
+    (view_own[0], view_own[1], view_own[4]) = (3, 1, 8);
+    [view_own[10], view_own[11]] = super::addr_tests::halves(at);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view_own, start);
+    assert!(t.host.mirror(start).unwrap());
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso_fmt);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(t.host.typed_views(), 9, "promoted over the committed buffer");
+    assert_eq!(t.host.unmapped(), 0);
+    // SAFETY: inside the allocation; read after the run waited for the GPU.
+    let own = unsafe { std::slice::from_raw_parts(at as *const u32, 8) };
+    assert_eq!((&own[..4], &own[4..8]), (&[0; 4][..], &bits[..]), "texel 1 in committed memory");
+    assert_eq!(f.get(0x2_1000, 5), [bits[0], bits[1], bits[2], bits[3], 8], "committed: readback");
+    t.host.release_resource(0xC0FFEE);
+    // SAFETY: allocated above with this layout; the GPU is idle.
+    unsafe { std::alloc::dealloc(mem, layout) };
     drop(records);
 }
 

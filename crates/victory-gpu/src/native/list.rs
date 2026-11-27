@@ -1297,6 +1297,7 @@ impl<B: GraphicsBackend> NativeList<B> {
                 index_count == 0 || instance_count == 0
             }
             DrawCall::Mesh { groups } => groups.contains(&0),
+            DrawCall::Rects => false,
         };
         if empty {
             self.state
@@ -1324,6 +1325,12 @@ impl<B: GraphicsBackend> NativeList<B> {
         index: u32,
     ) -> Result<(), String> {
         self.draw_indirect_from(record, indexed, Some((count, index)))
+    }
+
+    /// One rectangle-list draw of `ExecuteIndirect` (`DrawCall::Rects`): the record at title
+    /// address `record`, with `count` as [`Self::draw_indirect_counted`]'s.
+    pub fn draw_rects_indirect(&mut self, record: u64, count: Option<(u64, u32)>) -> Result<(), String> {
+        self.draw_from(DrawCall::Rects, Some(record), count)
     }
 
     fn draw_indirect_from(

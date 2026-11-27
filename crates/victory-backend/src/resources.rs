@@ -595,6 +595,10 @@ pub enum DrawCall {
     },
     /// `DispatchMesh` of a mesh pipeline: thread groups in x, y, z.
     Mesh { groups: [u32; 3] },
+    /// `ExecuteIndirect` of a rectangle list (indirect only): the record (`D3D12_DRAW_ARGUMENTS`)
+    /// counts the vertices of three-corner rectangles, and is drawn as a direct rectangle list is,
+    /// one four-vertex strip instance a rectangle (`victory_shader::emit::Options::rect_list`).
+    Rects,
 }
 
 /// A viewport as `RSSetViewports` takes it: top left, size, depth range.

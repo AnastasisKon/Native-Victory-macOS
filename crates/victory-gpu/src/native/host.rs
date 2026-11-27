@@ -204,6 +204,16 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.heaps.borrow().iter().filter(|h| h.kind == HeapKind::Resource).count()
     }
 
+    /// Buffer heap entries across all resource heaps that currently hold a live `texture_buffer`
+    /// view (overwriting an entry with `write_buffer` / `write_texture` or `clear_entry` drops it).
+    pub fn live_typed_views(&self) -> usize {
+        self.heaps
+            .borrow()
+            .iter()
+            .map(|h| self.backend.heap_typed_views(&h.heap))
+            .sum()
+    }
+
     /// The table the pool observer keeps current; register it as (or call it from) the observer.
     pub fn memory(&self) -> Arc<PoolTable> {
         self.memory.clone()
@@ -503,6 +513,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// (`HEAP_VIEWS`: a translated shader reads no entry past it, and reads the host's null
     /// buffer views just below it, see [`Self::write_null_buffers`]). A heap too long for the
     /// pairs ([`addr::fits`]) stays as long as it is.
+    ///
+    /// shortcut: every such heap is `HEAP_VIEWS` long (48 MiB of Metal entries, and its stride
+    /// table 8 MiB, both resident from its first dispatch) because a translated shader's clamp
+    /// and its null view index are constants, not the heap's length: sizing heap and table to
+    /// `count` needs the shader to read a per-heap bound (a root constant, say) instead.
     fn resource_entries(count: usize) -> usize {
         let entries = count + addr::RESERVED;
         if addr::fits(count) {
@@ -667,6 +682,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
             strides.write_at(index, &[self.stride_word(view.as_ref())]);
         }
         let Some(view) = view else {
+            // Emptied (by the title's stores): not mirrored any more, so a submission does not
+            // look at it again until the title writes a record there.
+            heap.mirrored.borrow_mut().remove(&index);
             return Ok(false);
         };
         let resources = self.resources.borrow();
@@ -857,8 +875,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     record_at(handle)
                 };
                 checked += 1;
-                if record == [0; 12]
-                    || h.mirrored.borrow().get(&index) == Some(&record)
+                let seen = h.mirrored.borrow().get(&index).copied();
+                // An empty record is mirrored only if a view was mirrored there before: the title
+                // zeroed it with stores, and its view-stride dword must go to 0.
+                if seen == Some(record)
+                    || (record == [0; 12] && seen.is_none())
                     || h.pending_mirror.borrow().get(&index) == Some(&(record, pool_gen, res_gen))
                 {
                     continue;
@@ -911,8 +932,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 .resolve(addr, u64::from(size))
                 .ok()
                 .or_else(|| self.title_alias(addr, u64::from(size)).map(|(b, p, _)| (b, p)));
-            if let Some((buf, ptr)) = resolved {
-                self.backend.write_typed_buffer(
+            if let Some((buf, ptr)) = resolved
+                && self.backend.write_typed_buffer(
                     &h.heap,
                     index,
                     &buf,
@@ -920,7 +941,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     size,
                     format,
                     writable,
-                );
+                )
+            {
                 self.typed_views.set(self.typed_views.get() + 1);
             }
         };
@@ -1056,8 +1078,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// One dword for every index a shader can compute (`HEAP_VIEWS`): the buffer view's element
     /// size at the title's entries, 0 elsewhere (the shader then reads the null buffer view).
     /// Made at first use from the heap as the title's memory has it now and kept current by
-    /// [`Self::mirror`]. shortcut: an entry the title copied as bytes outside a bound table
-    /// keeps its old dword until it is mirrored.
+    /// [`Self::mirror`] (also for a bound table's record the title zeroed with stores,
+    /// [`Self::remirror_tables`]). shortcut: an entry the title copied or zeroed as bytes outside
+    /// a bound table keeps its old dword until it is mirrored.
     fn view_strides(&self, heap: &NativeHeap<B>) -> Result<Rc<Pages<B>>, String> {
         if let Some(made) = &*heap.strides.borrow() {
             return Ok(made.clone());

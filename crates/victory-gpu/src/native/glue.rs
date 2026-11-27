@@ -1062,6 +1062,11 @@ pub(crate) fn log_draw_counts(frame: u64) {
         let (libraries_cached, libraries_converted) = victory_metal::disk::counts();
         tracing::info!(frame, shaders_cached, shaders_translated, libraries_cached, libraries_converted, "native shader cache so far");
     }
+    let (typed_views, typed_views_live) =
+        with_title(|t| (t.host.typed_views(), t.host.live_typed_views())).unwrap_or_default();
+    if typed_views > 0 {
+        tracing::info!(frame, typed_views, typed_views_live, "native typed buffer views");
+    }
     super::descriptor_trace::log(frame);
 }
 

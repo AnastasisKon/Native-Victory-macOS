@@ -401,13 +401,11 @@ fn a_compute_shader_stores_through_a_buffer_view_it_takes_from_the_heap() {
     assert_eq!((t.host.unset_roots(), t.host.unmapped(), t.host.failed()), (0, 0, 0));
 }
 
-/// #264 review: the title zeroes a heap record with plain stores (no device call). The host does
-/// not see it: the per-submission table check skips empty records, so the dispatch still finds
-/// the old stride and the old buffer view and stores through it. Only a mirror of that record
-/// (a device write there, or the host mirroring it for another reason) brings the stride to 0,
-/// and then the shader reads the null view.
+/// #264 review: the title zeroes a heap record with plain stores (no device call). The record is
+/// in a bound table and a view was mirrored there, so the next submission mirrors it: its
+/// view-stride dword goes to 0 and the shader reads the null view, not the old buffer.
 #[test]
-fn a_heap_record_the_title_zeroes_with_plain_stores_keeps_its_stride_until_mirrored() {
+fn a_heap_record_the_title_zeroes_with_plain_stores_reads_the_null_view_at_the_next_dispatch() {
     let mut uav = [0u8; 32];
     uav[0] = 0x41;
     uav[4..6].copy_from_slice(&[3, 3]);
@@ -444,11 +442,13 @@ fn a_heap_record_the_title_zeroes_with_plain_stores_keeps_its_stride_until_mirro
     // SAFETY: entry 2's 32 bytes inside `heap._records`, which the heap's records are.
     unsafe { std::ptr::write_bytes(slot as *mut u8, 0, 32) };
     assert!(crate::descriptor::view(slot).is_none(), "an empty record");
-    // Not seen: the stride and the view stay, and the stores land through the old view.
-    assert_eq!(run(&t), stored, "stale stride and view");
-    // Mirrored again: the stride is 0 and the shader reads the null view.
-    assert!(!t.host.mirror(slot).unwrap());
-    assert_eq!(run(&t), [canary; 3], "after a mirror of the zeroed record");
+    // Seen at the dispatch: the stride is 0 and the stores go to the null view.
+    assert_eq!(run(&t), [canary; 3], "the zeroed record's old view");
+    assert!(!heap.heap.mirrored.borrow().contains_key(&2), "nothing mirrored there any more");
+    assert_eq!(run(&t), [canary; 3], "a second dispatch");
+    // A view written there again with plain stores is mirrored again.
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
+    assert_eq!(run(&t), stored, "a view written there again");
     assert_eq!((t.host.unset_roots(), t.host.unmapped(), t.host.failed()), (0, 0, 0));
 }
 
@@ -687,6 +687,11 @@ fn formatted_buffer_stores_and_loads_through_structured_and_typed_uavs() {
             views_before + 1,
             "{label}: formatted shader materializes only the bound candidate (case {idx})"
         );
+        assert_eq!(
+            t.host.live_typed_views(),
+            1,
+            "{label}: overwriting slot 0 drops its previous view so only 1 stays live"
+        );
         assert!(!heap.typed_pending.borrow().contains(0));
         assert!(
             heap.typed_pending.borrow().contains(19),
@@ -817,6 +822,190 @@ fn formatted_buffer_stores_and_loads_through_structured_and_typed_uavs() {
         (snorm_out[0], snorm_out[1], snorm_out[4]),
         ((-1.0f32).to_bits(), 1.0f32.to_bits(), 8),
         "R16G16_SNORM readback + getDimensions"
+    );
+    assert_eq!(t.host.typed_views(), 8, "8 promotions across the 8 mirrored descriptors");
+    assert_eq!(t.host.live_typed_views(), 1, "only 1 entry holds a typed view at the end");
+    drop(records);
+}
+
+/// If `Binding`'s DXIL scan ever missed a `TypedBuffer` operation (`typed_buffers == false` on
+/// purpose), `NativeHost::mirror` wrote `[gpu, 0, size]` (`textureViewID == 0`), so both SRV and
+/// UAV `texture_buffer` loads and `getDimensions` read zero cleanly on Metal without faulting —
+/// both on a fresh heap slot and after overwriting a previously promoted slot.
+#[test]
+fn wrong_typed_buffer_scan_reads_zero_without_crashing() {
+    // Entry 0 (dwords 0..4) is a read-only SRV `Buffer<float4>`, entry 1 (dwords 8..12) is a raw output UAV.
+    const CS_FMT_SRV_LOAD: &[u32] = &[
+        0xBE8A_0304, // s_mov_b32 s10, s4
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+        0xF408_0405, 0xFA00_0020, // s_load_dwordx4 s[16:19], s[10:11], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E00_0281, // v_mov_b32 v0, 1 (element index 1)
+        0xE00C_2000, 0x8003_0600, // buffer_load_format_xyzw v[6:9], v0, s[12:15], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE078_0000, 0x8004_0600, // buffer_store_dwordx4 v[6:9], off, s[16:19], 0
+        0x7E14_020E, // v_mov_b32 v10, s14 (getDimensions)
+        0xE070_0010, 0x8004_0A00, // buffer_store_dword v10, off, s[16:19], 0 offset:16
+        0xBF81_0000, // s_endpgm
+    ];
+    // Entry 0 is a read-write UAV `RWBuffer<float4>`; stores to element 1, loads element 1, and queries size.
+    const CS_FMT_UAV_RW: &[u32] = &[
+        0xBE8A_0304, // s_mov_b32 s10, s4
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+        0xF408_0405, 0xFA00_0020, // s_load_dwordx4 s[16:19], s[10:11], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E00_0281, // v_mov_b32 v0, 1 (element index 1)
+        0xE038_0800, 0x8004_0100, // buffer_load_dwordx4 v[1:4], off, s[16:19], 0 offset:2048
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE01C_2000, 0x8003_0100, // buffer_store_format_xyzw v[1:4], v0, s[12:15], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE00C_2000, 0x8003_0600, // buffer_load_format_xyzw v[6:9], v0, s[12:15], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE078_0000, 0x8004_0600, // buffer_store_dwordx4 v[6:9], off, s[16:19], 0
+        0x7E14_020E, // v_mov_b32 v10, s14 (getDimensions)
+        0xE070_0010, 0x8004_0A00, // buffer_store_dword v10, off, s[16:19], 0 offset:16
+        0xBF81_0000, // s_endpgm
+    ];
+
+    let mut srv0 = [0u8; 32];
+    srv0[0] = 0x41;
+    srv0[4..6].copy_from_slice(&[1, 3]); // SRV in table
+    srv0[16] = 1;
+    srv0[20..23].copy_from_slice(&[4, 4, 0]);
+    let mut uav0 = srv0;
+    uav0[4] = 3; // UAV in table
+    let mut uav1 = uav0;
+    uav1[8] = 8; // +8 dwords (entry 1)
+
+    let cs_srv = shaders::translate(&crate::pipeline::test_compute_container(
+        CS_FMT_SRV_LOAD,
+        &[srv0, uav1],
+        7,
+    ))
+    .unwrap();
+    let cs_uav = shaders::translate(&crate::pipeline::test_compute_container(
+        CS_FMT_UAV_RW,
+        &[uav0, uav1],
+        7,
+    ))
+    .unwrap();
+    assert!(crate::native::list::Binding::of(&cs_srv).typed_buffers);
+    assert!(crate::native::list::Binding::of(&cs_uav).typed_buffers);
+
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let records = vec![0u32; 8 * 4];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 4).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1; // BUFFER
+
+    let mut raw_out = [0u32; 16];
+    (raw_out[1], raw_out[4], raw_out[8]) = (1, 1024, 1);
+    [raw_out[10], raw_out[11]] = super::addr_tests::halves(super::addr_tests::VA_A + 0x1000);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &raw_out, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+
+    let make_wrong_pso = |t: &Title<Metal>, cs: &HostShader, name: &str| {
+        let mut b = crate::native::list::Binding {
+            name: name.into(),
+            ..crate::native::list::Binding::of(cs)
+        };
+        // Force the scan flags wrong on purpose so `materialize_typed_buffers` skips promotion.
+        b.typed_buffers = false;
+        b.heap_typed_buffers = false;
+        let threads = shaders::threads_of(&cs.dxil).unwrap();
+        let pso = victory_backend::backend::ComputeBackend::create_compute_pipeline_with(
+            &t.host.backend,
+            &cs.dxil,
+            b.layout().as_ref().unwrap(),
+        )
+        .unwrap();
+        Rc::new(crate::native::list::ComputePso {
+            pso,
+            threads,
+            binding: Some(b),
+        })
+    };
+    let Pipe::Compute(pso_srv_right) = t.compute_pipe(&cs_srv, "srv right") else {
+        panic!("{:?}", t.shaders)
+    };
+    let pso_srv_wrong = make_wrong_pso(&t, &cs_srv, "srv wrong");
+    let pso_uav_wrong = make_wrong_pso(&t, &cs_uav, "uav wrong");
+
+    let elem0 = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+    let elem1 = [1.5f32, -2.0, 0.5, 4.0].map(f32::to_bits);
+    f.put(0x2_0000, &elem0);
+    f.put(0x2_0010, &elem1);
+    f.put(0x2_1000, &[0xCAFE_BABEu32; 8]);
+
+    // 1. Fresh SRV slot (`mirror()` wrote `[gpu, 0, size]`): wrong scan reads zeros, no crash.
+    let mut srv_desc = [0u32; 16];
+    (srv_desc[0], srv_desc[1], srv_desc[6]) = (2, 1, 8); // RGBA32_FLOAT, BUFFER, 8 elements
+    [srv_desc[10], srv_desc[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &srv_desc, start);
+    assert!(t.host.mirror(start).unwrap());
+    assert_eq!(t.host.live_typed_views(), 0);
+
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso_srv_wrong);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(t.host.typed_views(), 0);
+    assert_eq!(t.host.live_typed_views(), 0);
+    assert_eq!(
+        f.get(0x2_1000, 5),
+        [0, 0, 0, 0, 0],
+        "fresh SRV with forced-false scan reads [0, 0, 0, 0] and width 0 over canary"
+    );
+
+    // 2. Promote the SRV slot with the real scan (`live_typed_views == 1`), verify non-zero read,
+    // then overwrite slot 0 via `mirror()` (`live_typed_views == 0`) and run the wrong-scan UAV
+    // shader: store is dropped cleanly, load and `getDimensions` read `[0, 0, 0, 0, 0]`.
+    let mut l_ok = NativeList::default();
+    l_ok.set_heaps(Some(&heap), None);
+    l_ok.set_compute_pipeline(&pso_srv_right);
+    l_ok.set_compute_root_table(0, &heap, 0);
+    l_ok.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l_ok]);
+    assert_eq!(t.host.typed_views(), 1);
+    assert_eq!(t.host.live_typed_views(), 1);
+    assert_eq!(f.get(0x2_1000, 5), [elem1[0], elem1[1], elem1[2], elem1[3], 8]);
+
+    f.put(0x2_1000, &[0xCAFE_BABEu32; 8]);
+    f.put(0x2_1800, &[0xDEAD_0001u32, 0xDEAD_0002, 0xDEAD_0003, 0xDEAD_0004]);
+    let mut uav_desc = [0u32; 16];
+    (uav_desc[0], uav_desc[1], uav_desc[4]) = (2, 1, 8); // RGBA32_FLOAT UAV, 8 elements
+    [uav_desc[10], uav_desc[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav_desc, start);
+    assert!(t.host.mirror(start).unwrap());
+    assert_eq!(
+        t.host.live_typed_views(),
+        0,
+        "re-mirroring slot 0 drops its previous texture_buffer view"
+    );
+
+    let mut l_uav = NativeList::default();
+    l_uav.set_heaps(Some(&heap), None);
+    l_uav.set_compute_pipeline(&pso_uav_wrong);
+    l_uav.set_compute_root_table(0, &heap, 0);
+    l_uav.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l_uav]);
+    assert_eq!(t.host.typed_views(), 1, "wrong-scan UAV did not promote slot 0");
+    assert_eq!(t.host.live_typed_views(), 0);
+    assert_eq!(
+        f.get(0x2_0010, 4),
+        elem1,
+        "null texture_buffer UAV store leaves title memory untouched"
+    );
+    assert_eq!(
+        f.get(0x2_1000, 5),
+        [0, 0, 0, 0, 0],
+        "overwritten UAV with forced-false scan reads [0, 0, 0, 0] and width 0"
     );
     drop(records);
 }

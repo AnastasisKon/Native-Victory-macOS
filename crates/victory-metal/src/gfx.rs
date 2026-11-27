@@ -49,6 +49,8 @@ pub struct Heap {
     /// retaining it here keeps its `gpuResourceID` live without duplicating the pool's pages in
     /// `alloc_counts` / `MTLResidencySet` / per-encoder `useResource`.
     refs: RefCell<std::collections::HashMap<usize, (Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>>,
+    /// Entries in `refs` that currently hold `Some(texture_buffer)`.
+    typed_views: Cell<usize>,
     /// The distinct allocations `refs` names, by raw `MTLResource` pointer, with how many entries
     /// name each: an allocation is added to `set` once and removed + committed before its last
     /// `refs` entry is dropped, and without a set each is named to an encoder once.
@@ -530,6 +532,7 @@ impl Metal {
                 .enumerate()
                 .for_each(|(i, w)| p.add(i).write_volatile(*w));
         }
+        let added_typed = matches!(keep, Some((_, Some(_))));
         let old = match keep {
             Some((r, tex_view)) => {
                 let ptr = (&*r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
@@ -547,6 +550,12 @@ impl Metal {
             }
             None => heap.refs.borrow_mut().remove(&index),
         };
+        let removed_typed = matches!(old, Some((_, Some(_))));
+        if added_typed != removed_typed {
+            let n = heap.typed_views.get();
+            heap.typed_views
+                .set(if added_typed { n + 1 } else { n - 1 });
+        }
         if let Some((old, old_tex_view)) = old {
             let old_ptr = (&*old as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
             let mut counts = heap.alloc_counts.borrow_mut();
@@ -803,6 +812,7 @@ impl ResourceBackend for Metal {
             kind,
             count,
             refs: RefCell::default(),
+            typed_views: Cell::new(0),
             alloc_counts: RefCell::default(),
             set,
             dirty: Cell::new(false),
@@ -837,12 +847,12 @@ impl ResourceBackend for Metal {
         size: u32,
         format: Format,
         writable: bool,
-    ) {
+    ) -> bool {
         debug_assert_eq!(heap.kind, HeapKind::Resource);
         let (bw, elem_bytes) = format.block();
         if bw != 1 || format.is_depth() || size == 0 {
             self.write_buffer(heap, index, buffer, title, size);
-            return;
+            return false;
         }
         let pf = pixel_format(format);
         let align = self
@@ -854,7 +864,7 @@ impl ResourceBackend for Metal {
         let width = ((size as usize) / elem_bytes).min(max_elems).min(1 << 26);
         if width == 0 {
             self.write_buffer(heap, index, buffer, title, size);
-            return;
+            return false;
         }
         if !offset.is_multiple_of(align) {
             static WARNED: std::sync::atomic::AtomicBool =
@@ -877,7 +887,7 @@ impl ResourceBackend for Metal {
                 );
             }
             self.write_buffer(heap, index, buffer, title, size);
-            return;
+            return false;
         }
         let td = MTLTextureDescriptor::new();
         td.setTextureType(MTLTextureType::TypeTextureBuffer);
@@ -897,7 +907,7 @@ impl ResourceBackend for Metal {
             .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, width * elem_bytes)
         else {
             self.write_buffer(heap, index, buffer, title, size);
-            return;
+            return false;
         };
         let gpu = self.gpu_address(buffer, title);
         let tex_id = resource_id(tex.gpuResourceID());
@@ -908,6 +918,7 @@ impl ResourceBackend for Metal {
             [gpu, tex_id, size as u64],
             Some((keep_buf, Some(tex))),
         );
+        true
     }
 
     fn write_texture(&self, heap: &Heap, index: usize, t: &Texture, min_lod: f32) {
@@ -927,6 +938,10 @@ impl ResourceBackend for Metal {
 
     fn clear_entry(&self, heap: &Heap, index: usize) {
         self.heap_entry(heap, index, [0; 3], None);
+    }
+
+    fn heap_typed_views(&self, heap: &Heap) -> usize {
+        heap.typed_views.get()
     }
 
     fn heap_allocations(&self, heap: &Heap, last_used: &[u32]) -> Option<Vec<HeapAllocation>> {
@@ -3378,13 +3393,16 @@ mod heap_set_tests {
                     .read_unaligned()
             }
         };
-        m.write_typed_buffer(&heap, 0, &buf, arena.primary, 1024, Format::Rgba32Uint, true);
+        assert!(m.write_typed_buffer(&heap, 0, &buf, arena.primary, 1024, Format::Rgba32Uint, true));
+        assert_eq!(m.heap_typed_views(&heap), 1);
         assert_ne!(entry_words(0)[1], 0, "aligned typed buffer writes textureViewID");
         // SAFETY: `1024` and `4` are inside the 64 KiB `arena` allocation.
         let second = unsafe { arena.primary.add(1024) };
         let unaligned = unsafe { arena.primary.add(4) };
-        m.write_typed_buffer(&heap, 1, &buf, second, 1024, Format::Rgba32Float, true);
-        m.write_typed_buffer(&heap, 2, &buf, unaligned, 1024, Format::Rgba32Float, true);
+        assert!(m.write_typed_buffer(&heap, 1, &buf, second, 1024, Format::Rgba32Float, true));
+        assert_eq!(m.heap_typed_views(&heap), 2);
+        assert!(!m.write_typed_buffer(&heap, 2, &buf, unaligned, 1024, Format::Rgba32Float, true));
+        assert_eq!(m.heap_typed_views(&heap), 2, "unaligned fallback holds no typed view");
         assert_ne!(entry_words(2)[0], 0, "unaligned fallback preserves gpuVA in word 0");
         assert_eq!(entry_words(2)[1], 0, "unaligned fallback leaves textureViewID null");
         assert_eq!(entry_words(2)[2], 1024);
@@ -3394,10 +3412,15 @@ mod heap_set_tests {
             heap_only + arena.len as u64,
             "buffer-backed texture views do not multiply the pool's residency-set size"
         );
+        m.write_buffer(&heap, 0, &buf, arena.primary, 1024);
+        assert_eq!(m.heap_typed_views(&heap), 1, "overwriting with write_buffer drops the typed view");
+        assert_eq!(entry_words(0)[1], 0, "write_buffer zeroes textureViewID");
         m.clear_entry(&heap, 0);
         m.clear_entry(&heap, 2);
         assert_eq!(held(), 2);
+        assert_eq!(m.heap_typed_views(&heap), 1);
         m.clear_entry(&heap, 1);
+        assert_eq!(m.heap_typed_views(&heap), 0, "clear_entry drops the last typed view");
         assert_eq!(held(), 1, "cleared typed buffer entries release the pool allocation");
     }
 

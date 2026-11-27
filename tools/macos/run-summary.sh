@@ -105,7 +105,6 @@ function tomsec(v,   n) {
   if (line ~ /^console  /) { console = line; sub(/^console +/, "", console) }
   if (line ~ /^# exit code /) exitcode = $4
   if (line ~ /^# stopped by --seconds/) timedout = 1
-  if (line ~ /SIGSEGV|Segmentation fault/) segv = 1
   if (line ~ /the world.s first frame/ && world == "" && match(line, /frame=[0-9]+/)) world = substr(line, RSTART + 6, RLENGTH - 6)
   if (line ~ /profile at [0-9.]+s:/) { np = 0; prof = line }
   else if (line ~ /[ ]profile .* calls [0-9]+ total/) { np++; pl[np] = line }
@@ -145,7 +144,7 @@ function metrics(   i, k, w, nw, v, r, u, kd, d, end) { # the --compare rows, on
   for (kd in gk) if (kd != "Timeout" && kd != "OutOfMemory") emit("gpu", kd, gk[kd])
   for (d in drop) emit("drop", d, drop[d])
   if (exc != "") { end = exc; sub(/.* at /, "", end); sub(/ .*/, "", end); end = "fault at " end }
-  else if (segv || exitcode == 139) end = "SIGSEGV"
+  else if (exitcode == 139) end = "SIGSEGV"
   else if (timedout) end = "time limit"
   else if (nend) end = "watchdog/kill line"
   else if (exitcode != "") end = "exit code " exitcode

@@ -460,6 +460,17 @@ Findings:
   title memory after the texture exists is seen by the next dispatch. Mips, arrays, 3D, BC and the
   console's tiled layouts are not linear, so those still need the compute detile into an `MTLTexture`.
 
+**Dropping the top mip for memory (`VICTORY_TEXTURE_DROP_TOP_MIP=1`, off by default).** For hosts whose
+unified memory cannot hold the title's full texture set (an iPad keeps about 9 GiB before it swaps), a
+sampled-only 2D or array texture whose larger side is at least 1024 texels and that has a level below
+its top is made without that top level (half the width and height, one level fewer: about 75% of the
+texture's memory saved). `detile` (with `skip`) turns title level `m` into host level `m - 1` and never
+detiles level 0; `host_mip_range` maps a view's title levels onto the host's. Render targets, UAV and
+3D textures are never touched. Shortcut, not console behaviour: implicit-LOD sampling simply uses the
+next level (a little blurrier up close), explicit-LOD samples come out one level blurrier, and integer
+texel loads and `GetDimensions` see the smaller texture. Code: `native/textures.rs`; tests
+`drop_top_mip_tests` and `a_texture_made_without_its_top_level_gets_the_lower_levels`.
+
 ### Render passes
 
 `RenderPipelineDesc` (VS and optional PS DXIL, input elements and streams, target and depth formats,

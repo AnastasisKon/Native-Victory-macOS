@@ -1211,6 +1211,20 @@ logged programs use this pattern is unknown.
 Both `v_permlane16_b32` and `v_permlanex16_b32` also use those tracked SGPR constants as lane
 selectors. A selector with a runtime value still produces the computed-lane-select refusal.
 
+An EXEC write inside a section is followed when it is a constant lane set. Those were `s_mov`s of
+a constant only; `s_bfm_b32` and `s_bfm_b64` of two constant counts are one too
+(`((1 << S0) - 1) << S1`, `wave::exec_constant`). The title's wave32 prefix sums finish the upper
+row of sixteen lanes under `s_bfm_b32 exec_lo, 16, 16` before adding lane 15 through
+`v_permlanex16_b32`; the section stopped at the `s_bfm` ("s_bfm_b32 is not supported", the
+opcode a step that is no register operation is named by). An `s_bfm` with a count in an SGPR is
+still refused there. Over a 12,020-shader corpus (Series S boot to the menus, 27 November),
+9 compute shaders now translate, 1 is refused for another reason ("a lane-mask join of an
+untracked mask: data, at a join of several edges"), and no other output changes. Tests:
+`emit::wave::tests::s_bfm_gives_exec_its_field_of_constant_counts`,
+`emit::lower::tests::a_wave32_prefix_sum_may_set_its_upper_row_with_s_bfm`, and
+`split_wave_tests::a_wave32_prefix_sum_whose_upper_row_s_bfm_selects_runs` (`victory-gpu`; on
+Metal, with all 32 lanes and with lanes 20 and up off before the section).
+
 The simulator keeps the original source lane of a VGPR value through a shuffle. A constant
 `v_readlane_b32` of that value reads the original lane with `WaveReadLaneAt`, or through the
 group-shared exchange when a console wave spans two host waves. Uniform values and whole-wave

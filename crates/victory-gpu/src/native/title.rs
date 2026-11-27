@@ -185,7 +185,7 @@ pub struct Guessed<B: GraphicsBackend> {
 /// An operation that must keep its place between list submissions in the held FIFO.
 enum QueuedAction<B: PresentBackend> {
     Signal(Rc<B::Queue>, Rc<B::Fence>, u64),
-    Present(Rc<B::Queue>, Rc<B::Surface>, Rc<B::Texture>),
+    Present(Rc<B::Queue>, Rc<B::Surface>, Vec<Rc<B::Texture>>),
 }
 
 pub struct Title<B: PresentBackend> {
@@ -448,8 +448,9 @@ impl<B: PresentBackend> Title<B> {
                         tracing::warn!(error = %e, "a held fence signal was not queued");
                     }
                 }
-                Some(QueuedAction::Present(queue, surface, texture)) => {
-                    match host.backend.try_present(queue, surface, texture) {
+                Some(QueuedAction::Present(queue, surface, planes)) => {
+                    let planes: Vec<&B::Texture> = planes.iter().map(|t| &**t).collect();
+                    match host.backend.try_present(queue, surface, &planes) {
                         Ok(false) => return false,
                         Ok(true) => {}
                         Err(e) => tracing::warn!(error = %e, "a held present was not queued"),
@@ -523,17 +524,19 @@ impl<B: PresentBackend> Title<B> {
         Ok(())
     }
 
-    /// `PresentX`: show title texture `key` after all earlier work on `queue`, including held
-    /// work. `Ok(true)` means accepted (possibly deferred); deferred errors are logged by pump.
-    /// `Ok(false)` when there is no surface or the title has no such texture.
-    pub fn present(&mut self, queue: usize, key: usize) -> Result<bool, String> {
+    /// `PresentX`: show title textures `keys` after all earlier work on `queue`, including held
+    /// work: the first under the others, each later one blended over by its alpha.
+    /// `Ok(true)` means accepted (possibly deferred); deferred errors are logged by pump.
+    /// `Ok(false)` when there is no surface or the title has none of these textures.
+    pub fn present(&mut self, queue: usize, keys: &[usize]) -> Result<bool, String> {
         self.pump();
         if self.surface.is_none() {
             return Ok(false);
         }
-        let Some(tex) = self.texture_of(key) else {
+        let tex: Vec<_> = keys.iter().filter_map(|&k| self.texture_of(k)).collect();
+        if tex.is_empty() {
             return Ok(false);
-        };
+        }
         let q = self.queue(queue)?;
         if let Some(surface) = &self.surface {
             let n = self.next_action;

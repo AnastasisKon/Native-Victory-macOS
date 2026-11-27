@@ -758,16 +758,17 @@ pub trait PresentBackend: GraphicsBackend {
     fn create_surface(&self, layer: *mut std::ffi::c_void) -> Result<Self::Surface, String>;
     /// Attempts presentation without blocking drawable acquisition. False keeps the FIFO head
     /// pending; callers must retry before submitting later work on this queue.
-    fn try_present(&self, queue: &Self::Queue, surface: &Self::Surface, source: &Self::Texture) -> Result<bool, String> {
-        self.present(queue, surface, source).map(|()| true)
+    fn try_present(&self, queue: &Self::Queue, surface: &Self::Surface, sources: &[&Self::Texture]) -> Result<bool, String> {
+        self.present(queue, surface, sources).map(|()| true)
     }
 
-    /// Draws `source` over the surface's next drawable (scaled to it, whatever the formats) and
-    /// presents it after the work already submitted to `queue`. Never waits for the GPU.
+    /// Draws `sources` over the surface's next drawable (each scaled to it, whatever the formats)
+    /// and presents it after the work already submitted to `queue`: the first as it is, each
+    /// later one blended over by its alpha (straight). Never waits for the GPU.
     fn present(
         &self,
         queue: &Self::Queue,
         surface: &Self::Surface,
-        source: &Self::Texture,
+        sources: &[&Self::Texture],
     ) -> Result<(), String>;
 }

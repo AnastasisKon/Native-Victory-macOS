@@ -635,12 +635,16 @@ fn trace_present_draw(t: &MetalTitle, l: &MetalList) {
     t.host.trace_args(root, binding);
 }
 
-/// `PresentX` on title queue `queue`: title texture `resource` over the layer.
-pub(crate) fn present(queue: This, resource: This) {
+/// `PresentX` on title queue `queue`: title textures `planes` over the layer, the first under the
+/// others (`Title::present`). The traces name the first.
+pub(crate) fn present(queue: This, planes: &[This]) {
+    let Some(&resource) = planes.first() else { return };
     if present_every().is_some() {
         let mut shown = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
-        if !shown.contains(&(resource as usize)) {
-            shown.push(resource as usize);
+        for &p in planes {
+            if !shown.contains(&(p as usize)) {
+                shown.push(p as usize);
+            }
         }
     }
     // Diagnostic: VICTORY_PRESENT_DELAY_MS slows every present, to tell a trigger that follows
@@ -661,7 +665,8 @@ pub(crate) fn present(queue: This, resource: This) {
     pass_present(resource);
     let shown = with_title(|t| {
         let _ = t.ensure_queue(queue as usize);
-        t.present(queue as usize, resource as usize)
+        let keys: Vec<usize> = planes.iter().map(|&p| p as usize).collect();
+        t.present(queue as usize, &keys)
     });
     match shown {
         Some(Err(e)) => tracing::warn!(error = %e, "a frame was not presented"),

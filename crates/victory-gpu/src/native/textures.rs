@@ -1687,7 +1687,8 @@ impl Job {
         let blank = changed && addressable && is_all_zero(tiled);
         let levels = changed.then(|| {
             if blank && self.uploaded_mips == 0 {
-                // Fresh host textures start zeroed (`MTLStorageMode::Shared`), so a never-uploaded
+                // Guess: fresh host textures start zeroed (`MTLStorageMode::Shared`; Metal does not
+                // document it, see docs/native-host.md), so a never-uploaded
                 // all-zero texture needs neither staging allocation, CPU detile, nor `replaceRegion`.
                 (Vec::new(), 0, Ok(()))
             } else {

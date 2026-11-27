@@ -1974,8 +1974,8 @@ world streaming maps physical pages for coarse mips while fine mips stay unmappe
   unmapped fine-mip gaps without `mach_vm_region` traps (`read_texture_chunk` also coalesces
   adjacent readable VM regions for non-pool ranges).
 * `detile_changed` (`Tracked::uploaded_mips`) skips staging allocations, CPU detiling, and
-  `replaceRegion` uploads for never-uploaded blank textures and all-zero non-tail mips (fresh
-  `MTLStorageMode::Shared` textures start zeroed), and sampled textures enter `WATCH` once their
+  `replaceRegion` uploads for never-uploaded blank textures and all-zero non-tail mips (guess:
+  fresh `MTLStorageMode::Shared` textures start zeroed; Metal does not document it), and sampled textures enter `WATCH` once their
   first submission read populates `seen` rather than being hashed twice at realization.
 
 Tests (`victory-gpu`): `native::memory::tests::read_mapped_with_coalesces_adjacent_pages_across_pools_and_zeroes_gaps`,

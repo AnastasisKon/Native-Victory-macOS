@@ -18,6 +18,12 @@
 //! fallback approximation of reverb coloration, not the title's actual
 //! effect, and without the variable set the output is silence as before.
 //! Other block transforms stay silent either way: their shape is unknown.
+//!
+//! With `VICTORY_DUMP_DSP=<dir>` set at activation, each stream's own
+//! impulse response is captured to `<dir>/stream<n>_ir.f32` and every
+//! command's gains, input block and output block are appended to
+//! `<dir>/stream<n>_blocks.f32` / `_out.f32`, so the guessed convolution can
+//! be checked against what the title actually sends and hears.
 // shortcut: convolution streams get one fixed synthetic decay instead of the
 // title's impulse response, behind VICTORY_GUESS_DSP=1 since it is unverified
 // against a real run; other transform kinds stay silent regardless. Upgrade
@@ -26,7 +32,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -34,6 +42,11 @@ use crate::{HleModule, hle_export};
 
 const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
+
+/// Cap on how many floats a `VICTORY_DUMP_DSP` capture of `StreamDesc::ir`
+/// reads, so a bogus `ir_floats` cannot make the diagnostic allocate
+/// gigabytes; a larger count is logged as truncated.
+const DUMP_IR_MAX: usize = 0x100_0000;
 
 const CONVOLUTION: u32 = 1;
 /// Option bits that need a stereo stream, and one convolution refuses.
@@ -77,7 +90,73 @@ pub struct Stream {
     /// Reused across `XDspSubmitCommand` calls to merge `history` and the
     /// title's input without allocating on the audio path each block.
     scratch: Vec<f32>,
+    /// Capture directory and stream number when `VICTORY_DUMP_DSP` is set.
+    dump: Option<(PathBuf, u32)>,
     status: Box<Status>,
+}
+
+/// Streams activated so far under `VICTORY_DUMP_DSP`, numbering capture
+/// files.
+static DUMP_ID: AtomicU32 = AtomicU32::new(0);
+
+fn dump_dir() -> Option<PathBuf> {
+    std::env::var_os("VICTORY_DUMP_DSP").map(PathBuf::from)
+}
+
+fn append_f32(path: &std::path::Path, floats: &[f32]) {
+    use std::io::Write as _;
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        tracing::warn!(?path, "audio DSP dump write failed");
+        return;
+    };
+    let mut bytes = Vec::with_capacity(floats.len() * 4);
+    bytes.extend(floats.iter().flat_map(|s| s.to_le_bytes()));
+    let _ = file.write_all(&bytes);
+}
+
+/// Writes a convolution stream's own impulse response — the title's bytes,
+/// not the synthetic tail — to `<dir>/stream<n>_ir.f32`, to help settle
+/// the hardware's partitioned IR layout (see `trace_ir`). Off by default;
+/// reads are bounded by `ir_floats` and `DUMP_IR_MAX`.
+fn dump_ir(dir: &std::path::Path, n: u32, desc: &StreamDesc) {
+    let (kind, ir_floats) = (desc.kind, desc.ir_floats as usize);
+    if kind != CONVOLUTION || desc.ir.is_null() {
+        tracing::info!(n, kind, "audio DSP stream has no IR to dump");
+        return;
+    }
+    let len = ir_floats.min(DUMP_IR_MAX);
+    if len < ir_floats {
+        tracing::warn!(ir_floats, dumped = len, "IR dump truncated");
+    }
+    // SAFETY: `len` is bounded by the title's own `ir_floats` count.
+    let ir = unsafe { std::slice::from_raw_parts(desc.ir, len) };
+    append_f32(&dir.join(format!("stream{n}_ir.f32")), ir);
+    tracing::info!(
+        n,
+        ir_floats,
+        "dumped audio DSP stream's own impulse response"
+    );
+}
+
+/// Appends one command's gains and input block to
+/// `<dir>/stream<n>_blocks.f32`, so a capture shows what the title fed the
+/// DSP in block order.
+fn dump_block(dir: &std::path::Path, n: u32, gains: [f32; 2], input: &[f32]) {
+    let mut block = Vec::with_capacity(2 + input.len());
+    block.extend_from_slice(&gains);
+    block.extend_from_slice(input);
+    append_f32(&dir.join(format!("stream{n}_blocks.f32")), &block);
+}
+
+/// Appends one command's output block to `<dir>/stream<n>_out.f32`, after
+/// the stream has filled it, so a capture shows either the silence or the
+/// `VICTORY_GUESS_DSP` result the title actually heard.
+fn dump_output(dir: &std::path::Path, n: u32, output: &[f32]) {
+    append_f32(&dir.join(format!("stream{n}_out.f32")), output);
 }
 
 /// Taps of the synthetic reverb tail: a fixed decaying-noise burst,
@@ -251,6 +330,17 @@ pub extern "system" fn XDspActivate(
         "audio DSP stream activated"
     );
     trace_ir(desc);
+    let dump = dump_dir().map(|dir| {
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let n = DUMP_ID.fetch_add(1, Ordering::Relaxed);
+            dump_ir(&dir, n, desc);
+            Some((dir, n))
+        } else {
+            tracing::warn!(?dir, "audio DSP dump directory unusable");
+            None
+        }
+    });
+    let dump = dump.flatten();
     {
         // SAFETY: a connection from `XDspConnectWithMaximumStreamLimit`.
         let dsp = unsafe { &*dsp };
@@ -274,6 +364,7 @@ pub extern "system" fn XDspActivate(
         ir,
         history,
         scratch: Vec::new(),
+        dump,
         status: Box::new(Status {
             submitted: 0,
             completed: 0,
@@ -314,8 +405,17 @@ pub extern "system" fn XDspSubmitCommand(
     }
     // SAFETY: a stream from `XDspActivate`, the title's command.
     let (stream, command) = unsafe { (&mut *stream, &*command) };
+    let samples = (stream.frames * stream.channels) as usize;
+    if let Some((dir, n)) = &stream.dump {
+        let input = if command.input.is_null() {
+            &[][..]
+        } else {
+            // SAFETY: the title's input buffer holds one block of the stream.
+            unsafe { std::slice::from_raw_parts(command.input, samples) }
+        };
+        dump_block(dir, *n, command.gains, input);
+    }
     if !command.output.is_null() {
-        let samples = (stream.frames * stream.channels) as usize;
         if guess_dsp() && stream.kind == CONVOLUTION && !command.input.is_null() {
             let hist_frames = stream.history.len() / stream.channels as usize;
             stream.scratch.clear();
@@ -345,6 +445,11 @@ pub extern "system" fn XDspSubmitCommand(
             // SAFETY: the title's output buffer holds one block of the stream.
             unsafe { std::ptr::write_bytes(command.output, 0, samples) };
         }
+    }
+    if let (Some((dir, n)), false) = (&stream.dump, command.output.is_null()) {
+        // SAFETY: the title's output buffer, just filled above.
+        let out = unsafe { std::slice::from_raw_parts(command.output, samples) };
+        dump_output(dir, *n, out);
     }
     let status = &mut *stream.status;
     let next = status.submitted.wrapping_add(1);
@@ -511,6 +616,74 @@ mod tests {
 
         let streamed: Vec<f32> = out1.iter().chain(out2.iter()).copied().collect();
         assert_eq!(streamed, reference);
+    }
+
+    #[test]
+    fn dump_captures_the_titles_ir_blocks_and_output() {
+        let dir = std::env::temp_dir().join(format!("victory-dsp-dump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The dump captures whatever the stream actually wrote, so this
+        // test does not touch VICTORY_GUESS_DSP, which the other test
+        // toggles.
+        // SAFETY: no other test reads VICTORY_DUMP_DSP.
+        unsafe { std::env::set_var("VICTORY_DUMP_DSP", &dir) };
+        let mut base = vec![0u8; 0x10_0000];
+        let mut dsp = std::ptr::null_mut();
+        assert_eq!(
+            XDspConnectWithMaximumStreamLimit(
+                base.as_mut_ptr().cast(),
+                0x10_0000,
+                24,
+                0x80,
+                1,
+                &mut dsp
+            ),
+            S_OK
+        );
+        // A recognisable pattern, to prove the dump holds the title's own
+        // IR bytes and not the synthetic tail.
+        let ir: Vec<f32> = (0..0x800).map(|i| i as f32 * 0.25).collect();
+        let desc = StreamDesc {
+            kind: CONVOLUTION,
+            options: 2,
+            frames: 0x400,
+            channels: 2,
+            ir_floats: 0x800,
+            ir: ir.as_ptr(),
+        };
+        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+        let mut output = vec![0f32; 0x800];
+        let input = vec![0.5f32; 0x800];
+        let command = Command {
+            gains: [1.0, 0.5],
+            input: input.as_ptr(),
+            output: output.as_mut_ptr(),
+            reserved: 0,
+        };
+        let mut ticket = 0;
+        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+
+        let read_f32 = |name: &str| -> Vec<f32> {
+            let bytes = std::fs::read(dir.join(name)).unwrap();
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        assert_eq!(read_f32("stream0_ir.f32"), ir);
+        let blocks = read_f32("stream0_blocks.f32");
+        assert_eq!(&blocks[..2], &[1.0, 0.5]);
+        assert_eq!(&blocks[2..], &input[..]);
+        assert_eq!(read_f32("stream0_out.f32"), output);
+
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+        // SAFETY: set at the top of this test; nothing else reads it.
+        unsafe { std::env::remove_var("VICTORY_DUMP_DSP") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

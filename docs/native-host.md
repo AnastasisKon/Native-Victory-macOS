@@ -1292,6 +1292,14 @@ activation (`trace_ir`). It exists to let a future run with the real game settle
 data is actually in (time-domain samples, in which case `ir_floats` for a given `ir_seconds` would
 land near `ir_seconds * 48000`, or something else) and replace this guess with the real thing.
 
+`VICTORY_DUMP_DSP=<dir>` goes further: at activation it writes a convolution stream's whole own
+`StreamDesc::ir` to `<dir>/stream<n>_ir.f32` (the title's bytes, not the synthetic tail; capped at
+16 Mi floats, logged as truncated if longer), and each `XDspSubmitCommand` appends the command's
+gains and input block to `<dir>/stream<n>_blocks.f32` and the block the stream wrote — silence, or
+the `VICTORY_GUESS_DSP` result — to `<dir>/stream<n>_out.f32`. A run with both set captures what
+the title sends and hears, to validate the guess against the real effect once the hardware's
+partitioned IR layout is known.
+
 Tests (`modules::dsp::tests`): `convolve_merged_is_a_causal_fir_per_channel_scaled_by_gain` and
 `convolve_merged_reads_history_as_the_frames_before_the_block` (the convolution math against
 hand-computed values), `a_block_split_matches_one_convolution_over_the_whole_signal` (splitting one
@@ -1299,7 +1307,8 @@ signal into two blocks and carrying history gives the same result as convolving 
 property that stops the tail from clicking at block boundaries), and
 `convolution_stream_as_the_title_drives_it` (the exported `XDspSubmitCommand` path, with
 `VICTORY_GUESS_DSP` set, no longer returns digital silence for a convolution stream with real
-input).
+input), and `dump_captures_the_titles_ir_blocks_and_output` (`VICTORY_DUMP_DSP` writes the title's
+own IR, and every command's gains, input and output blocks, in order).
 
 ## Depth-stencil textures are not watched or uploaded from CPU memory
 

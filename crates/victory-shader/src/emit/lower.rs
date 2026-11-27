@@ -556,6 +556,15 @@ type UniformBit = (Bool, bool, Vec<(Atom, bool)>);
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// `VICTORY_DEBUG_PS=id`: the colour every float export of a pixel program writes, the low three
+/// bytes (red first) of the 32-bit FNV-1a hash of its console code (a container's `ACCC` code
+/// piece, as the `disasm` example takes it), so a target dump tells which program drew a pixel.
+pub(crate) fn debug_id_colour(code: &[u8]) -> [u8; 3] {
+    let h = code.iter().fold(0x811c_9dc5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    let [r, g, b, _] = h.to_le_bytes();
+    [r, g, b]
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -13833,6 +13842,12 @@ impl<'a> Lower<'a> {
                     }
                 }
                 (true, Some("white")) => self.s.m.f32(1.0f32.to_bits()),
+                // Debug: which pixel program drew a pixel (`debug_id_colour`).
+                (true, Some("id")) => {
+                    let rgb = debug_id_colour(&self.x.native.code);
+                    let v = rgb.get(usize::from(col)).map_or(1.0, |&b| f32::from(b) / 255.0);
+                    self.s.m.f32(v.to_bits())
+                }
                 (true, Some("alpha")) if col == 3 => self.s.m.f32(1.0f32.to_bits()),
                 (true, _) if std::env::var_os("VICTORY_DEBUG_PS_RED").is_some() => {
                     self.s.m.f32(if col == 0 || col == 3 { 1.0f32.to_bits() } else { 0 })
@@ -15256,6 +15271,12 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn the_debug_id_colour_is_the_low_bytes_of_fnv1a() {
+        // FNV-1a 32 of "a" is 0xe40c292c (the published test vector).
+        assert_eq!(super::debug_id_colour(b"a"), [0x2c, 0x29, 0x0c]);
+    }
 
     fn interp_copy_chain(moves: usize, arithmetic: bool) -> (bool, usize) {
         let mut words = Vec::new();

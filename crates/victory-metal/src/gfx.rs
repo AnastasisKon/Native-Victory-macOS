@@ -2221,10 +2221,12 @@ fn cap_label_str(mut s: String) -> String {
 
 impl Metal {
     /// The capped label for an encoder, kept for the command buffer's description.
+    /// The command buffer's description keeps the whole label when `VICTORY_TRACE_COMMITS` logs it
+    /// (a capped one hid the end of a 17-dispatch pass, #79).
     fn cap_label(&self, s: String) -> Retained<objc2_foundation::NSString> {
-        let s = cap_label_str(s);
-        let n = objc2_foundation::NSString::from_str(&s);
-        self.trace_enc.borrow_mut().push(s);
+        let capped = cap_label_str(s.clone());
+        let n = objc2_foundation::NSString::from_str(&capped);
+        self.trace_enc.borrow_mut().push(if commits_traced() { s } else { capped });
         n
     }
 

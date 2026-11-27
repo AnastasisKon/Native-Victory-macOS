@@ -575,6 +575,16 @@ mod tests {
             ([0xF088_0F10, 0x4082_0A02], "image_sample_d", 8),
             // image_sample_d v[10:13], v[2:7], ... dim:CUBE a16
             ([0xF088_0F18, 0x4082_0A02], "image_sample_d", 6),
+            // image_sample_d v[10:13], v[2:4], ... dim:1D_ARRAY a16: dx/dh, dx/dv, then x and
+            // the slice as one f16 pair
+            ([0xF088_0F20, 0x4082_0A02], "image_sample_d", 3),
+            // image_sample_d v[10:13], v[2:5], ... dim:1D_ARRAY
+            ([0xF088_0F20, 0x0082_0A02], "image_sample_d", 4),
+            // image_sample_d v[10:13], v[2:7], ... dim:2D_ARRAY a16: four gradients, then x, y
+            // and the slice in two VGPRs
+            ([0xF088_0F28, 0x4082_0A02], "image_sample_d", 6),
+            // image_sample_d v[10:13], v[2:8], ... dim:2D_ARRAY
+            ([0xF088_0F28, 0x0082_0A02], "image_sample_d", 7),
             // image_sample_d_o v[10:13], v[1:6], ... dim:2D a16
             ([0xF0C8_0F08, 0x4082_0A01], "image_sample_d_o", 6),
             // image_sample_d_g16 v[10:13], v[2:4], ... dim:2D a16

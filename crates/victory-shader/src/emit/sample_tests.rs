@@ -251,6 +251,16 @@ fn gradients_stay_32_bit_with_16_bit_coordinates() {
     let (name, args) = call(CS, [0xF088_0F00, 0x4082_0A02]);
     assert_eq!(name, "dx.op.sampleGrad.f32");
     assert_eq!(args[7..13], [TWO, U, U, QUARTER, U, U]);
+
+    // Arrays: `dim` 4 (1D array) is `kind` 6 with two coordinates and `dim` 5 (2D array) `kind`
+    // 7 with three; the slice is no spatial coordinate, so there are 2 and 4 gradients, as
+    // `image_addr_dwords` sizes them (one and two a direction): v[2:4] and v[2:7] with a16.
+    let (name, args) = call(CS, [0xF088_0F20, 0x4082_0A02]);
+    assert_eq!(name, "dx.op.sampleGrad.f32");
+    assert_eq!(args[7..13], [TWO, U, U, QUARTER, U, U]);
+    let (name, args) = call(CS, [0xF088_0F28, 0x4082_0A02]);
+    assert_eq!(name, "dx.op.sampleGrad.f32");
+    assert_eq!(args[7..13], [TWO, QUARTER, U, THREE_QUARTERS, HALF, U]);
 }
 
 #[test]

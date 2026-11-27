@@ -669,7 +669,8 @@ fn a_pixel_program_reads_a_zero_line_stipple_coordinate_on_a_triangle() {
 
 /// A pixel program that packs its colour as the title's do. It interpolates param0 with the
 /// barycentric inputs v0 and v1. Then `v_fma_mixlo_f16` writes the low half of v1 and keeps the
-/// high half, which still holds the barycentric, and `v_fma_mixhi_f16` replaces that high half.
+/// high half, which still holds the barycentric, and `v_fma_mixhi_f16` replaces that high half
+/// (the test also runs the two in the other order).
 /// `exp ... compr` writes the pairs. The barycentric is never read for the colour, so the program
 /// translates (it was refused as "barycentrics read directly") and draws (1.0, 0.5, 1.0, 1.0).
 const PACKED_BY_MIX: &[u32] = &[
@@ -688,14 +689,23 @@ fn a_half_kept_by_mixlo_and_replaced_by_mixhi_draws_without_the_barycentric() {
     let mut words = TRIANGLE.to_vec();
     let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
     words.splice(at..at, [0xF800_0201, 0x0000_0006]); // exp param0 v6 (1.0)
-    let (ms, ps) = (translate(HwStage::Vs, &words), translate(HwStage::Ps, PACKED_BY_MIX));
+    // Also in the other order: `mixhi` first keeps the low half, `mixlo` replaces it.
+    let mut swapped = PACKED_BY_MIX.to_vec();
+    let at = swapped.iter().position(|&w| w == 0xCC21_0001).unwrap();
+    let (lo, hi) = (swapped[at..at + 2].to_vec(), swapped[at + 2..at + 4].to_vec());
+    swapped.splice(at..at + 4, hi.into_iter().chain(lo));
+    let ms = translate(HwStage::Vs, &words);
     let Some(mut t) = title() else { return };
-    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
-    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mix") else {
-        panic!("{:?}", t.shaders);
-    };
-    let (color, mut list) = list_into(&t, &pso, binding);
-    list.dispatch_mesh(1, 1, 1).unwrap();
-    super::run(&t.host, &[&list]);
-    assert!(pixels(&t, &color).iter().all(|p| *p == [255, 128, 255, 255]), "{:?}", pixels(&t, &color));
+    for (order, ps_words) in [("mixlo, mixhi", PACKED_BY_MIX), ("mixhi, mixlo", &swapped[..])] {
+        let ps = translate(HwStage::Ps, ps_words);
+        let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+        let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mix") else {
+            panic!("{order}: {:?}", t.shaders);
+        };
+        let (color, mut list) = list_into(&t, &pso, binding);
+        list.dispatch_mesh(1, 1, 1).unwrap();
+        super::run(&t.host, &[&list]);
+        let got = pixels(&t, &color);
+        assert!(got.iter().all(|p| *p == [255, 128, 255, 255]), "{order}: {got:?}");
+    }
 }

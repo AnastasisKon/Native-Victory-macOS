@@ -18,7 +18,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
@@ -42,6 +42,8 @@ const FACTORY: Guid = Guid::new(
 );
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
+/// A request whose run panicked (a bug of ours; logged). No other failure uses it.
+const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)`: the source ends early.
 const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_DATA)`: a bad compressed stream.
@@ -434,7 +436,35 @@ fn log_pending(this: Array, index: u32, polls: u64) {
             )
         })
         .collect();
-    tracing::warn!(array = ?this, index, polls, staged = lanes.staged, ?state, "dstorage: a status entry is still pending");
+    let running = running_reads(&lanes);
+    tracing::warn!(array = ?this, index, polls, staged = lanes.staged, ?state, ?running, "dstorage: a status entry is still pending");
+}
+
+/// The reads running longest (at most 8), oldest first: for how long, on which worker, and what
+/// they read. One that has run for seconds is stuck in its worker (a read that does not return).
+fn running_reads(lanes: &Lanes) -> Vec<String> {
+    let mut running: Vec<_> = lanes
+        .lanes
+        .iter()
+        .flat_map(|(id, l)| l.running.iter().map(move |(seq, r)| (id, seq, r)))
+        .collect();
+    running.sort_by_key(|(_, _, r)| r.started);
+    running
+        .iter()
+        .take(8)
+        .map(|(id, seq, r)| {
+            format!(
+                "lane {id} seq {seq}: {:.1} s on {} {} at {:#x} options {:#x} source {} destination {}",
+                r.started.elapsed().as_secs_f64(),
+                r.thread.name().unwrap_or("?"),
+                source_name(&r.request),
+                r.request.offset,
+                r.request.options,
+                r.request.source_size,
+                r.request.destination_size
+            )
+        })
+        .collect()
 }
 
 static STATUS_VTABLE: Methods<5> = Methods([
@@ -517,9 +547,16 @@ struct Lane {
     /// not written, reads running, and failures not yet reported.
     reads: VecDeque<(u64, Request)>,
     statuses: VecDeque<(u64, Status)>,
-    running: BTreeSet<u64>,
+    running: BTreeMap<u64, Running>,
     failures: BTreeMap<u64, HRESULT>,
     closed: bool,
+}
+
+/// A read a worker runs, for the pending warning: since when, on which thread.
+struct Running {
+    started: std::time::Instant,
+    thread: std::thread::Thread,
+    request: Request,
 }
 
 // SAFETY: requests point into title memory and our own objects, which stay
@@ -621,7 +658,11 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        // A panic killed the worker and left its read running for good, so the status entries
+        // behind it never completed (#446). The request is plain data, and what a failed one
+        // leaves in its destination is undefined anyway.
+        let result = std::panic::catch_unwind(|| execute(&job.request))
+            .unwrap_or_else(|panic| Err(panicked(&job.request, panic.as_ref())));
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -690,7 +731,16 @@ impl Lanes {
             return None;
         }
         lane.reads.pop_front();
-        lane.running.insert(seq);
+        let started = std::time::Instant::now();
+        let thread = std::thread::current();
+        lane.running.insert(
+            seq,
+            Running {
+                started,
+                thread,
+                request,
+            },
+        );
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
         self.now = self.clock[class];
@@ -785,7 +835,7 @@ impl Lane {
             held: Vec::new(),
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
-            running: BTreeSet::new(),
+            running: BTreeMap::new(),
             failures: BTreeMap::new(),
             closed: false,
         }
@@ -806,7 +856,7 @@ impl Lane {
             let waiting = self.reads.front().map(|r| r.0);
             if waiting
                 .into_iter()
-                .chain(self.running.first().copied())
+                .chain(self.running.keys().next().copied())
                 .any(|s| s < seq)
             {
                 return;
@@ -1023,22 +1073,45 @@ extern "system" fn close(this: QueueRef) {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
+/// Logs a failed request and returns `hr`.
+fn failed(request: &Request, hr: HRESULT, why: &str) -> HRESULT {
+    tracing::warn!(
+        options = format_args!("{:#x}", request.options),
+        offset = request.offset,
+        source_size = request.source_size,
+        destination_size = request.destination_size,
+        intermediate_size = request.intermediate_size,
+        tag = request.tag,
+        name = text(request.name),
+        file = source_name(request),
+        hr = format_args!("{:#010x}", hr as u32),
+        "dstorage: request failed: {why}"
+    );
+    hr
+}
+
+/// A request whose run panicked fails with `E_FAIL`, so its status entry completes and the worker
+/// goes on. The panic hook has already printed where.
+fn panicked(request: &Request, panic: &(dyn std::any::Any + Send)) -> HRESULT {
+    let why = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("?");
+    failed(request, E_FAIL, &format!("panicked: {why}"))
+}
+
+/// Tests make a request panic with this tag (Grand Theft Auto VI leaves tags 0).
+#[cfg(test)]
+const PANIC_TAG: u64 = u64::MAX;
+
 fn execute(request: &Request) -> Result<(), HRESULT> {
+    #[cfg(test)]
+    if request.tag == PANIC_TAG {
+        panic!("dstorage: a test request panics");
+    }
     let options = request.options;
-    let fail = |hr: HRESULT, why: &str| {
-        tracing::warn!(
-            options = format_args!("{options:#x}"),
-            offset = request.offset,
-            source_size = request.source_size,
-            destination_size = request.destination_size,
-            intermediate_size = request.intermediate_size,
-            tag = request.tag,
-            name = text(request.name),
-            hr = format_args!("{:#010x}", hr as u32),
-            "dstorage: request failed: {why}"
-        );
-        hr
-    };
+    let fail = |hr: HRESULT, why: &str| failed(request, hr, why);
     if options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) != 0 {
         return Err(fail(E_NOTIMPL, "unsupported options"));
     }
@@ -1740,6 +1813,107 @@ mod tests {
         assert_eq!(results(), (E_PENDING, E_PENDING));
         l.finish(&jobs[1], Err(INVALID_DATA));
         assert_eq!(results(), (INVALID_DATA, S_OK));
+    }
+
+    /// A request that panics fails its status entry, and the queue's later reads and statuses go
+    /// on (#446). Before, the panic killed its worker and the entry stayed pending for good.
+    #[test]
+    fn a_panicking_request_fails_its_status_and_the_queue_goes_on() {
+        let contents = pattern(64);
+        let (_dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(2));
+        let mut buffers = [[0u8; 16]; 2];
+        let [panics, out] = buffers.each_mut().map(|b| b.as_mut_ptr().cast());
+        let mut bad = request(ZLIB, panics, 16, file, 0, 16);
+        bad.tag = PANIC_TAG;
+        enqueue(queue, &bad);
+        enqueue_status(queue, array, 0);
+        enqueue(queue, &request(0, out, 16, file, 8, 16));
+        enqueue_status(queue, array, 1);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), E_FAIL);
+        assert_eq!(wait(array, 1), S_OK);
+        assert_eq!(buffers[1], contents[8..24]);
+    }
+
+    /// With one worker: the read after one that panicked runs on the same worker, and the panicked
+    /// read's staging is given back.
+    #[test]
+    fn a_worker_survives_a_panic() {
+        let contents = pattern(64);
+        let (_dir, file) = file_with(&contents);
+        let s: &'static Scheduler = Box::leak(Box::new(Scheduler {
+            lanes: Mutex::new(lanes(STAGING)),
+            work: Condvar::new(),
+            finished: Condvar::new(),
+        }));
+        s.lock().lanes.insert(0, Lane::new(0, 64));
+        std::thread::Builder::new()
+            .name("dstorage test".into())
+            .spawn(move || work(s))
+            .unwrap();
+        let array = status_array(2).cast::<Instance<StatusArray>>();
+        let status = |index| {
+            add_ref_instance(array);
+            Command::Status(Status { array, index })
+        };
+        // SAFETY: an array we created.
+        for entry in unsafe { &(*array).state.entries }.iter() {
+            entry.store(E_PENDING, Ordering::Release);
+        }
+        let mut buffers = [[0u8; 16]; 2];
+        let [panics, out] = buffers.each_mut().map(|b| b.as_mut_ptr().cast());
+        let mut bad = request(ZLIB, panics, 16, file, 0, 16);
+        bad.tag = PANIC_TAG;
+        let good = request(0, out, 16, file, 8, 16);
+        {
+            let mut l = s.lock();
+            let lane = l.lanes.get_mut(&0).unwrap();
+            lane.unsubmitted.extend([
+                Command::Read(bad),
+                status(0),
+                Command::Read(good),
+                status(1),
+            ]);
+            l.submit(0);
+        }
+        s.work.notify_all();
+        assert_eq!(wait(array.cast(), 0), E_FAIL);
+        assert_eq!(wait(array.cast(), 1), S_OK);
+        assert_eq!(buffers[1], contents[8..24]);
+        let l = s.lock();
+        assert_eq!(l.staged, 0, "the panicked read's staging is given back");
+        assert!(l.lanes[&0].running.is_empty());
+    }
+
+    /// The pending warning names each running read: its file, offset, options and worker.
+    #[test]
+    fn running_reads_name_what_they_read() {
+        let (_dir, file) = file_with(&pattern(64));
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let r = request(ZLIB, std::ptr::null_mut(), 16, file, 0x1234, 16);
+        l.lanes
+            .get_mut(&0)
+            .unwrap()
+            .unsubmitted
+            .push(Command::Read(r));
+        l.submit(0);
+        let job = l.start().unwrap();
+        let running = running_reads(&l);
+        assert_eq!(running.len(), 1, "{running:?}");
+        let thread = std::thread::current();
+        for part in [
+            "lane 0 seq 0: ",
+            "data.bin",
+            " at 0x1234 ",
+            "options 0x1 ",
+            thread.name().unwrap(),
+        ] {
+            assert!(running[0].contains(part), "{part:?} in {running:?}");
+        }
+        l.finish(&job, Ok(()));
+        assert!(running_reads(&l).is_empty());
     }
 
     #[test]

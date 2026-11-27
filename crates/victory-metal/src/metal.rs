@@ -559,6 +559,7 @@ impl ComputeBackend for Metal {
                 signals: work.signals,
             },
         )
+        .map_err(|e| e.to_string())
     }
 
     fn signal(&self, fence: &Fence, value: u64) {

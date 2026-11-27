@@ -1017,13 +1017,22 @@ frame rate decayed to 0.4 fps and the title's watchdog ended the run (`0xc000000
 commits, so the fills of the dropped pass never run and nothing paid them; a piece refused before a
 command buffer exists at all loses them the same way.
 
-Now: when the `submit_passes` call in `NativeHost::execute` returns an error, the host makes the
-piece's fills on the CPU, in order, with a release fence after them
-(`crates/victory-gpu/src/native/host.rs`), and warns the first time
-(`native host pays a refused submission's value writes on the CPU`). A fill the GPU still runs
-repeats the same bytes. Host policy, not console behaviour, like the recoveries above: the console
-has no refused submissions. Tests: `vertex_tests::a_refused_submission_pays_its_value_writes_on_the_cpu`
-and `vertex_tests::a_submitted_piece_leaves_its_value_writes_to_the_gpu`.
+Now: `submit_passes` reports what it lost (`victory_backend::resources::SubmitFailure`): whether the
+command buffer committed, and which pass indices were dropped from it. When the call in
+`NativeHost::execute` returns an error, the host makes only the lost passes' fills on the CPU, in
+order, with a release fence after them (`crates/victory-gpu/src/native/host.rs`), and warns the first
+time (`native host pays a lost pass's value writes on the CPU`). A committed submission's kept passes
+still run on the GPU: paying their fills too would let a waiting queue go on before this queue's
+earlier GPU passes have run, and the GPU's own later fill could overwrite a newer value the title
+wrote after seeing the CPU write. What a waiting queue can read early from a paid fill is nothing
+harmful: the fill is a plain store of the word range into coherent title memory plus a release
+fence, so a queue polling the barrier word reads the old value (keeps waiting) or the filled one; a
+partial multi-word fill just means it waits on the next word. The hazard closed is the opposite:
+the word staying 0 forever after a refused submission, which held the queue for good. Host policy,
+not console behaviour, like the recoveries above: the console has no refused submissions. Tests:
+`vertex_tests::a_submission_that_never_committed_pays_its_value_writes_on_the_cpu`,
+`vertex_tests::only_the_fills_of_refused_passes_are_paid_on_the_cpu` and
+`vertex_tests::a_submitted_piece_leaves_its_value_writes_to_the_gpu`.
 
 #### A pass refused mid-encoding ends its encoder
 

@@ -2331,30 +2331,39 @@ impl<B: GraphicsBackend> NativeHost<B> {
         );
         // A refused submission must not lose its bottom-of-pipe value writes: another queue waits
         // on one of them with no other way to go on, and a lost write is the title's
-        // `Unsignaled CrossQueueBarrier`, which kills it (#80). The backend either committed what
-        // it could encode (a dropped pass's fills never run) or refused before committing at all;
-        // either way the piece's fills are made here on the CPU, in order. A fill the GPU still
-        // runs repeats the same bytes.
-        if submitted.is_err() {
+        // `Unsignaled CrossQueueBarrier`, which kills it (#80). Only the lost passes' fills are
+        // made here on the CPU: a committed submission's kept passes still run on the GPU (paying
+        // their fills too could let a waiting queue go on before earlier GPU passes have run, and
+        // the GPU's later fill would overwrite a newer value the title wrote), and a submission
+        // that never committed lost every pass. Pass `n` is group `n` below.
+        if let Err(f) = &submitted {
+            let lost: Vec<usize> = if f.committed {
+                f.refused.iter().copied().filter(|&n| n < groups.len()).collect()
+            } else {
+                (0..groups.len()).collect()
+            };
             let mut paid = 0usize;
-            for (c, p) in cmds.iter().zip(&preps) {
-                if let Cmd::Fill { len, value, .. } = c {
-                    let (_, ptr) = &p.blit[0];
-                    // SAFETY: the range lies inside a mapped pool's title memory: it resolved.
-                    unsafe { std::ptr::write_bytes(*ptr as *mut u8, *value, *len) };
-                    paid += 1;
+            for n in lost {
+                let Group::Blit(a, b) = &groups[n] else { continue };
+                for k in *a..*b {
+                    if let Cmd::Fill { len, value, .. } = cmds[k] {
+                        let (_, ptr) = &preps[k].blit[0];
+                        // SAFETY: the range lies inside a mapped pool's title memory: it resolved.
+                        unsafe { std::ptr::write_bytes(*ptr as *mut u8, *value, *len) };
+                        paid += 1;
+                    }
                 }
             }
             if paid > 0 {
                 std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    tracing::warn!("native host pays a refused submission's value writes on the CPU (first time; each after at debug level)");
+                    tracing::warn!("native host pays a lost pass's value writes on the CPU (first time; each after at debug level)");
                 });
-                tracing::debug!("native host paid {paid} value writes of a refused submission on the CPU");
+                tracing::debug!("native host paid {paid} value writes of lost passes on the CPU: {f}");
             }
         }
-        submitted
+        submitted.map_err(|e| e.to_string())
     }
 }
 

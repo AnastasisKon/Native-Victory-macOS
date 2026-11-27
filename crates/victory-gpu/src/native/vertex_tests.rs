@@ -37,16 +37,21 @@ pub(super) struct Capture {
     host_buffers: RefCell<Vec<Box<[u8]>>>,
     // (heap index, pool base, resolved address, size) for each buffer descriptor write.
     pub(super) buffer_writes: RefCell<Vec<(usize, usize, usize, u32)>>,
-    // When set, `submit_passes` refuses the whole submission.
-    pub(super) refuse: std::cell::Cell<bool>,
+    // When set, `submit_passes` fails with it: (whether the command buffer committed, the pass
+    // indices dropped from it).
+    pub(super) refuse: std::cell::RefCell<Option<(bool, Vec<usize>)>>,
 }
 
 impl GraphicsBackend for Capture {
     type RenderPipeline = ();
 
-    fn submit_passes(&self, _: &(), work: &PassSubmission<'_, Self>) -> Result<(), String> {
-        if self.refuse.get() {
-            return Err("refused for the test".to_string());
+    fn submit_passes(&self, _: &(), work: &PassSubmission<'_, Self>) -> Result<(), SubmitFailure> {
+        if let Some((committed, refused)) = self.refuse.borrow().as_ref() {
+            return Err(SubmitFailure {
+                committed: *committed,
+                refused: refused.clone(),
+                error: "refused for the test".to_string(),
+            });
         }
         for pass in work.passes {
             let Pass::Render(render) = pass else {
@@ -177,9 +182,9 @@ fn aliased_pool(host: &NativeHost<Capture>, mem: &[u8]) -> u64 {
 }
 
 #[test]
-fn a_refused_submission_pays_its_value_writes_on_the_cpu() {
+fn a_submission_that_never_committed_pays_its_value_writes_on_the_cpu() {
     let backend = Capture::default();
-    backend.refuse.set(true);
+    backend.refuse.replace(Some((false, Vec::new())));
     let host = NativeHost::new(backend);
     let mem = vec![0u8; 0x4000].into_boxed_slice();
     let alias = aliased_pool(&host, &mem);
@@ -188,8 +193,29 @@ fn a_refused_submission_pays_its_value_writes_on_the_cpu() {
     list.fill(alias + 0x200, 4, 0x5A);
     let err = host.execute(&(), &[&list], &[], &[]);
     assert!(err.is_err(), "the backend refused the submission");
-    assert_eq!(&mem[0x100..0x108], &[0xAB; 8], "the refused submission's first fill was not paid");
-    assert_eq!(&mem[0x200..0x204], &[0x5A; 4], "the refused submission's second fill was not paid");
+    assert_eq!(&mem[0x100..0x108], &[0xAB; 8], "the lost submission's first fill was not paid");
+    assert_eq!(&mem[0x200..0x204], &[0x5A; 4], "the lost submission's second fill was not paid");
+}
+
+#[test]
+fn only_the_fills_of_refused_passes_are_paid_on_the_cpu() {
+    let backend = Capture::default();
+    // The command buffer commits, but pass 0 (the first fill) and pass 1 (the draw) are dropped.
+    backend.refuse.replace(Some((true, vec![0, 1])));
+    let host = NativeHost::new(backend);
+    let mem = vec![0u8; 0x4000].into_boxed_slice();
+    let alias = aliased_pool(&host, &mem);
+    let mut list = NativeList::default();
+    list.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
+    list.set_render_targets(&[Rc::new(TextureDesc::d2(Format::Rgba8Unorm, 1, 1))], None);
+    list.fill(alias + 0x100, 8, 0xAB); // pass 0: refused
+    list.set_vertex_buffer(2, alias + 0x300);
+    list.draw_instanced(3, 1, 0, 0).unwrap(); // pass 1: refused
+    list.fill(alias + 0x200, 4, 0x5A); // pass 2: kept, runs on the GPU
+    let err = host.execute(&(), &[&list], &[], &[]);
+    assert!(err.is_err(), "the backend refused passes 0 and 1");
+    assert_eq!(&mem[0x100..0x108], &[0xAB; 8], "the refused pass's fill was not paid");
+    assert_eq!(&mem[0x200..0x204], &[0; 4], "a kept pass's fill must stay with the GPU");
 }
 
 #[test]

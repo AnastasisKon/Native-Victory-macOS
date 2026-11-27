@@ -9070,6 +9070,11 @@ impl<'a> Lower<'a> {
                             unknown = Some(w);
                             self.s.m.i32(0)
                         }
+                        // The high half replaces the unknown one: a `v_fma_mixlo_f16` kept it
+                        // above a low half it made (`low16`), and only that low half stays.
+                        Err(w) if name == "v_fma_mixhi_f16" => {
+                            *self.low16.get(&o).ok_or(w)?
+                        }
                         Err(w) => return Err(w),
                     },
                     None => self.s.m.i32(0),

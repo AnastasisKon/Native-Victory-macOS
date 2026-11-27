@@ -666,3 +666,36 @@ fn a_pixel_program_reads_a_zero_line_stipple_coordinate_on_a_triangle() {
     let Some(words) = exported_input(0x80, 0) else { return };
     assert_eq!(words, vec![0; 64]);
 }
+
+/// A pixel program that packs its colour as the title's do. It interpolates param0 with the
+/// barycentric inputs v0 and v1. Then `v_fma_mixlo_f16` writes the low half of v1 and keeps the
+/// high half, which still holds the barycentric, and `v_fma_mixhi_f16` replaces that high half.
+/// `exp ... compr` writes the pairs. The barycentric is never read for the colour, so the program
+/// translates (it was refused as "barycentrics read directly") and draws (1.0, 0.5, 1.0, 1.0).
+const PACKED_BY_MIX: &[u32] = &[
+    0xC80C_0000, // v_interp_p1_f32 v3, v0, attr0.x
+    0xC80D_0001, // v_interp_p2_f32 v3, v1, attr0.x
+    0xCC21_0001, 0x0201_E4F2, // v_fma_mixlo_f16 v1, 1.0, 1.0, 0
+    0xCC22_0001, 0x0201_E4F0, // v_fma_mixhi_f16 v1, 0.5, 1.0, 0
+    0x7E04_02FF, 0x3C00_3C00, // v_mov_b32 v2, 0x3c003c00 (two f16 1.0)
+    0xF800_1C0F, 0x0000_0201, // exp mrt0 v1, v1, v2, v2 done compr vm (vsrc0 v1, vsrc1 v2)
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_half_kept_by_mixlo_and_replaced_by_mixhi_draws_without_the_barycentric() {
+    // The triangle program, exporting param0 for the pixel program's interpolation.
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [0xF800_0201, 0x0000_0006]); // exp param0 v6 (1.0)
+    let (ms, ps) = (translate(HwStage::Vs, &words), translate(HwStage::Ps, PACKED_BY_MIX));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mix") else {
+        panic!("{:?}", t.shaders);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    assert!(pixels(&t, &color).iter().all(|p| *p == [255, 128, 255, 255]), "{:?}", pixels(&t, &color));
+}

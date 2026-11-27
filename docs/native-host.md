@@ -451,6 +451,31 @@ Slow work shows in the log: a translation or a conversion of 20 ms or more logs 
 
 Translations of 20 to 40 s (27 November; 44 to 48 KB pixel shaders) were lowering done over: `lower_graphics` lowered the whole program again for each join with an incoming value that has no DXIL form (574 times for one shader), and `fill_phis` now reports all the joins a pass finds, so two passes do. The shaders were refused in 30 ms until descriptor tracing followed dwords swapped by XORs, and then reached this. `descriptor_data` also searched every descriptor's sources for each load read as data: one table (`load_use`), worth about a tenth of the heaviest translations. The walk in `live_edges` is bounded separately (see "Liveness of phi edges"). A program with several such joins may now be refused for another of them than before, so tallies of refusals by reason shift without any shader changing between translated and refused. Test: `joins_without_a_value_are_found_in_one_pass` (`gfx_refusal_tests`) bounds the passes, not the time.
 
+## A half kept by `v_fma_mixlo_f16` and replaced by `v_fma_mixhi_f16`
+
+The title's pixel programs often pack two f16 results into a register that still holds an input
+they are done with, a barycentric (`v0`/`v1`) or the first half of an interpolation:
+`v_fma_mixlo_f16 v1, ...` writes the low half and keeps the high half, then
+`v_fma_mixhi_f16 v1, ...` replaces it, and `exp ... compr` writes the pair. The kept high half has
+no DXIL form, so `v_fma_mixlo_f16` already recorded its value as unknown, with the low half it made
+in `low16`. `v_fma_mixhi_f16` then refused that unknown value, though it keeps only the low half.
+It now takes the low half from `low16` when the value is unknown. That entry exists only for a
+`v_fma_mixlo_f16` result with an unknown high half, so whatever else reads such a value is refused
+as before. A `mixlo` whose kept high half is exported or read stays refused too (one of the
+corpus's shaders exports `v0` after a `mixlo` alone).
+
+Over a 12,020-shader corpus (Series S boot to the menus, 27 November), 79 shaders now translate
+(78 pixel, 1 vertex), and no other output changes. They were refused as:
+- "barycentrics read directly": 64;
+- "the first half of an interpolation": 11;
+- "a lane mask holding lanes elsewhere read as data: not written by a scalar ALU instruction": 3;
+- "a descriptor built around a table in the code": 1 (vertex).
+
+The last two kinds name what the kept high half held. Each of the 79 has the `mixlo`/`mixhi`
+pairs. `mesh_tests::a_half_kept_by_mixlo_and_replaced_by_mixhi_draws_without_the_barycentric`
+(`victory-gpu`) draws the shape on Metal: a pixel program that interpolates with `v0`/`v1` and
+then packs (1.0, 0.5) into `v1` draws (1.0, 0.5, 1.0, 1.0).
+
 ## LDS instructions addressed by M0
 
 `ds_append`, `ds_consume`, `ds_read_addtid_b32` and `ds_write_addtid_b32` have no address

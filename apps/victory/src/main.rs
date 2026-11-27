@@ -163,6 +163,7 @@ fn stop_gpu_on_signals() {
         fn sigwait(set: *const u32, sig: *mut i32) -> i32;
     }
     const SIG_BLOCK: i32 = 1;
+    const SIG_UNBLOCK: i32 = 2;
     let set: u32 = [1u32 /* SIGHUP */, 2 /* SIGINT */, 15 /* SIGTERM */]
         .iter()
         .fold(0, |set, sig| set | 1 << (sig - 1));
@@ -170,17 +171,25 @@ fn stop_gpu_on_signals() {
     if unsafe { pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut()) } != 0 {
         return;
     }
-    let _ = std::thread::Builder::new().name("stop-on-signal".into()).spawn(move || {
+    let spawned = std::thread::Builder::new().name("stop-on-signal".into()).spawn(move || {
         let mut sig = 0;
         // SAFETY: as above; `sig` receives the signal taken.
         if unsafe { sigwait(&set, &mut sig) } != 0 {
             return;
         }
+        // A second signal stops the process at once, should the drain or the exit hang.
+        // SAFETY: as above.
+        unsafe { pthread_sigmask(SIG_UNBLOCK, &set, std::ptr::null_mut()) };
         tracing::warn!(signal = sig, "stopping: waking and draining the GPU's queued work first");
         let (in_flight, left) = victory_gpu::stop_gpu(std::time::Duration::from_secs(3));
         tracing::warn!(in_flight, left, "stopped the GPU's work; exiting");
         std::process::exit(128 + sig);
     });
+    if spawned.is_err() {
+        // No thread to take them: leave the signals their default action.
+        // SAFETY: as above; no other thread has started yet.
+        unsafe { pthread_sigmask(SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+    }
 }
 
 /// Diagnostics: the heap bytes Rust code holds, for the statistics.

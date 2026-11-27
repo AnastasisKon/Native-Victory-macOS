@@ -2964,3 +2964,70 @@ fn a_wave64_skip_on_exec_lo_alone_does_not_make_an_edge_unneeded() {
     let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err.contains("data whose high dword is not known"), "{err:?}");
 }
+
+/// [`SKIP`] with a second EXEC skip inside the region: the join `s[10:11]` reaches is not read in
+/// its own block (J1) but relayed unchanged, by one unconditional jump, into the next block's phi
+/// (J2) and read there only ANDed with EXEC. The outer skip (to J2) brings an empty EXEC there.
+const RELAY: &[u32] = &[
+    0xD4C4_000A,
+    0x0202_0090, // v_cmp_gt_u32 s[10:11], 16, v0
+    0xBE8A_0385, // s_mov_b32 s10, 5 (data; s11 keeps the mask's high dword)
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0x4A06_00FF,
+    0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+    0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+    0xBF88_0008, // s_cbranch_execz J2 (the outer skip)
+    0x7DA8_0004, // v_cmpx_gt_u32 s4, v0
+    0xBF88_0005, // s_cbranch_execz J1 (the inner skip)
+    0xD760_0008,
+    0x0201_4703, // v_readlane_b32 s8, v3, 35 (refused on the fast path: lockstep)
+    0x7E04_0208, // v_mov_b32 v2, s8
+    0xD4C4_000A,
+    0x0202_0088, // v_cmp_gt_u32 s[10:11], 8, v0 (a mask on this path only)
+    0xBE89_0380, // J1: s_mov_b32 s9, 0 (the join is not read here, only relayed on)
+    0x878C_7E0A, // J2: s_and_b64 s[12:13], s[10:11], exec
+    0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+    0x87FE_7E0C, // s_and_b64 exec, s[12:13], exec
+    0x4A04_0487, // v_add_nc_u32 v2, 7, v2
+    0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+    0xDC70_8000,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3]
+    0xBF81_0000, // s_endpgm
+];
+
+/// A join read only by an AND with EXEC in the block after an unconditional jump (`RELAY`): on the
+/// edge the outer skip takes, that EXEC is empty, so the relayed value is not needed there either.
+#[test]
+fn a_join_relayed_by_a_jump_and_read_only_with_exec_needs_nothing_from_an_exec_skip() {
+    if let Err(e) = emit_wave64_cs(RELAY, 64, false) {
+        panic!("{e}");
+    }
+}
+
+/// [`RELAY`] with J1 making EXEC `s_mov_b64 exec, s[6:7]`: the relay block now writes EXEC, so the
+/// EXEC J2 reads is not the one the skip found empty and the data is needed: still refused.
+#[test]
+fn a_relay_block_that_rewrites_exec_still_needs_the_data() {
+    let w: Vec<u32> = RELAY.iter().map(|&x| if x == 0xBE89_0380 { 0xBEFE_0406 } else { x }).collect();
+    assert_ne!(w, RELAY);
+    let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("lane-mask join") && err.contains("0x44"), "{err:?}");
+}
+
+/// [`RELAY`] with the inner skip written as `s_cmp_eq_u32 exec_lo, 0; s_cbranch_scc1`: in wave64
+/// that sees only half of EXEC, so the edge is not proved empty and stays refused.
+#[test]
+fn a_wave64_relay_skip_on_exec_lo_alone_does_not_make_an_edge_unneeded() {
+    let mut w = Vec::new();
+    for &x in RELAY {
+        match x {
+            0xBF88_0005 => w.extend([0xBF06_807E, 0xBF85_0005]), // s_cmp_eq_u32 exec_lo, 0; s_cbranch_scc1 J1
+            0xBF88_0008 => w.push(0xBF88_0009), // the outer branch, one word further
+            _ => w.push(x),
+        }
+    }
+    let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("lane-mask join") && err.contains("0x48"), "{err:?}");
+}

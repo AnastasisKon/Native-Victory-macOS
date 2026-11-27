@@ -1619,6 +1619,50 @@ fn a_mask_joined_with_data_on_an_exec_skips_edge_is_its_lanes_in_lockstep() {
 }
 
 #[test]
+fn a_mask_relayed_by_a_jump_and_read_only_with_exec_is_its_lanes_in_lockstep() {
+    // As above, with a second EXEC skip (on the flag, in s4) inside the region: the join of
+    // `s[10:11]` after it is only relayed by the fall-through into the block where it is ANDed
+    // with EXEC. Lanes below 40 pass the outer skip, those below the flag the inner one (and read
+    // lane 35); of those, the lanes below 8 are in the mask.
+    let w = [
+        0xD4C4_000A, 0x0202_0090, // v_cmp_gt_u32 s[10:11], 16, v0
+        0xBE8A_0385, // s_mov_b32 s10, 5
+        V_LSHLREV_V1_2_V0,
+        0x4A06_00FF, 0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+        skip_execz(8), // the outer skip, to the AND
+        0x7DA8_0004, // v_cmpx_gt_u32 s4, v0
+        skip_execz(5), // the inner skip, to the relay block
+        0xD760_0008, 0x0201_4703, // v_readlane_b32 s8, v3, 35
+        0x7E04_0208, // v_mov_b32 v2, s8
+        0xD4C4_000A, 0x0202_0088, // v_cmp_gt_u32 s[10:11], 8, v0
+        0xBE89_0380, // relay block: s_mov_b32 s9, 0
+        0x878C_7E0A, // s_and_b64 s[12:13], s[10:11], exec
+        0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+        0x87FE_7E0C, // s_and_b64 exec, s[12:13], exec
+        0x4A04_0487, // v_add_nc_u32 v2, 7, v2
+        0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+        GLOBAL_STORE_V2_AT_V1[0], GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let got = run(&w, 0, 40);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..8], [1042; 8]);
+    assert_eq!(got[8..40], [1035; 32]);
+    assert_eq!(got[40..], [0; 24]);
+    // Only lanes below 4 stay in EXEC past the `v_cmpx`; the others add nothing at the join.
+    let got = run(&w, 0, 4);
+    assert_eq!(got[..4], [1042; 4]);
+    assert_eq!(got[4..], [0; 60]);
+    // No lane enters at all.
+    assert_eq!(run(&w, 0, 0), [0; 64]);
+}
+
+#[test]
 fn a_loop_register_that_is_exec_on_every_edge_counts_the_lanes_still_looping() {
     // Two nested loops keeping the lanes still looping in an SGPR beside EXEC (a copy of EXEC
     // before the loop, `s_andn2_b64 s, s, exec` at the head, `s_andn2_wrexec_b64 s, s` at the back

@@ -35,6 +35,18 @@ run_gate() {
 
 echo "== native VIctory verification gate ($GATE) =="
 
+# The native victory-gpu tests convert DXIL through Apple's Metal Shader
+# Converter; without its dylib they fail with an indirect panic that looks
+# like a GPU bug, so fail fast on the prerequisite first on a Mac (#379).
+# (GPTK's bundled copy of the dylib is not a substitute for Apple's.)
+MSC="${VICTORY_MSC_DYLIB:-/usr/local/lib/libmetalirconverter.dylib}"
+if [ "$(uname)" = "Darwin" ] && [ ! -f "$MSC" ]; then
+    echo "FAIL: no Metal Shader Converter at $MSC"
+    echo "install Apple's Metal Shader Converter (https://developer.apple.com/metal/metal-shader-converter/)"
+    echo "or set VICTORY_MSC_DYLIB to its libmetalirconverter.dylib"
+    exit 1
+fi
+
 run_gate "suite-hle" sh -c \
     "$RUNNER cargo test --target x86_64-apple-darwin -p victory-hle -p victory-loader -p victory"
 

@@ -37,15 +37,20 @@ pub(super) struct Capture {
     host_buffers: RefCell<Vec<Box<[u8]>>>,
     // (heap index, pool base, resolved address, size) for each buffer descriptor write.
     pub(super) buffer_writes: RefCell<Vec<(usize, usize, usize, u32)>>,
+    // When set, `submit_passes` refuses the whole submission.
+    pub(super) refuse: std::cell::Cell<bool>,
 }
 
 impl GraphicsBackend for Capture {
     type RenderPipeline = ();
 
     fn submit_passes(&self, _: &(), work: &PassSubmission<'_, Self>) -> Result<(), String> {
+        if self.refuse.get() {
+            return Err("refused for the test".to_string());
+        }
         for pass in work.passes {
             let Pass::Render(render) = pass else {
-                panic!("expected a render pass")
+                continue;
             };
             for draw in &render.draws {
                 self.draws.borrow_mut().push(
@@ -160,4 +165,40 @@ impl ResourceBackend for Capture {
     fn create_sampler(&self, _: &SamplerDesc) -> Result<(), String> {
         unreachable!()
     }
+}
+
+/// A pool of real memory shown to the "title" at an alias, the way `title_tests` makes one.
+fn aliased_pool(host: &NativeHost<Capture>, mem: &[u8]) -> u64 {
+    let base = mem.as_ptr() as usize;
+    let alias = (base + 0x8000_0000) & !0xfff;
+    let pool = PoolInfo { id: 1, base, len: mem.len(), memory_entry: None };
+    host.memory().mapped(alias, pool.len, &pool, 0);
+    alias as u64
+}
+
+#[test]
+fn a_refused_submission_pays_its_value_writes_on_the_cpu() {
+    let backend = Capture::default();
+    backend.refuse.set(true);
+    let host = NativeHost::new(backend);
+    let mem = vec![0u8; 0x4000].into_boxed_slice();
+    let alias = aliased_pool(&host, &mem);
+    let mut list = NativeList::default();
+    list.fill(alias + 0x100, 8, 0xAB);
+    list.fill(alias + 0x200, 4, 0x5A);
+    let err = host.execute(&(), &[&list], &[], &[]);
+    assert!(err.is_err(), "the backend refused the submission");
+    assert_eq!(&mem[0x100..0x108], &[0xAB; 8], "the refused submission's first fill was not paid");
+    assert_eq!(&mem[0x200..0x204], &[0x5A; 4], "the refused submission's second fill was not paid");
+}
+
+#[test]
+fn a_submitted_piece_leaves_its_value_writes_to_the_gpu() {
+    let host = NativeHost::new(Capture::default());
+    let mem = vec![0u8; 0x4000].into_boxed_slice();
+    let alias = aliased_pool(&host, &mem);
+    let mut list = NativeList::default();
+    list.fill(alias + 0x100, 8, 0xAB);
+    host.execute(&(), &[&list], &[], &[]).unwrap();
+    assert_eq!(&mem[0x100..0x108], &[0; 8], "the host wrote a fill the GPU was given");
 }

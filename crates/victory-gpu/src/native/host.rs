@@ -2321,14 +2321,40 @@ impl<B: GraphicsBackend> NativeHost<B> {
             });
         }
         self.passes.set(self.passes.get() + passes.len() as u64);
-        self.backend.submit_passes(
+        let submitted = self.backend.submit_passes(
             queue,
             &PassSubmission {
                 waits,
                 passes: &passes,
                 signals,
             },
-        )
+        );
+        // A refused submission must not lose its bottom-of-pipe value writes: another queue waits
+        // on one of them with no other way to go on, and a lost write is the title's
+        // `Unsignaled CrossQueueBarrier`, which kills it (#80). The backend either committed what
+        // it could encode (a dropped pass's fills never run) or refused before committing at all;
+        // either way the piece's fills are made here on the CPU, in order. A fill the GPU still
+        // runs repeats the same bytes.
+        if submitted.is_err() {
+            let mut paid = 0usize;
+            for (c, p) in cmds.iter().zip(&preps) {
+                if let Cmd::Fill { len, value, .. } = c {
+                    let (_, ptr) = &p.blit[0];
+                    // SAFETY: the range lies inside a mapped pool's title memory: it resolved.
+                    unsafe { std::ptr::write_bytes(*ptr as *mut u8, *value, *len) };
+                    paid += 1;
+                }
+            }
+            if paid > 0 {
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!("native host pays a refused submission's value writes on the CPU (first time; each after at debug level)");
+                });
+                tracing::debug!("native host paid {paid} value writes of a refused submission on the CPU");
+            }
+        }
+        submitted
     }
 }
 

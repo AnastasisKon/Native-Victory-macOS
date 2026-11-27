@@ -1007,6 +1007,24 @@ four minutes, 21 world frames each) had no failed command buffer. That is fewer 
 set-mode runs reached before stalling (31 and 54), so it does not show that per-encoder naming
 survives pressure better.
 
+#### A refused submission still pays its value writes
+
+Observed on 16 GB Macs (tester reports #265 and #280): after Metal failed command buffers with
+`kIOGPUCommandBufferCallbackErrorOutOfMemory`, queues stayed held on their per-frame barrier words
+(`work held for a wait that does not hold`: `0x18437f9d8 cmp 7 ref 0x883 ... now Some(2178)`), the
+frame rate decayed to 0.4 fps and the title's watchdog ended the run (`0xc0000005` at
+`image+0x55e56f8`). A pass `submit_passes` cannot encode is dropped while the command buffer still
+commits, so the fills of the dropped pass never run and nothing paid them; a piece refused before a
+command buffer exists at all loses them the same way.
+
+Now: when the `submit_passes` call in `NativeHost::execute` returns an error, the host makes the
+piece's fills on the CPU, in order, with a release fence after them
+(`crates/victory-gpu/src/native/host.rs`), and warns the first time
+(`native host pays a refused submission's value writes on the CPU`). A fill the GPU still runs
+repeats the same bytes. Host policy, not console behaviour, like the recoveries above: the console
+has no refused submissions. Tests: `vertex_tests::a_refused_submission_pays_its_value_writes_on_the_cpu`
+and `vertex_tests::a_submitted_piece_leaves_its_value_writes_to_the_gpu`.
+
 #### A pass refused mid-encoding ends its encoder
 
 `submit_passes` refuses a pass it cannot encode and still encodes the passes after it. A refusal after the pass's encoder was opened (a counted record whose gate fails, an indexed indirect draw without an index buffer) now ends that encoder first; it used to leave it open, and Metal aborted the process (`A command encoder is already encoding to this command buffer`) when the next pass opened its own.

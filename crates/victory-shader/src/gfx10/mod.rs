@@ -18,6 +18,8 @@ mod fields;
 #[cfg(test)]
 mod fields_tests;
 mod opcodes;
+#[cfg(test)]
+mod opcodes_tests;
 mod sp3;
 
 pub use fields::{Cache, Dpp, Fields, NULL, Operand, Sdwa, Valu};

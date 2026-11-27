@@ -58,6 +58,8 @@ pub struct Heap {
     /// Residency set holding the heap buffer and everything its entries name.
     set: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     dirty: Cell<bool>,
+    /// The set asked to stay resident (`VICTORY_METAL_REQUEST_RESIDENCY`): it ends that when dropped.
+    requested: bool,
 }
 
 impl Drop for Heap {
@@ -65,8 +67,11 @@ impl Drop for Heap {
         // MTLResidencySet does not retain allocations: detach everything and commit before
         // `buf` and `refs` are dropped.
         if let Some(set) = self.set.take() {
+            if self.requested {
+                crate::metal::residency_timed("end", Some(&set), || set.endResidency());
+            }
             set.removeAllAllocations();
-            set.commit();
+            crate::metal::residency_timed("drop_commit", Some(&set), || set.commit());
         }
     }
 }
@@ -573,7 +578,7 @@ impl Metal {
             drop(counts);
             if last && let Some(set) = &heap.set {
                 set.removeAllocation(ProtocolObject::from_ref(&*old));
-                set.commit();
+                crate::metal::residency_timed("remove_commit", Some(set), || set.commit());
                 heap.dirty.set(false);
             }
             drop(old_tex_view);
@@ -619,6 +624,22 @@ impl Metal {
         Ok(cb)
     }
 
+    /// With `VICTORY_METAL_REQUEST_RESIDENCY`, asks that a heap's set, as last committed, stay
+    /// resident between the command buffers that use it. Without it the system may make the
+    /// set's allocations non-resident whenever no command buffer in flight uses the set, and
+    /// make them resident again for the next one: in a run on a 48 GB Mac the wired memory fell
+    /// from about 22 GB to 6 GB and came back within 10 s in the world, then command buffers
+    /// timed out (#79). Measured since (`VICTORY_TRACE_RESIDENCY`, docs/native-host.md): the
+    /// wired memory falls only after the host has committed no command buffer for a few seconds,
+    /// this request does not stop that, and making the set resident again cost 0.1 to 0.3 s: the
+    /// fall follows a stall, it does not cause it.
+    fn request(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
+        if self.request_residency {
+            crate::metal::residency_timed("request", Some(set), || set.requestResidency());
+            self.count(|c| c.requests += 1);
+        }
+    }
+
     /// A set covers all passes in the command buffer. Later uses can still commit new entries.
     fn use_heap_cb(
         &self,
@@ -628,7 +649,8 @@ impl Metal {
     ) {
         if let Some(set) = &heap.set {
             if heap.dirty.replace(false) {
-                set.commit();
+                crate::metal::residency_timed("add_commit", Some(set), || set.commit());
+                self.request(set);
                 self.count(|c| {
                     c.heap_entries = c.heap_entries.max(heap.refs.borrow().len() as u64);
                     c.heap_allocations = c.heap_allocations.max(heap.alloc_counts.borrow().len() as u64);
@@ -840,7 +862,8 @@ impl ResourceBackend for Metal {
                 .newResidencySetWithDescriptor_error(&d)
                 .map_err(|e| e.localizedDescription().to_string())?;
             s.addAllocation(ProtocolObject::from_ref(&*buf));
-            s.commit();
+            crate::metal::residency_timed("made", Some(&s), || s.commit());
+            self.request(&s);
             Some(s)
         } else {
             None
@@ -852,6 +875,7 @@ impl ResourceBackend for Metal {
             refs: RefCell::default(),
             typed_views: Cell::new(0),
             alloc_counts: RefCell::default(),
+            requested: set.is_some() && self.request_residency,
             set,
             dirty: Cell::new(false),
         })
@@ -1255,6 +1279,13 @@ impl GraphicsBackend for Metal {
         made.map(|made| made.and_then(|(pso, mesh)| self.finish_render(d, pso, mesh))).transpose()
     }
 
+    fn name_render_pipeline(&self, p: &RenderPipeline, name: &str) {
+        if self.trace_fails {
+            let key = Retained::as_ptr(&p.pso) as *const u8 as usize;
+            self.pipe_names.borrow_mut().insert(key, name.to_string());
+        }
+    }
+
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
         if self.trace_fails {
             report_in_flight();
@@ -1370,7 +1401,8 @@ impl GraphicsBackend for Metal {
         flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
         // A command buffer the GPU fails is logged (the first few), not silently dropped.
         let trace = self.trace_fails;
-        let tinfo = trace.then(|| (serial, label, self.trace_enc.borrow().join(" | ")));
+        let tinfo = trace.then(|| (serial, label.clone(), self.trace_enc.borrow().join(" | ")));
+        self.trace_commit(serial, queue_id, &label);
         if let Some((s, l, enc)) = &tinfo {
             IN_FLIGHT.lock().unwrap().insert(*s, (std::time::Instant::now(), format!("{l} | {enc}")));
         }
@@ -1378,6 +1410,7 @@ impl GraphicsBackend for Metal {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
+            trace_done(serial, done);
             landed(serial, queue_id, done.error().is_some());
             if let Some((s, l, enc)) = &tinfo {
                 let started = IN_FLIGHT.lock().unwrap().remove(s).map(|(t, _)| t);
@@ -1407,7 +1440,7 @@ impl GraphicsBackend for Metal {
         });
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
-        cb.commit();
+        crate::metal::residency_timed("cb_commit", None, || cb.commit());
         self.committed.set(self.committed.get() + 1);
         match refused {
             Some(e) => Err(e),
@@ -1483,11 +1516,13 @@ impl Metal {
             cb
         };
         flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
+        self.trace_commit(serial, queue_id, &format!("piece {piece}"));
         let trace = self.trace_fails;
         let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
+            trace_done(serial, done);
             let error = done.error();
             landed(serial, queue_id, dropped || error.is_some());
             if let Some(e) = &error
@@ -1505,7 +1540,7 @@ impl Metal {
         });
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
-        cb.commit();
+        crate::metal::residency_timed("cb_commit", None, || cb.commit());
         self.committed.set(self.committed.get() + 1);
     }
 
@@ -1952,6 +1987,27 @@ fn wake_and_drain(
     (in_flight, left.len())
 }
 
+/// `VICTORY_TRACE_COMMITS=1` (with `VICTORY_TRACE_GPU_FAILS` for the encoder names): a line for
+/// each command buffer as it is committed (serial, queue, its encoders: pipelines by shader hash,
+/// draw counts, dispatch sizes) and one as it completes, so a command buffer the GPU never
+/// finishes is the one committed and never done (#79).
+fn commits_traced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TRACE_COMMITS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The completion line of [`commits_traced`].
+fn trace_done(serial: u64, done: &ProtocolObject<dyn MTLCommandBuffer>) {
+    if commits_traced() {
+        tracing::info!(
+            "cb done #{serial} t={:.3} gpu_ms={:.1} failed={}",
+            crate::metal::since_start(),
+            (done.GPUEndTime() - done.GPUStartTime()) * 1000.0,
+            done.error().is_some()
+        );
+    }
+}
+
 static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
@@ -2034,11 +2090,22 @@ fn cap_label_str(mut s: String) -> String {
 
 impl Metal {
     /// The capped label for an encoder, kept for the command buffer's description.
+    /// The command buffer's description keeps the whole label when `VICTORY_TRACE_COMMITS` logs it
+    /// (a capped one hid the end of a 17-dispatch pass, #79).
     fn cap_label(&self, s: String) -> Retained<objc2_foundation::NSString> {
-        let s = cap_label_str(s);
-        let n = objc2_foundation::NSString::from_str(&s);
-        self.trace_enc.borrow_mut().push(s);
+        let capped = cap_label_str(s.clone());
+        let n = objc2_foundation::NSString::from_str(&capped);
+        self.trace_enc.borrow_mut().push(if commits_traced() { s } else { capped });
         n
+    }
+
+    /// The commit line of [`commits_traced`]: this command buffer's encoders, which are then
+    /// forgotten so the next piece lists only its own.
+    fn trace_commit(&self, serial: u64, queue_id: usize, what: &str) {
+        if commits_traced() {
+            let enc = std::mem::take(&mut *self.trace_enc.borrow_mut()).join(" | ");
+            tracing::warn!("cb commit #{serial} q{queue_id:x} t={:.3} {what} | {enc}", crate::metal::since_start());
+        }
     }
 
     fn encode_blit(
@@ -3029,7 +3096,25 @@ impl Metal {
             started.set(true);
         }
         if self.trace_fails {
-            e.setLabel(Some(&self.cap_label(format!("render: {} draws", rp.draws.len()))));
+            // Each distinct pipeline once, with its draw count: names the pass's shaders.
+            let names = self.pipe_names.borrow();
+            let mut seen: Vec<(usize, usize)> = Vec::new();
+            for d in &rp.draws {
+                let k = Retained::as_ptr(&d.pipeline.pso) as *const u8 as usize;
+                match seen.iter_mut().find(|(p, _)| *p == k) {
+                    Some((_, n)) => *n += 1,
+                    None => seen.push((k, 1)),
+                }
+            }
+            let mut l = format!("render: {} draws", rp.draws.len());
+            for (k, n) in seen {
+                match names.get(&k) {
+                    Some(name) => l.push_str(&format!("; {name} x{n}")),
+                    None => l.push_str(&format!("; {k:#x} x{n}")),
+                }
+            }
+            drop(names);
+            e.setLabel(Some(&self.cap_label(l)));
         }
         e.endEncoding();
         Ok(())
@@ -3693,6 +3778,30 @@ mod heap_set_tests {
         assert!(!attaches(&mut attached), "once per command buffer");
         let _next = m.next_piece(&q, &[], &mut attached, None).unwrap();
         assert!(attaches(&mut attached), "the next piece is given the heap's set too");
+    }
+
+    /// With `VICTORY_METAL_REQUEST_RESIDENCY` a heap's set asks to stay resident when it is made
+    /// and after each commit a use makes; without it, never.
+    #[test]
+    fn a_heaps_set_asks_to_stay_resident_only_when_switched_on() {
+        for on in [false, true] {
+            let m = Metal::new().unwrap().with_heap_sets().with_requested_residency(on);
+            let heap = m.create_heap(HeapKind::Resource, 4).unwrap();
+            if heap.set.is_none() {
+                eprintln!("skipped: no residency sets on this system");
+                return;
+            }
+            let before = m.residency_counts().requests;
+            let t = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+            m.write_texture(&heap, 0, &t, 0.0);
+            let mut attached = Vec::new();
+            m.use_heap_cb(&heap, &mut attached, |_| {});
+            m.use_heap_cb(&heap, &mut attached, |_| {});
+            let made = u64::from(on);
+            assert_eq!(before, made, "on={on}: when the set is made");
+            assert_eq!(m.residency_counts().requests, 2 * made, "on={on}: again after the one commit");
+            drop(heap); // ends the residency it asked for
+        }
     }
 
     /// A heap's residency set holds the heap buffer and each allocation its entries name, once,

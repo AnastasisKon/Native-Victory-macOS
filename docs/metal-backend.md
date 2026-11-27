@@ -428,9 +428,19 @@ With a heap's set, Metal's hazard tracking no longer sees what a pass reaches th
 host orders the queue's work itself (the queue event and the fence under **Residency** below).
 The heap tests run in all three modes (`common::backends()`).
 
+`VICTORY_METAL_REQUEST_RESIDENCY=1` (off by default) makes each heap's set ask to stay resident
+(`requestResidency` when it is made and after each commit; `endResidency` when the heap goes), so
+the system does not make it non-resident between the command buffers that use it and resident
+again for the next. In a 330 s run on a 48 GB Mac the wired memory fell from about 22 GB to 6 GB
+and came back within 10 s twice in the world, and command buffers later timed out (#79); whether
+that churn is the stall is a guess this switch tests. The frame line counts nothing for it; the
+start-up residency line logs `request_residency`.
+
 Not known: how the default does on a Mac with 16 or 18 GB; it was run with 48 GB. The frame line
 (`native draws so far`, every 64 frames) logs `heap_set_mb`, the most bytes one heap's set held
-(pool buffers its entries name count whole), and `heap_allocations`. Not done: an entry that names a
+(pool buffers its entries name count whole), `heap_allocations`, and, to see where the memory is
+when command buffers stall (#79), `metal_mb` (the device's `currentAllocatedSize`) and
+`footprint_mb` (the process's physical footprint). Not done: an entry that names a
 texture the title has released keeps it, alive and in the set, until the title overwrites the entry,
 as naming per encoder did; `useHeap` for `MTLHeap`-placed textures.
 

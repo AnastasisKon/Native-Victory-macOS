@@ -360,6 +360,7 @@ impl<B: PresentBackend> Title<B> {
             Ok(None) => self.put_off(),
             Ok(Some(p)) => {
                 self.shaders.pipelines += 1;
+                self.host.backend.name_render_pipeline(&p, name);
                 Pipe::Render(Rc::new(p), Some(Rc::new(Binding {
                     ps: ps_binding.map(Rc::new),
                     ..vs_binding

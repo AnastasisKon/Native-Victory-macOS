@@ -3323,6 +3323,9 @@ impl<'a> Lower<'a> {
     /// `v_fma_legacy_f32` and `v_fmac_legacy_f32`, RDNA2's encodings of what GFX10.1 had as
     /// `v_mad_legacy_f32` and `v_mac_legacy_f32`: one rounding, with DX9's rule that a zero
     /// factor makes the product +0 against anything (both factors made 0, so `0 * 0 + c`).
+    /// Denormals, unknown: whether the console reads a denormal factor as 0 here is not measured
+    /// (`semantics_tests` guesses it does, as measured for `v_mul_legacy_f32`); this keeps it, as
+    /// `legacy_mul` does, and the host keeps denormals (#323).
     fn legacy_fma(&mut self, a: V, b: V, cc: V) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);

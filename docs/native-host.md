@@ -1511,6 +1511,13 @@ Tests:
 - `split_wave_tests::a_wave64_prefix_sum_whose_rows_s_bitreplicate_and_s_bfm_select_runs`
   (`victory-gpu`, on Metal, across the two host waves of a console wave).
 
+A `v_readlane_b32` inside a section that reloads an SGPR the program spilled to a VGPR lane
+(`v_writelane_b32` on every path, `Lower::spill_slot`) is that SGPR, as outside a section, with no
+lane read. The title's pixel programs reload one just before a reduction, and the section's shape
+for it, a read of a constant lane, was refused there ("v_readlane_b32 of a constant lane in a
+pixel program"; 8 pixel shaders in a 26,849-shader corpus, 27 November). Test:
+`emit::gfx_refusal_tests::a_pixel_program_reads_back_a_spilled_sgpr_inside_a_whole_wave_section`.
+
 The simulator keeps the original source lane of a VGPR value through a shuffle. A constant
 `v_readlane_b32` of that value reads the original lane with `WaveReadLaneAt`, or through the
 group-shared exchange when a console wave spans two host waves. Uniform values and whole-wave

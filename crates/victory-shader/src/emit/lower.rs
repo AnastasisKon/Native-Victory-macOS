@@ -1673,6 +1673,11 @@ impl<'a> Lower<'a> {
             Shape::ReadLane(v, lane) if self.section_lanes.contains_key(&(v, lane)) => {
                 return self.section_lanes[&(v, lane)];
             }
+            // A lane only `v_writelane_b32` fills (an SGPR spill reloaded inside the section): the
+            // SGPR written there, with no lane read, as outside a section.
+            Shape::ReadLane(v, lane) if self.spill_slot(v, lane, &mut Vec::new(), false).is_ok() => {
+                return self.spill_slot(v, lane, &mut Vec::new(), true);
+            }
             Shape::ReadLane(v, lane) => {
                 self.cross_lane(false, outside_compute!("v_readlane_b32 of a constant lane"))?;
                 let x = self.i32_of(v)?;

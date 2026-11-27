@@ -2702,6 +2702,26 @@ fn a_pixel_program_reads_back_an_sgpr_spilled_on_two_paths() {
     assert!(l.wave_read_lane_calls.is_empty(), "{:?}", l.wave_read_lane_calls);
 }
 
+/// The same reload inside a whole-wave section (`s_or_saveexec_b32 -1` ... restore): the title's
+/// pixel programs reload a spilled SGPR there, before a reduction. The section's shape for it is
+/// a read of lane 3, which a pixel program cannot make; it is the spilled SGPR, as outside a
+/// section (it was refused as "v_readlane_b32 of a constant lane in a pixel program").
+#[test]
+fn a_pixel_program_reads_back_a_spilled_sgpr_inside_a_whole_wave_section() {
+    let code = [
+        0xBE94_03F2, // s_mov_b32 s20, 1.0
+        0xD761_000E, 0x0001_0614, // v_writelane_b32 v14, s20, 3
+        0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        0xD760_0016, 0x0001_070E, // v_readlane_b32 s22, v14, 3
+        0xBEFE_0302, // s_mov_b32 exec_lo, s2
+        0x7E02_0216, // v_mov_b32 v1, s22
+        0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let l = lower_ps(&code, false, vec![], vec![], 0, 0, vec![], false).expect("lowers");
+    assert!(l.wave_read_lane_calls.is_empty(), "{:?}", l.wave_read_lane_calls);
+}
+
 /// DPP8 in a pixel program stays refused under its own name. No open lowering (#259, #261,
 /// #262) takes it; whether to lower it waits for the op tally of current main on #4.
 #[test]

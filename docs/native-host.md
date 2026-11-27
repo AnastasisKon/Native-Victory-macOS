@@ -640,6 +640,22 @@ a cycle. Of the 9,995 dumped pixel programs, 273 more translate (7,606 to 7,879)
 24 lane-mask joins stay refused (285 before); the vertex corpus is unchanged. Test:
 `emit::gfx_refusal_tests::a_pixel_program_joins_data_an_else_part_clears_with_its_exec`.
 
+A join of SGPR data whose every edge brings copies of one value is that value, whatever edges
+the lanes took (`Lower::copy_leaf`, `copied_number`): the copies followed are `s_mov`, a swap's
+last XOR (`structure::xored_back`) and a spill read back that the structure proved is the same
+value on every path (`restored`). This follows from the instructions alone: a copy keeps every
+bit, so the register holds the one number on each path. With console lanes (compute) a lane mask
+leaf gives its ballot. The 32-lane programs that rotate a value through a mask's register by two
+XOR swaps hit it: the second swap's last XOR gives back the first one's, which the structure
+counts as a mask (it XORed the mask's register), so the copy had no number and the join was
+refused as "a lane mask read as data". Joins of two different values stay refused. On the
+tmi-agent corpus (21,600, `local/pr-stack` 4cd9e726 with the tile-class commits): 9 more
+translate (compute `28a2afab9c479d55`, `825365a94651e7ea`, `9171e6576a99ef14`,
+`b797dd042ea5b43c`, three pixel and two vertex programs), none regress, 3 outputs change (joins
+now numbers: copies of an EXEC mask in `0ef1184e45342d20`, of a constant-buffer dword in two
+vertex programs), and 137 compute programs move on to "a descriptor read only as data". Tests: `gfx_refusal_tests::a_join_of_swapped_copies_of_one_value_is_that_value`,
+`a_join_of_copies_of_two_values_stays_refused`.
+
 In a mesh shader, a uniform branch can skip a block that replaces a scalar mask with a
 vector compare result. At the join each mesh thread uses its group index modulo the console
 wave size to read its bit. Wave64 takes lanes 32–63 from the high dword on the same edge.

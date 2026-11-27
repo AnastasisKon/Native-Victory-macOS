@@ -1419,6 +1419,29 @@ alone, as read from the CPU (a read the reset pass makes meaningless, #258). Wit
 view-stride table (#264) as well, the G-buffer's targets are 11 to 15 % covered in a warm world
 run, against 0 to 8 % before.
 
+## View addresses on the native host (#306)
+
+A shader that reads a buffer view's title address from its descriptor (dwords 0-1, the start of a
+BVH walk), or a texture view's size fields, gets them from the view addresses, the translator's
+root SRV `t1` of the memory space (`victory_shader::emit`, "View addresses"; `HostShader::
+view_addresses`). The native host bound no such table and refused every such program ("needs view
+addresses or write marks"; write marks stay refused, as "needs write marks"). Each resource heap now
+has one (`NativeHost::view_addresses`, `NativeHeap::addresses`): four dwords per title entry, a
+buffer view's title address (dword 0, and the low 16 bits of dword 1), a texture view's size fields
+(`descriptor::texture_words`, the D3D12 path's, now shared), zeros for anything else. It is made
+the first time a shader reads it, from the heap's records as they are then, and kept current by
+every mirrored write (`NativeHost::mirror`). It follows the page table in the argument buffer
+(`Binding::view_addresses`). Cost: 16 bytes an entry of each resource heap a shader reads it
+through (16 MiB for 2^20 entries), made only for those heaps. shortcut: an entry the title copies
+as bytes outside a bound table keeps its old words until it is mirrored, as for the view-stride
+table. Measured offline (27 November): the 7 compute programs of the boot-dumped corpus that #304
+lets translate but the host refused for view addresses now make their Metal pipelines (not run;
+six walk title memory from a view's address, one reads the heap only). Test:
+`heap_tests::a_compute_shader_reads_title_memory_at_a_heap_views_address` (a raw SRV's address read
+from its descriptor, the word there stored to the output; refused before, and with only the
+refusal lifted the converter refused the pipeline: "Resource SRV in space 2 register 1 ... is not
+referenced by the root signature").
+
 ## Descriptor dwords read as data
 
 The console compiler computes sizes from descriptor bits instead of querying them; those fields
@@ -1427,7 +1450,7 @@ were refused as "a descriptor's address or format read as data". That text is no
 colon and the dword: "a buffer's base address (dword 0)", "a buffer's dword 1 (address high
 bits, stride, swizzle)", "a buffer's dword 3 (format and type)", "an image's base address (dword
 0)", "an image's dwords 5 to 7" or "a dword outside the descriptor". Nothing is lowered: the
-native Metal host serves no view addresses or formats to shaders, and would have to first.
+native Metal host serves view addresses (see "View addresses on the native host") but no formats, and would have to first.
 `pipeline::pieces_tests::the_host_refuses_a_descriptor_dword_read_as_data_naming_it`
 (`victory-gpu`) checks the refusal on the native host's own path: the container made from the
 title's pieces, the host's options. The story-load log of issue #110 (Series S) has three

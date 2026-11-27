@@ -85,8 +85,8 @@ pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
     if shader.memory && !memory {
         return Some("reads title memory through the page table in a graphics pipeline");
     }
-    if shader.view_addresses || shader.view_marks {
-        return Some("needs view addresses or write marks");
+    if shader.view_marks {
+        return Some("needs write marks");
     }
     None
 }

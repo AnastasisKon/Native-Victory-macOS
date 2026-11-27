@@ -1138,6 +1138,70 @@ fn a_count_written_earlier_on_the_gpu_limits_the_indirect_dispatches() {
     assert_eq!(out, want);
 }
 
+/// `ExecuteIndirect` recorded as one command ([`NativeList::indirect_records`]) runs what the
+/// records one by one do: dispatch records of 2, 0, 8 and 4 groups (12 bytes apart, or 16 with
+/// padding), with no count or a count of 0 to 4 written on the GPU, leave the same values.
+#[test]
+fn batched_indirect_dispatches_write_what_one_by_one_ones_do() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let (src, dst, records, staged, count) = (0, 16384, 32768, 32896, 32912);
+    pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+    let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+    let groups = [[2u32, 1, 1], [0, 1, 1], [8, 1, 1], [4, 1, 1]];
+    for stride in [12u32, 16] {
+        let mut words = vec![0u32; 16];
+        for (i, g) in groups.iter().enumerate() {
+            words[i * stride as usize / 4..][..3].copy_from_slice(g);
+        }
+        pool.write(records, &words);
+        for counted in [None, Some(0u32), Some(1), Some(2), Some(3), Some(4)] {
+            let out = |batched: bool| {
+                pool.write(dst, &[0u32; N]);
+                pool.write(staged, &[counted.unwrap_or(0)]);
+                pool.write(count, &[0u32]);
+                let mut l = NativeList::default();
+                l.copy_buffer_region(pool.va(count), pool.va(staged), 4);
+                l.set_compute_pipeline(&pso);
+                l.set_compute_root_constants(0, &[5, 7]);
+                l.set_compute_root_view(1, pool.va(src));
+                l.set_compute_root_view(2, pool.va(dst));
+                let before = l.cmds.len();
+                let n = groups.len() as u32;
+                let at = |i: u32| pool.va(records + (i * stride) as usize);
+                if batched {
+                    l.indirect_records(at(0), stride, n, counted.map(|_| pool.va(count)), |l, r, c| match c {
+                        Some((c, i)) => l.dispatch_indirect_counted(r, c, i),
+                        None => l.dispatch_indirect(r),
+                    })
+                    .unwrap();
+                    assert_eq!(l.cmds.len() - before, 1, "one command");
+                } else {
+                    for i in 0..n {
+                        match counted {
+                            Some(_) => l.dispatch_indirect_counted(at(i), pool.va(count), i),
+                            None => l.dispatch_indirect(at(i)),
+                        }
+                        .unwrap();
+                    }
+                }
+                run(&h, &[&l]);
+                pool.read::<u32>(dst, N)
+            };
+            let one_by_one = out(false);
+            let lit = one_by_one.iter().filter(|v| **v != 0).count();
+            let want = match counted {
+                Some(0) => 0,
+                Some(1) | Some(2) => 128,
+                _ => 512,
+            };
+            // Value 0 is 0 * 5 + 7, never 0: every written value counts.
+            assert_eq!(lit, want, "stride {stride} {counted:?}: the per-record path itself");
+            assert_eq!(out(true), one_by_one, "stride {stride} {counted:?}");
+        }
+    }
+}
+
 /// `ExecuteIndirect` of a dispatch: the record is read on the GPU when the dispatch runs, so a copy
 /// earlier in the same list that writes it (as a culling pass would) decides the group count.
 #[test]

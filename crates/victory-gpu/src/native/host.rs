@@ -146,6 +146,23 @@ impl<B: GraphicsBackend> Default for Contract<B> {
     }
 }
 
+// By hand: `B` itself is not `Clone`.
+impl<B: GraphicsBackend> Clone for Prep<B> {
+    fn clone(&self) -> Self {
+        Prep {
+            root: self.root.clone(),
+            ps_root: self.ps_root.clone(),
+            bufs: self.bufs.clone(),
+            vertex: self.vertex.clone(),
+            index: self.index.clone(),
+            blit: self.blit.clone(),
+            indirect: self.indirect.clone(),
+            count: self.count.clone(),
+            heap: self.heap.clone(),
+        }
+    }
+}
+
 /// What one command resolved to: title addresses are made into buffers here, kept alive until the
 /// submission has been handed over.
 struct Prep<B: GraphicsBackend> {
@@ -162,6 +179,15 @@ struct Prep<B: GraphicsBackend> {
     count: Option<(Rc<B::Buffer>, *const u8, u32)>,
     /// The resource heap the work needs in place of the one the title bound (none bound).
     heap: Option<Rc<NativeHeap<B>>>,
+}
+
+/// The bytes of an `ExecuteIndirect` argument record of `cmd`'s kind.
+fn indirect_size<B: GraphicsBackend>(cmd: &Cmd<B>) -> u64 {
+    match cmd {
+        Cmd::Draw { call: DrawCall::Indexed { .. }, .. } => 20,
+        Cmd::Draw { call: DrawCall::Arrays { .. } | DrawCall::Rects, .. } => 16,
+        _ => 12,
+    }
 }
 
 enum Group {
@@ -1044,7 +1070,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         if heap.kind == HeapKind::Resource
             && let Some(strides) = &*heap.strides.borrow()
         {
-            strides.write_at(index, &[self.stride_word(view.as_ref())]);
+            self.write_strides(strides, index, view.as_ref());
         }
         if heap.kind == HeapKind::Resource
             && let Some(addresses) = &*heap.addresses.borrow()
@@ -1145,6 +1171,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 mips,
                 slices,
                 format,
+                min_lod,
             } => {
                 let Some(Res::Texture(tex)) = resources.get(&resource) else {
                     // An evicted texture: made again at the next submission, which writes this
@@ -1183,9 +1210,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                 }),
                             },
                         )?;
-                        self.backend.write_texture(&heap.heap, index, &v, 0.0);
+                        self.backend.write_texture(&heap.heap, index, &v, min_lod);
                     }
-                    _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
+                    _ => self.backend.write_texture(&heap.heap, index, tex, min_lod),
                 }
                 heap.typed_pending.borrow_mut().set(index, false, false);
                 heap.shows(index, Some(resource));
@@ -1545,10 +1572,23 @@ impl<B: GraphicsBackend> NativeHost<B> {
         view.map_or(0, |v| super::descriptors::stride_word(v, &self.resources.borrow()))
     }
 
+    /// Writes entry `index`'s dwords of the view-stride table: its stride, and past the first
+    /// `HEAP_VIEWS` its minimum LOD clamp ([`super::descriptors::min_lod_word`]).
+    fn write_strides(&self, pages: &Pages<B>, index: usize, view: Option<&crate::descriptor::View>) {
+        // Shaders read no index past `HEAP_VIEWS`; the clamps follow there.
+        let views = victory_shader::emit::HEAP_VIEWS as usize;
+        if index < views {
+            pages.write_at(index, &[self.stride_word(view)]);
+            let lod = view.map_or(0, |v| super::descriptors::min_lod_word(v, &self.resources.borrow()));
+            pages.write_at(views + index, &[lod]);
+        }
+    }
+
     /// The view-stride table of `heap` (the translator's root SRV `t255`, which a shader that
     /// takes a buffer view from the resource heap itself looks up before it reads the entry).
     /// One dword for every index a shader can compute (`HEAP_VIEWS`): the buffer view's element
-    /// size at the title's entries, 0 elsewhere (the shader then reads the null buffer view).
+    /// size at the title's entries, 0 elsewhere (the shader then reads the null buffer view); then
+    /// as many for the texture views' minimum LOD clamps (0 elsewhere).
     /// Made at first use from the heap as the title's memory has it now and kept current by
     /// [`Self::mirror`] (also for a bound table's record the title zeroed with stores,
     /// [`Self::remirror_tables`]). shortcut: an entry the title copied or zeroed as bytes outside
@@ -1558,13 +1598,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
             return Ok(made.clone());
         }
         self.write_null_buffers(heap)?;
-        let slots = heap.count.max(victory_shader::emit::HEAP_VIEWS as usize);
-        let pages = Rc::new(Pages::new(&self.backend, slots * 4)?);
+        // A stride, then a LOD clamp, for every index a shader can compute.
+        let pages = Rc::new(Pages::new(&self.backend, victory_shader::emit::HEAP_VIEWS as usize * 8)?);
         let step = Self::step(heap.kind);
         for index in 0..heap.count {
             let view = crate::descriptor::view(heap.start + index as u64 * step);
             if view.is_some() {
-                pages.write_at(index, &[self.stride_word(view.as_ref())]);
+                self.write_strides(&pages, index, view.as_ref());
             }
         }
         *heap.strides.borrow_mut() = Some(pages.clone());
@@ -1938,6 +1978,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
             Some(i) => format!("{r:#x}:f{}:{}x{}@{:#x}", i.format, i.width, i.height, i.memory as usize),
             None => format!("{r:#x}:buf"),
         };
+        // A shader-resource view's minimum LOD clamp (in the resource's mips), and its component
+        // mapping when not the default (the host does not apply one).
+        let clamp = |v: &[u32; 10]| {
+            let map = if v[2] == 0x1688 { String::new() } else { format!(":map{:#x}", v[2]) };
+            match super::descriptors::min_lod(v, 0) {
+                0.0 => map,
+                c => format!(":clamp{c}{map}"),
+            }
+        };
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
             if h.kind != HeapKind::Resource {
@@ -1952,7 +2001,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             for k in 0..n.min(h.count.saturating_sub(*at)) as u64 {
                 match crate::descriptor::view(h.start + (*at as u64 + k) * Self::step(HeapKind::Resource)) {
                     Some(View::Shader(r, desc)) => match texture_info_of(r) {
-                        Some(i) => { keys.push(r); reads.push(format!("{slot}.{k}={}", d(r, Some(i)))); }
+                        Some(i) => { keys.push(r); reads.push(format!("{slot}.{k}={}{}", d(r, Some(i)), desc.as_ref().map(clamp).unwrap_or_default())); }
                         // Named too, so a table entry the host cannot draw from shows in the trace.
                         None => {
                             let buffer = matches!(self.resources.borrow().get(&r), Some(Res::Buffer(..)));
@@ -1965,7 +2014,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     Some(View::Placed(u, res, v)) if res[0] > 1 => {
                         let address = u64::from(v[10]) | u64::from(v[11]) << 32;
-                        let s = format!("{slot}.{k}=placed:{}", d(address as usize, placed_info_of(address, &res)));
+                        let info = placed_info_of(address, &res);
+                        // Named for `PASSTEX` (per-mip contents of formats it does not decode).
+                        if info.is_some() && !u {
+                            keys.push(super::textures::placed_key(address, &res));
+                        }
+                        let s = format!("{slot}.{k}=placed:{}{}", d(address as usize, info), if u { String::new() } else { clamp(v[..10].try_into().unwrap()) });
                         if u { writes.push(s) } else { reads.push(s) }
                     }
                     // A constant buffer view: its address, size and first dwords now (up to 512 bytes).
@@ -2216,6 +2270,26 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
     }
 
+    /// The preparations of records 1 to n - 1 of `cmd` ([`Cmd::Draw::records`]), from `p`, the
+    /// first's: each its own record, resolved as the first's, and count index.
+    fn more_records(&self, cmd: &Cmd<B>, p: &Prep<B>) -> Vec<Result<Prep<B>, String>> {
+        let (Cmd::Draw { indirect: Some(first), count, records: (stride, n), .. }
+        | Cmd::Dispatch { indirect: Some(first), count, records: (stride, n), .. }) = cmd
+        else {
+            return Vec::new();
+        };
+        (1..*n)
+            .map(|i| {
+                let mut q = p.clone();
+                q.indirect = Some(self.resolve(first + u64::from(i) * u64::from(*stride), indirect_size(cmd))?);
+                if let (Some((b, at, _)), Some((_, index))) = (&p.count, count) {
+                    q.count = Some((b.clone(), *at, index + i));
+                }
+                Ok(q)
+            })
+            .collect()
+    }
+
     fn prep(&self, cmd: &Cmd<B>) -> Result<Prep<B>, String> {
         let mut p = Prep {
             root: RootArgs::default(),
@@ -2238,6 +2312,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 threads,
                 indirect,
                 count,
+                ..
             } => {
                 if let Some(a) = indirect {
                     p.indirect = Some(self.resolve(*a, 12)?);
@@ -2284,7 +2359,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 ..
             } => {
                 if let Some(a) = indirect {
-                    p.indirect = Some(self.resolve(*a, match call { DrawCall::Indexed { .. } => 20, DrawCall::Mesh { .. } => 12, DrawCall::Arrays { .. } | DrawCall::Rects => 16 })?);
+                    p.indirect = Some(self.resolve(*a, indirect_size(cmd))?);
                 }
                 if let Some((a, index)) = count {
                     let (b, at) = self.resolve(*a, 4)?;
@@ -2450,8 +2525,24 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         self.note_written(root, pso.binding.as_ref());
                     }
                     cut.push(dropped.drain(..).any(|d| !same(d, c)));
+                    // The other records of an `ExecuteIndirect`: the same preparation, each with
+                    // its own record (and count index), as if recorded one by one.
+                    let more = self.more_records(c, &p);
                     cmds.push(c);
                     preps.push(p);
+                    for q in more {
+                        match q {
+                            Ok(q) => {
+                                cut.push(false);
+                                cmds.push(c);
+                                preps.push(q);
+                            }
+                            Err(e) => {
+                                self.unmapped.set(self.unmapped.get() + 1);
+                                tracing::debug!(error = %e, "native host drops a record at unmapped title memory");
+                            }
+                        }
+                    }
                 }
                 Err(e)
                     if e.ends_with(NEVER_SET)

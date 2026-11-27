@@ -243,6 +243,8 @@ pub struct Title<B: PresentBackend> {
     /// Placed copies another placement covered, given up once nothing uses them
     /// ([`Self::give_up_covered`]).
     pub(super) covered: std::collections::HashSet<usize>,
+    /// The covered copies [`Self::give_up_covered`] has still to check in its current sweep.
+    pub(super) covered_queue: Vec<usize>,
     /// Resource objects whose host texture a placed view names too: its address and key.
     pub(super) shared: HashMap<usize, (u64, usize)>,
     queues: HashMap<usize, Rc<B::Queue>>,
@@ -288,6 +290,7 @@ impl<B: PresentBackend> Title<B> {
             copies_of: HashMap::new(),
             at_memory: HashMap::new(),
             covered: Default::default(),
+            covered_queue: Default::default(),
             queues: HashMap::new(),
             fences: HashMap::new(),
             requested: HashMap::new(),

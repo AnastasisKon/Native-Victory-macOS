@@ -4,8 +4,8 @@
 #
 # usage: tools/macos/verify.sh [quick|full]
 #
-#   quick  the two documented test suites (CONTRIBUTING.md)
-#   full   quick + the CI clippy gate for the Windows target (default)
+#   quick  the test suites: CONTRIBUTING.md's two, and victory-gpu natively
+#   full   quick + cargo xtask policy + the CI clippy gate for the Windows target (default)
 #
 # Prints one PASS/FAIL line per gate and exits non-zero if any gate failed,
 # so a caller (CI, a hook, a human) can gate a pull request on it.

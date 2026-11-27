@@ -32,7 +32,11 @@ pub fn record_free(addr: u64, len: u64) {
         return;
     }
     let serial = SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
-    let mut spans = FREED.lock().unwrap_or_else(|e| e.into_inner());
+    freed(&mut FREED.lock().unwrap_or_else(|e| e.into_inner()), addr, len, serial);
+}
+
+/// Adds the freed span `[addr, addr + len)` to `spans`, kept by start address.
+fn freed(spans: &mut Vec<(u64, u64, u64)>, addr: u64, len: u64, serial: u64) {
     let at = spans.partition_point(|&(start, _, _)| start < addr);
     spans.insert(at, (addr, len, serial));
 }
@@ -43,8 +47,12 @@ pub fn record_alloc(addr: u64, len: u64) {
     if len == 0 || !tracing_on() {
         return;
     }
+    alloc(&mut FREED.lock().unwrap_or_else(|e| e.into_inner()), addr, len);
+}
+
+/// Takes `[addr, addr + len)` out of the freed `spans`, leaving the freed ends beside it.
+fn alloc(spans: &mut Vec<(u64, u64, u64)>, addr: u64, len: u64) {
     let end = addr + len;
-    let mut spans = FREED.lock().unwrap_or_else(|e| e.into_inner());
     let mut at = 0;
     while at < spans.len() {
         let (start, length, serial) = spans[at];
@@ -72,65 +80,40 @@ pub fn check(addr: u64, len: u64, what: &str) {
         return;
     }
     let spans = FREED.lock().unwrap_or_else(|e| e.into_inner());
-    for &(start, length, serial) in spans.iter() {
-        if start < addr + len && start + length > addr {
-            tracing::warn!(
-                serial,
-                freed = format_args!("{start:#x}+{length:#x}"),
-                asked = format_args!("{addr:#x}+{len:#x}"),
-                "{what}: title memory the allocator has freed"
-            );
-        }
+    for (start, length, serial) in overlapping(&spans, addr, len) {
+        tracing::warn!(
+            serial,
+            freed = format_args!("{start:#x}+{length:#x}"),
+            asked = format_args!("{addr:#x}+{len:#x}"),
+            "{what}: title memory the allocator has freed"
+        );
     }
+}
+
+/// The spans of `spans` that overlap `[addr, addr + len)`.
+fn overlapping(spans: &[(u64, u64, u64)], addr: u64, len: u64) -> Vec<(u64, u64, u64)> {
+    spans
+        .iter()
+        .filter(|&&(start, length, _)| start < addr + len && start + length > addr)
+        .copied()
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    /// The spans that overlap `[addr, addr + len)`.
-    fn overlapping(spans: &[(u64, u64, u64)], addr: u64, len: u64) -> Vec<(u64, u64, u64)> {
-        spans
-            .iter()
-            .filter(|&&(start, length, _)| start < addr + len && start + length > addr)
-            .copied()
-            .collect()
-    }
+    use super::overlapping;
 
-    /// The table only notes while `VICTORY_TRACE_FREED` is on; the tests
-    /// work on the spans directly.
-    fn spans(list: &[(u64, u64, u64)]) -> Vec<(u64, u64, u64)> {
-        list.to_vec()
-    }
-
-    /// A freed span joins the table by start address.
+    /// The real table only notes while `VICTORY_TRACE_FREED` is on; the tests drive its
+    /// functions on a list of their own.
     fn freed(list: &[(u64, u64, u64)], addr: u64, len: u64, serial: u64) -> Vec<(u64, u64, u64)> {
-        let mut spans = spans(list);
-        let at = spans.partition_point(|&(start, _, _)| start < addr);
-        spans.insert(at, (addr, len, serial));
+        let mut spans = list.to_vec();
+        super::freed(&mut spans, addr, len, serial);
         spans
     }
 
-    /// The allocator hands `[addr, addr + len)` out again.
     fn alloc(list: &[(u64, u64, u64)], addr: u64, len: u64) -> Vec<(u64, u64, u64)> {
-        let mut spans = spans(list);
-        let end = addr + len;
-        let mut at = 0;
-        while at < spans.len() {
-            let (start, length, serial) = spans[at];
-            if start >= end || start + length <= addr {
-                at += 1;
-                continue;
-            }
-            spans.remove(at);
-            if start < addr {
-                spans.insert(at, (start, addr - start, serial));
-                at += 1;
-            }
-            if start + length > end {
-                let left = start + length - end;
-                spans.insert(at, (end, left, serial));
-                at += 1;
-            }
-        }
+        let mut spans = list.to_vec();
+        super::alloc(&mut spans, addr, len);
         spans
     }
 

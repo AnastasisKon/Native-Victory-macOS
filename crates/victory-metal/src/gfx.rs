@@ -1255,13 +1255,13 @@ impl GraphicsBackend for Metal {
         made.map(|made| made.and_then(|(pso, mesh)| self.finish_render(d, pso, mesh))).transpose()
     }
 
-    fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
+    fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), SubmitFailure> {
         if self.trace_fails {
             report_in_flight();
             self.trace_enc.borrow_mut().clear();
             self.trace_args.borrow_mut().clear();
         }
-        let mut cb = self.new_command_buffer(queue)?;
+        let mut cb = self.new_command_buffer(queue).map_err(SubmitFailure::uncommitted)?;
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut label = String::new();
         if self.trace_fails {
@@ -1299,8 +1299,10 @@ impl GraphicsBackend for Metal {
         // A pass that cannot be encoded must not take the submission's fence signals and
         // bottom-of-pipe value writes with it: the title's compute queues wait for those writes,
         // and a lost one is `Unsignaled CrossQueueBarrier` (the title then dies). The failing pass
-        // is dropped, the command buffer still commits, and the caller is told.
-        let mut refused: Option<String> = None;
+        // is dropped, the command buffer still commits, and the caller is told which passes were
+        // dropped, so it can pay only their lost work.
+        let mut refused: Vec<usize> = Vec::new();
+        let mut first_error: Option<String> = None;
         let mut attached_heaps = Vec::new();
         // A submission's passes can go in command buffers of at most `passes_per_buffer` passes
         // (`VICTORY_PASSES_PER_BUFFER`; default 0: all in one). macOS stops a command buffer that
@@ -1313,7 +1315,7 @@ impl GraphicsBackend for Metal {
         // later pieces still run and nothing is paid twice.
         let per = self.passes_per_buffer;
         let pieces = if per > 0 && work.passes.len() > per {
-            Some(track_event(self.dev.newSharedEvent().ok_or("newSharedEvent failed")?))
+            Some(track_event(self.dev.newSharedEvent().ok_or_else(|| SubmitFailure::uncommitted("newSharedEvent failed"))?))
         } else {
             None
         };
@@ -1336,8 +1338,9 @@ impl GraphicsBackend for Metal {
                 // A pass that cannot be encoded (a render target with no attachments, a piece
                 // whose root arguments were never set) is dropped; the passes after it still run,
                 // so one bad pass does not cost the frame's whole picture.
-                if refused.is_none() {
-                    refused = Some(e);
+                refused.push(n);
+                if first_error.is_none() {
+                    first_error = Some(e);
                 }
             }
             if let Some(event) = &pieces
@@ -1354,7 +1357,19 @@ impl GraphicsBackend for Metal {
                 });
                 self.commit_piece(queue, &cb, owed, piece, tinfo);
                 first = n + 1;
-                cb = self.next_piece(queue, work.waits, &mut attached_heaps, Some((&**event, piece)))?;
+                cb = match self.next_piece(queue, work.waits, &mut attached_heaps, Some((&**event, piece))) {
+                    Ok(cb) => cb,
+                    Err(e) => {
+                        // The current piece never started: every pass from `first` on was lost,
+                        // and the earlier pieces did commit.
+                        refused.extend(first..work.passes.len());
+                        return Err(SubmitFailure {
+                            committed: true,
+                            refused,
+                            error: e,
+                        });
+                    }
+                };
                 if self.trace_fails {
                     let piece = format!("{label} piece {}", piece + 1);
                     cb.setLabel(Some(&objc2_foundation::NSString::from_str(&piece)));
@@ -1417,8 +1432,12 @@ impl GraphicsBackend for Metal {
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
         cb.commit();
         self.committed.set(self.committed.get() + 1);
-        match refused {
-            Some(e) => Err(e),
+        match first_error {
+            Some(e) => Err(SubmitFailure {
+                committed: true,
+                refused,
+                error: e,
+            }),
             None => Ok(()),
         }
     }

@@ -1061,6 +1061,33 @@ four minutes, 21 world frames each) had no failed command buffer. That is fewer 
 set-mode runs reached before stalling (31 and 54), so it does not show that per-encoder naming
 survives pressure better.
 
+#### A refused submission still pays its value writes
+
+Observed on 16 GB Macs (tester reports #265 and #280): after Metal failed command buffers with
+`kIOGPUCommandBufferCallbackErrorOutOfMemory`, queues stayed held on their per-frame barrier words
+(`work held for a wait that does not hold`: `0x18437f9d8 cmp 7 ref 0x883 ... now Some(2178)`), the
+frame rate decayed to 0.4 fps and the title's watchdog ended the run (`0xc0000005` at
+`image+0x55e56f8`). A pass `submit_passes` cannot encode is dropped while the command buffer still
+commits, so the fills of the dropped pass never run and nothing paid them; a piece refused before a
+command buffer exists at all loses them the same way.
+
+Now: `submit_passes` reports what it lost (`victory_backend::resources::SubmitFailure`): whether the
+command buffer committed, and which pass indices were dropped from it. When the call in
+`NativeHost::execute` returns an error, the host makes only the lost passes' fills on the CPU, in
+order, with a release fence after them (`crates/victory-gpu/src/native/host.rs`), and warns the first
+time (`native host pays a lost pass's value writes on the CPU`). A committed submission's kept passes
+still run on the GPU: paying their fills too would let a waiting queue go on before this queue's
+earlier GPU passes have run, and the GPU's own later fill could overwrite a newer value the title
+wrote after seeing the CPU write. What a waiting queue can read early from a paid fill is nothing
+harmful: the fill is a plain store of the word range into coherent title memory plus a release
+fence, so a queue polling the barrier word reads the old value (keeps waiting) or the filled one; a
+partial multi-word fill just means it waits on the next word. The hazard closed is the opposite:
+the word staying 0 forever after a refused submission, which held the queue for good. Host policy,
+not console behaviour, like the recoveries above: the console has no refused submissions. Tests:
+`vertex_tests::a_submission_that_never_committed_pays_its_value_writes_on_the_cpu`,
+`vertex_tests::only_the_fills_of_refused_passes_are_paid_on_the_cpu` and
+`vertex_tests::a_submitted_piece_leaves_its_value_writes_to_the_gpu`.
+
 #### A pass refused mid-encoding ends its encoder
 
 `submit_passes` refuses a pass it cannot encode and still encodes the passes after it. A refusal after the pass's encoder was opened (a counted record whose gate fails, an indexed indirect draw without an index buffer) now ends that encoder first; it used to leave it open, and Metal aborted the process (`A command encoder is already encoding to this command buffer`) when the next pass opened its own.

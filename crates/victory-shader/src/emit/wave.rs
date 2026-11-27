@@ -378,11 +378,14 @@ std::thread_local! {
     pub(super) static SIMULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Each VGPR value's lanes, each SGPR value, and the first step not modelled.
+type Simulated = (HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>, Option<&'static str>);
+
 fn simulate(
     insts: &[Inst],
     wave: u32,
     saved: Value,
-) -> (HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>, Option<&'static str>) {
+) -> Simulated {
     #[cfg(test)]
     SIMULATIONS.set(SIMULATIONS.get() + 1);
     let mut why = None;

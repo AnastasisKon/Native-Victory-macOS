@@ -1815,3 +1815,160 @@ fn an_image_whose_width_bits_in_dword_1_are_0_is_no_null_descriptor() {
     assert_eq!(f.get(0x2_0000, 1), [1], "a view, not a null descriptor");
     drop(records);
 }
+
+/// A pixel shader that indexes `ResourceDescriptorHeap` directly (`s2`, so `dwords == 0`,
+/// `views.is_empty()`, `!memory`) and queries a texture's dimensions from its image descriptor
+/// (`view_addresses == true`) still keeps its own `ps` binding on `Title::make_render`, rather
+/// than falling back to the vertex shader's `root` bytes at fragment `buffer(2)` (#410).
+#[test]
+fn a_pixel_shader_with_only_view_addresses_gets_its_own_fragment_root() {
+    let mut vs_words = vec![
+        // Read s4 so the vertex shader keeps its 2-dword root-constant block (`0xDEAD_BEEF` x 2).
+        0x8708_8004, // s_and_b32 s8, s4, 0 (reads s4; 0)
+    ];
+    vs_words.extend_from_slice(&COVER[..7]);
+    vs_words.extend_from_slice(&[
+        0x7E08_0208, // v_mov_b32 v4, s8 (z = 0.0 when s4 == 0xdeadbeef)
+        0x7E0C_02F2, // v_mov_b32 v6, 1.0
+        0xF800_08CF, 0x0604_0302, // exp pos0 v2, v3, v4, v6 done
+        0xBF81_0000, // s_endpgm
+    ]);
+    let mut vs_meta = [0u8; 0x30];
+    vs_meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    vs_meta[0x10] = 0x41;
+    vs_meta[0x14] = 2; // Root constants in slot 0 at user data 4 (`s4..s5`).
+    vs_meta[0x24..0x26].copy_from_slice(&[2, 4]);
+    let vs_bytes: Vec<_> = vs_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let vs = shaders::translate(
+        &victory_shader::emit::graphics::container(HwStage::Vs, &vs_bytes, &vs_meta).unwrap(),
+    )
+    .unwrap();
+    assert!(vs.user_data_dwords() > 0);
+
+    // Samples entry 0 (`0x0`) from `ResourceDescriptorHeap` in `s2` (so `s2` is inferred as the
+    // resource heap with `dwords == 0`) AND loads entry 1's (`0x20`) 8-dword image descriptor
+    // purely to extract its width and height through `view_addresses` (`t1, space3`).
+    const PS_IMAGE_SIZE: &[u32] = &[
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF40C_0401, 0xFA00_0000, // s_load_dwordx8 s[16:23], s[2:3], 0x0
+        0xF40C_0101, 0xFA00_0020, // s_load_dwordx8 s[4:11], s[2:3], 0x20
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF000_1F08, 0x0004_0600, // image_load v[6:9], v[0:1], s[16:23] dmask:0xf dim:2D unorm
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x870C_FF05, 0xC000_0000, // s_and_b32 s12, s5, 0xc0000000
+        0x900C_9E0C, // s_lshr_b32 s12, s12, 30
+        0x870D_FF06, 0x0000_3FFF, // s_and_b32 s13, s6, 0x3fff
+        0x8F0D_820D, // s_lshl_b32 s13, s13, 2
+        0x880C_0D0C, // s_or_b32 s12, s12, s13
+        0x800C_810C, // s_add_u32 s12, s12, 1 (width)
+        0x870E_FF06, 0x3FFF_C000, // s_and_b32 s14, s6, 0x3fffc000
+        0x900E_8E0E, // s_lshr_b32 s14, s14, 14
+        0x800E_810E, // s_add_u32 s14, s14, 1 (height)
+        0x7E04_0C0C, // v_cvt_f32_u32_e32 v2, s12
+        0x7E06_0C0E, // v_cvt_f32_u32_e32 v3, s14
+        0x1004_04FF, 0x3B80_8081, // v_mul_f32_e32 v2, 1/255, v2
+        0x1006_06FF, 0x3B80_8081, // v_mul_f32_e32 v3, 1/255, v3
+        0x7E0A_02F2, // v_mov_b32_e32 v5, 1.0
+        0xF800_180F, 0x0508_0302, // exp mrt0 v2, v3, v8, v5 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let ps = translate(HwStage::Ps, PS_IMAGE_SIZE);
+    assert!(
+        ps.view_addresses
+            && !ps.memory
+            && ps.user_data_dwords() == 0
+            && ps.root_cbvs.is_empty()
+            && ps.root_srvs.is_empty()
+            && ps.root_uavs.is_empty(),
+        "{ps:?}"
+    );
+
+    let Some(mut t) = title() else { return };
+    let records = vec![0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    // Entry 0: 1x1 RGBA8 texture `[0, 0, 200, 255]` sampled by `image_load`.
+    let tex0 = t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap();
+    t.host.backend.upload_texture(&tex0, 0, 0, &[0, 0, 200, 255], 4, 0);
+    let res_iid = crate::object::guid(
+        0x696442be,
+        0xa72e,
+        0x4059,
+        [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+    );
+    let tex0_words = [3u32, 0, 0, 0, 1, 0, 1, 1 | 1 << 16, 28, 1, 0, 1, 0, 0];
+    let mut tex0_obj = std::ptr::null();
+    assert_eq!(
+        crate::resource::create_at_address(
+            std::ptr::null(),
+            0x1_0000,
+            tex0_words.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &res_iid,
+            &mut tex0_obj,
+        ),
+        0,
+    );
+    t.host.register_texture(tex0_obj as usize, &tex0);
+    let mut srv0 = [0u32; 10];
+    (srv0[0], srv0[1], srv0[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), tex0_obj, &srv0, start);
+    assert!(t.host.mirror(start).unwrap());
+    // Entry 1: 13x7 RGBA8 2D texture view (`start + 32`).
+    let tex1 = t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 13, 7)).unwrap();
+    let tex1_words = [3u32, 0, 0, 0, 13, 0, 7, 1 | 1 << 16, 28, 1, 0, 1, 0, 0];
+    let mut tex1_obj = std::ptr::null();
+    assert_eq!(
+        crate::resource::create_at_address(
+            std::ptr::null(),
+            0x2_0000,
+            tex1_words.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &res_iid,
+            &mut tex1_obj,
+        ),
+        0,
+    );
+    t.host.register_texture(tex1_obj as usize, &tex1);
+    crate::descriptor::create_srv(std::ptr::null(), tex1_obj, &srv0, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "ps view_addresses") else {
+        panic!("{:?}", t.shaders);
+    };
+    assert!(
+        binding.as_ref().and_then(|b| b.ps.as_ref()).is_some_and(|p| p.view_addresses),
+        "ps_binding must be preserved when view_addresses is true"
+    );
+
+    let mut rt_desc = TextureDesc::d2(Format::Rgba8Unorm, 4, 4);
+    rt_desc.render_target = true;
+    let rt = t.host.texture(&rt_desc).unwrap();
+    let mut list = NativeList::default();
+    list.set_render_targets(std::slice::from_ref(&rt), None);
+    list.clear_render_target(&rt, [0.0; 4]);
+    list.set_heaps(Some(&heap), None);
+    list.set_graphics_pipeline(&pso, Topology::Triangles);
+    list.set_graphics_binding(binding);
+    // Non-pointer sentinel in vertex root slot 0: would GPU-fault if bound as fragment `t1`.
+    list.set_graphics_root_constants(0, &[0xDEAD_BEEF, 0xDEAD_BEEF]);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    super::run(&t.host, &[&list]);
+
+    let mut px = [0u8; 4 * 4 * 4];
+    t.host.backend.read_texture(&rt, 0, 0, &mut px, 16, 0);
+    assert!(
+        px.chunks(4).all(|c| c == [13, 7, 200, 255]),
+        "expected [13, 7, 200, 255], got {:?}",
+        &px[..4]
+    );
+    for obj in [tex0_obj, tex1_obj] {
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(obj, 0x10)(obj);
+    }
+    drop(records);
+}

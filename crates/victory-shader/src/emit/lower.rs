@@ -992,6 +992,9 @@ impl<'a> Lower<'a> {
                 }
                 if halves {
                     once = if one_wave { wave_blocks(p, x.st) } else { once_blocks(p) };
+                    for (o, at_barrier) in once.iter_mut().zip(barrier_blocks(p)) {
+                        *o |= at_barrier;
+                    }
                     s.xchg_dwords = lanes.next_multiple_of(64);
                 }
             } else if console_lanes || one_wave && s.lds_dwords > 0 && !fits {
@@ -14306,6 +14309,33 @@ pub(crate) fn once_blocks(p: &Program) -> Vec<bool> {
                     .enumerate()
                     .any(|(q, &r)| r && succ(q).is_empty());
             !reach(b, false, None)[b] && !ends_around
+        })
+        .collect()
+}
+
+/// Blocks outside any cycle that hold one of the title's own `s_barrier`s. The console's barrier
+/// waits for every wave of the group that has not ended, so the title brings every live wave
+/// there together, and the host lowers it to a group barrier on that same promise: an exchange
+/// between host waves in such a block is reached by the same threads, once (the G-buffer culling
+/// shaders' whole-wave OR in groups of two console waves, whose culled waves end early).
+pub(crate) fn barrier_blocks(p: &Program) -> Vec<bool> {
+    let n = p.blocks.len();
+    (0..n)
+        .map(|b| {
+            if !p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier") {
+                return false;
+            }
+            let mut seen = vec![false; n];
+            let mut stack = p.blocks[b].exit.successors();
+            while let Some(x) = stack.pop() {
+                if x == b {
+                    return false;
+                }
+                if !std::mem::replace(&mut seen[x], true) {
+                    stack.extend(p.blocks[x].exit.successors());
+                }
+            }
+            true
         })
         .collect()
 }

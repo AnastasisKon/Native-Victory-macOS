@@ -1942,8 +1942,9 @@ mod state {
     pub(super) use super::dispatch;
     pub(super) use super::draw;
     pub(super) use super::draw as draw_indexed;
-    pub(super) use super::dropped_mesh as dispatch_mesh;
-    pub(super) use super::dropped_mesh_x as dispatch_mesh_x;
+    use super::This;
+    pub(super) extern "system" fn dispatch_mesh(_: This, _: u32, _: u32, _: u32) {}
+    pub(super) extern "system" fn dispatch_mesh_x(_: This, _: u32, _: u64, _: u64, _: u64) {}
     pub(super) use super::ignored_state as blend_factor;
     pub(super) use super::ignored_state as clear_unordered_float;
     pub(super) use super::ignored_state as clear_unordered_uint;

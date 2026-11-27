@@ -1265,8 +1265,18 @@ impl<B: PresentBackend> Title<B> {
         for key in self.host.take_wanted() {
             self.realize(key);
         }
+        let timed = super::glue::lock_traced();
+        let phase = |i: usize, since: std::time::Instant| {
+            if timed {
+                super::glue::SYNC_PHASES[i].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            std::time::Instant::now()
+        };
+        let t = std::time::Instant::now();
         self.keep_to_budget();
+        let t = phase(1, t);
         self.give_up_covered();
+        phase(2, t);
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
         // a time budget so world streaming (thousands of blank textures) never stalls submissions;
@@ -1278,6 +1288,7 @@ impl<B: PresentBackend> Title<B> {
         let hot = std::time::Instant::now();
         let until = budget.map(|budget| hot + budget);
         probe_round(&mut self.textures, &mut self.blank_keys, &mut self.blank_cursor, until, None, &mut self.probe_buf, &mut dirty);
+        phase(3, started);
         if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
             SyncCost { probe: [hot - started, hot.elapsed()], hot: self.hot_keys.len() as u64, ..Default::default() }.log();
         }
@@ -1729,10 +1740,14 @@ impl<B: PresentBackend> Title<B> {
         }
         // shortcut: a record changed after this read (before held work is encoded) still gets the
         // cleared entry and `take_wanted`; reading again at encoding needs the title's state there.
+        let since = std::time::Instant::now();
         let held: Vec<Rc<NativeList<B>>> = self.held.segments().cloned().collect();
         let mut all: Vec<&NativeList<B>> = lists.collect();
         all.extend(held.iter().map(|l| &**l));
         let named = self.host.resources_named(all.into_iter());
+        if super::glue::lock_traced() {
+            super::glue::SYNC_PHASES[0].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         for &key in &named {
             if self.host.is_evicted(key) {
                 self.realize(key);

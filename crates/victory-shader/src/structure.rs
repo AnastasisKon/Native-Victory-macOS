@@ -877,7 +877,58 @@ impl<'a> Lanes<'a> {
                 self.when[b] = Some(w);
             }
         }
+        self.exec_copies_at_joins();
         (execs, kill_lanes)
+    }
+
+    /// A register joined at a block entry that takes EXEC's own incoming value on every edge
+    /// (a copy of it, or the same result written to both) holds exactly the lanes that arrive,
+    /// as EXEC there does: a structurized loop's "lanes still looping", which the compiler keeps
+    /// beside EXEC and tests with `s_andn2_b64 s, s, exec` for its exit. It is that mask, and a
+    /// ballot at the block gives it.
+    fn exec_copies_at_joins(&mut self) {
+        let p = self.p;
+        let same = |a: Value, e: Value, reg: Reg| -> bool {
+            if a == e {
+                return true;
+            }
+            let Some(&(b, i)) = self.defs.get(&a) else { return false };
+            let inst = &p.blocks[b].insts[i];
+            // `s_mov` of EXEC: the copy reads the incoming value itself.
+            let copy = matches!(inst.name(), "s_mov_b64" | "s_mov_b32") && inst.read(reg) == Some(e);
+            // `s_*_wrexec_b64`: the destination and EXEC get the same result.
+            let both = inst.name().contains("_wrexec_") && inst.write(reg) == Some(e);
+            copy || both
+        };
+        let mut found = Vec::new();
+        for b in 0..p.blocks.len() {
+            let phis = &p.blocks[b].phis;
+            let find = |r: Reg| phis.iter().find(|ph| ph.reg == r);
+            let Some(elo) = find(Reg::S(EXEC)) else { continue };
+            let ehi = if p.wave64 { find(Reg::S(EXEC + 1)) } else { Some(elo) };
+            let Some(ehi) = ehi else { continue };
+            let exec = (elo.value, ehi.value);
+            for lo in phis {
+                let Reg::S(code) = lo.reg else { continue };
+                if code == EXEC || code == EXEC + 1 || (p.wave64 && code % 2 == 1) {
+                    continue;
+                }
+                let hi = if p.wave64 { find(Reg::S(code + 1)) } else { Some(lo) };
+                let Some(hi) = hi else { continue };
+                let all = (0..lo.args.len()).all(|n| {
+                    same(lo.args[n], elo.args[n], Reg::S(EXEC))
+                        && (!p.wave64 || same(hi.args[n], ehi.args[n], Reg::S(EXEC + 1)))
+                });
+                if all && lo.args.len() == elo.args.len() {
+                    found.push(((lo.value, hi.value), exec));
+                }
+            }
+        }
+        for (k, exec) in found {
+            let m = self.mask(exec).0;
+            self.masks.insert(k, m);
+            self.active.insert(k.0);
+        }
     }
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.

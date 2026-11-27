@@ -10842,6 +10842,27 @@ impl<'a> Lower<'a> {
                                 .filter(|&&(pb, _)| pb == b)
                                 .map(|&(_, pi)| &blk.phis[pi]);
                             let exec = joined.map_or(exec, |ph| ph.args[n]);
+                            // The edge a `s_cbranch_execz` takes (`s_cmp_eq_u64 exec, 0` and
+                            // `s_cbranch_scc1` in the IR) brings that EXEC empty: a mask ANDed with
+                            // it keeps no lane, whatever the join brings there.
+                            let q = blk.preds[n];
+                            let insts = &p.blocks[q].insts;
+                            if keeps_exec
+                                && let Exit::Branch { taken, .. } = p.blocks[q].exit
+                                && taken == b
+                                && let [.., cmp, branch] = &insts[..]
+                                && branch.name() == "s_cbranch_scc1"
+                                // In a wave64 program `s_cmp_eq_u32 exec_lo, 0` sees only the low
+                                // half: the high lanes may still be in EXEC there.
+                                && matches!((cmp.name(), p.wave64), ("s_cmp_eq_u64", _) | ("s_cmp_eq_u32", false))
+                                && cmp.write(Reg::Scc).is_some()
+                                && branch.read(Reg::Scc) == cmp.write(Reg::Scc)
+                                && cmp.read(Reg::S(EXEC)) == Some(exec)
+                                && matches!(&cmp.fields, Fields::Sop { src, .. }
+                                    if src.get(1).copied().and_then(scalar_constant) == Some(0))
+                            {
+                                return true;
+                            }
                             let Some(&m) = st.masks.get(&exec) else { return false };
                             let mut lanes = self.lane_edge(blk.preds[n], b);
                             lanes.push((m, keeps_exec));
@@ -14243,6 +14264,12 @@ impl<'a> Lower<'a> {
                 };
                 let x = match (mask, self.vals.get(&arg)) {
                     (Some(m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                    // Read only ANDed with an EXEC those lanes are not in, or not read at all
+                    // but by joins that do not need it: any bit will do, so what the edge brings
+                    // (data, or a value not made) is not needed, not even as a number.
+                    (None, _) if self.unneeded_edges().contains(&(phi.value, n)) => {
+                        self.s.m.bool(false)
+                    }
                     (None, Some(&Val::I32(word))) if number => {
                         let hi = if self.x.native.wave64 {
                             match high.and_then(|h| self.vals.get(&h.args[n])) {
@@ -14255,12 +14282,6 @@ impl<'a> Lower<'a> {
                         self.lane_bit(qb, word, hi)
                     }
                     (None, _) if !uniform && self.no_mask_lane_on_edge(b, &phi.args, n) => {
-                        self.s.m.bool(false)
-                    }
-                    // Read only ANDed with an EXEC those lanes are not in, or not read at all
-                    // but by joins that do not need it: any bit will do, so what the edge brings
-                    // (data, or a value not made) is not needed.
-                    (None, _) if self.unneeded_edges().contains(&(phi.value, n)) => {
                         self.s.m.bool(false)
                     }
                     // A lane function the structure knows though no mask tracks it (a constant,

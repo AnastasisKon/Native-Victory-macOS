@@ -13,9 +13,44 @@ const LIMIT: usize = 16_384;
 /// New first binds between two writes of the list: a run the watchdog ends loses at most these.
 const WRITE_EVERY: usize = 64;
 
-/// Workers in the pool: all cores but two (the title's render thread and one more).
+/// Workers in the pool: the performance cores but two (the title's render thread and one more),
+/// at least two; `cores` (all of them) where the kinds of core are not known. On a cold cache a
+/// pool of all cores but two (16 on an 18-core M5 Max) took the cores the title's frames need: the
+/// boot movie and menus dropped about 216 frames in 50 s, against about 54 with 4 workers, and the
+/// world still loaded (late shaders are put off, `glue::put_off`).
 pub(crate) fn pool_size(cores: usize) -> usize {
-    cores.saturating_sub(2).max(1)
+    pool_for(cores, performance_cores())
+}
+
+/// [`pool_size`] given the core counts.
+fn pool_for(cores: usize, performance: Option<usize>) -> usize {
+    let fast = performance.unwrap_or(cores).min(cores);
+    fast.saturating_sub(2).max(2).min(cores).max(1)
+}
+
+/// The performance cores (`hw.perflevel0.physicalcpu`), on macOS.
+fn performance_cores() -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn sysctlbyname(
+                name: *const std::ffi::c_char,
+                old: *mut std::ffi::c_void,
+                old_len: *mut usize,
+                new: *mut std::ffi::c_void,
+                new_len: usize,
+            ) -> i32;
+        }
+        let mut n: i32 = 0;
+        let mut len = std::mem::size_of::<i32>();
+        // SAFETY: a documented sysctl name and an int-sized output.
+        let ok = unsafe {
+            sysctlbyname(c"hw.perflevel0.physicalcpu".as_ptr(), (&raw mut n).cast(), &mut len, std::ptr::null_mut(), 0)
+        } == 0;
+        (ok && n > 0).then_some(n as usize)
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 /// How long a frame may run, from its first new host pipeline, before pipelines whose shaders
@@ -233,11 +268,14 @@ mod tests {
     }
 
     #[test]
-    fn the_pool_leaves_two_cores() {
-        assert_eq!(pool_size(18), 16);
-        assert_eq!(pool_size(8), 6);
-        assert_eq!(pool_size(2), 1);
-        assert_eq!(pool_size(1), 1);
+    fn the_pool_is_the_performance_cores_but_two() {
+        // The performance cores but two, at least two: 4 of an M5 Max's 6, 2 of an M1's 4.
+        assert_eq!(pool_for(18, Some(6)), 4);
+        assert_eq!(pool_for(8, Some(4)), 2);
+        // Kinds of core unknown: all cores but two.
+        assert_eq!(pool_for(8, None), 6);
+        assert_eq!(pool_for(2, None), 2);
+        assert_eq!(pool_for(1, None), 1);
     }
 
     #[test]

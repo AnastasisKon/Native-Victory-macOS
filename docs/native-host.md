@@ -2098,6 +2098,29 @@ The earlier pieces are committed as they fill: each gets the submission's waits 
 
 What a submission owes if the GPU fails it (`Owed`: its bottom-of-pipe value writes, its fence signals, the queue's order event) is split among its pieces. Each piece owes the value writes of its own passes and ends by raising the submission's piece event to its number; the next piece waits for that value. The last piece owes the fence signals and the order event too. A piece the GPU fails pays its own share on the CPU, once (the writes, then the event), so the next piece still runs, the later pieces' writes and signals come from the GPU, and nothing is paid twice. Each piece is in flight on its own (`recover_lost` pays one Metal never reports on, which also lets the next piece go). Guess: a failed piece does not raise the piece event itself; if Metal did run that signal, the next piece could start before the CPU has written the failed piece's values. Tests: `owed_tests::a_long_submission_is_cut_into_command_buffers_of_at_most_n_passes`, `owed_tests::a_failed_earlier_piece_pays_its_own_writes_and_the_later_pieces_still_run` (the test drops the first piece's command buffer, as the GPU would fail it: no real GPU failure is made), `heap_set_tests::the_next_piece_of_a_split_submission_attaches_the_heaps_again`.
 
+### The G-buffer's shards: a mesh program's first-lane read was each host wave's (#517)
+
+With the world drawing, the G-buffer held long fans and sheets on every kind of mesh geometry
+(characters, cars, buildings): some triangles right, others spread from a point. They were there
+before lighting. The common G-buffer mesh programs are wave64 NGG groups of 128 threads, and their
+threads are console lanes (`lane_index_at`), so each 32-lane host wave is half a console wave.
+They take wave-wide values with `v_readfirstlane_b32` (7 to 10 per program), several from values
+that differ per lane: meshlets packed several to a group give each lane its own meshlet's vertex
+and primitive counts. That lowered to `waveReadLaneFirst`, the host wave's own first lane, so lanes
+32 to 63 of each console wave read lane 32's value, not lane 0's, and built their vertices and
+primitives from the wrong meshlet.
+
+A wave64 mesh program's `v_readfirstlane_b32` now reads the console wave's first active lane where
+every thread runs the block once (`once_blocks`): each host wave finds its own first lane on and
+that lane's value, its lane 0 stores the value and its lane 1 whether any lane was on, and after a
+group barrier every thread takes the lower half's value if it had a lane on, else the upper half's
+(`mesh_first_lane`, `halves.rs`; the same exchange #302 proposes for compute). Elsewhere the read
+stays per host wave. Cost: two group barriers and 4 bytes of group-shared memory per thread.
+Test: `export_tests::a_wave64_mesh_programs_first_lane_read_is_its_console_waves`. Over the
+21,579-shader corpus nothing is newly refused or newly translated, and the output of 6,959 vertex
+(mesh) programs changes. On an M3 Max (Series X, preview `b3c1a1b0`, `VICTORY_GUESS_GRAPHICS=1`),
+G-buffer dumps from 140 to 290 s show no fans, where every run before had them.
+
 ## Zero-count dispatches, draws and buffer blits
 
 D3D12 treats zero-sized dispatches (`Dispatch`, `DispatchX` with thread counts), draws with zero

@@ -1939,10 +1939,10 @@ mod state {
 /// Without a host GPU every draw state call is ignored.
 #[cfg(not(any(windows, target_os = "macos")))]
 mod state {
+    use super::This;
     pub(super) use super::dispatch;
     pub(super) use super::draw;
     pub(super) use super::draw as draw_indexed;
-    use super::This;
     pub(super) extern "system" fn dispatch_mesh(_: This, _: u32, _: u32, _: u32) {}
     pub(super) extern "system" fn dispatch_mesh_x(_: This, _: u32, _: u64, _: u64, _: u64) {}
     pub(super) use super::ignored_state as blend_factor;

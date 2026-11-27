@@ -165,6 +165,45 @@ fn a_counted_indirect_mesh_dispatch_runs_only_the_records_below_the_count() {
     }
 }
 
+/// `ExecuteIndirect` of `DispatchMesh` recorded as one command ([`super::NativeList::indirect_records`])
+/// draws what the records one by one do: record 0 of no groups, record 1 of one, with no count or
+/// a count of 0, 1 or 2 (only a count of 2, or none, reaches record 1 and colours the target).
+#[test]
+fn batched_indirect_mesh_dispatches_draw_what_one_by_one_ones_do() {
+    let (ms, ps) = (translate(HwStage::Vs, TRIANGLE), translate(HwStage::Ps, RED));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders);
+    };
+    let pool = super::Pool::new(&t.host, 1);
+    let (records, count) = (0, 64);
+    pool.write(records, &[0u32, 1, 1, 1, 1, 1]);
+    for counted in [None, Some(0u32), Some(1), Some(2)] {
+        pool.write(count, &[counted.unwrap_or(0)]);
+        let draw = |batched: bool| {
+            let (color, mut list) = list_into(&t, &pso, binding.clone());
+            let before = list.cmds.len();
+            let at = |i: u32| pool.va(records + 12 * i as usize);
+            if batched {
+                list.indirect_records(at(0), 12, 2, counted.map(|_| pool.va(count)), |l, r, c| l.dispatch_mesh_indirect(r, c))
+                    .unwrap();
+                assert_eq!(list.cmds.len() - before, 1, "one command");
+            } else {
+                for i in 0..2 {
+                    list.dispatch_mesh_indirect(at(i), counted.map(|_| (pool.va(count), i))).unwrap();
+                }
+            }
+            super::run(&t.host, &[&list]);
+            pixels(&t, &color)
+        };
+        let one_by_one = draw(false);
+        let want = if matches!(counted, None | Some(2)) { [255, 128, 128, 255] } else { [0; 4] };
+        assert!(one_by_one.iter().all(|p| *p == want), "{counted:?}: the per-record path itself");
+        assert_eq!(draw(true), one_by_one, "{counted:?}");
+    }
+}
+
 /// A mesh dispatch record that asks for more than 2^22 groups in all (D3D12's most for
 /// `DispatchMesh`) is what a culling pass left unfinished in title memory: it draws nothing
 /// (Metal would run it, for as long as it takes), and one below that still draws.
@@ -701,6 +740,39 @@ fn an_indirect_rectangle_list_draws_its_records_as_a_direct_one() {
         } else {
             assert!(got.iter().all(|p| *p == [0; 4]), "record {record} {counted:?}");
         }
+    }
+}
+
+/// `ExecuteIndirect` of a rectangle list recorded as one command draws what the records one by
+/// one do: records of 0 and of 3 vertices, 16 bytes apart, with no count or a count of 1 or 2.
+#[test]
+fn batched_indirect_rectangle_lists_draw_what_one_by_one_ones_do() {
+    let Some(mut t) = title() else { return };
+    let pool = super::Pool::new(&t.host, 1);
+    let count = 64;
+    pool.write(0, &[0u32, 1, 0, 0, 3, 1, 0, 0]);
+    for counted in [None, Some(1u32), Some(2)] {
+        pool.write(count, &[counted.unwrap_or(0)]);
+        let mut draw = |batched: bool| {
+            let (color, mut list) = rect_list_into(&mut t);
+            let before = list.cmds.len();
+            let at = |i: u32| pool.va(16 * i as usize);
+            if batched {
+                list.indirect_records(at(0), 16, 2, counted.map(|_| pool.va(count)), |l, r, c| l.draw_rects_indirect(r, c))
+                    .unwrap();
+                assert_eq!(list.cmds.len() - before, 1, "one command");
+            } else {
+                for i in 0..2 {
+                    list.draw_rects_indirect(at(i), counted.map(|_| (pool.va(count), i))).unwrap();
+                }
+            }
+            super::run(&t.host, &[&list]);
+            pixels(&t, &color)
+        };
+        let one_by_one = draw(false);
+        let lit = one_by_one.iter().any(|p| *p != [0; 4]);
+        assert_eq!(lit, counted != Some(1), "{counted:?}: the per-record path itself");
+        assert_eq!(draw(true), one_by_one, "{counted:?}");
     }
 }
 

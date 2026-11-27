@@ -143,6 +143,23 @@ impl<B: GraphicsBackend> Default for Contract<B> {
     }
 }
 
+// By hand: `B` itself is not `Clone`.
+impl<B: GraphicsBackend> Clone for Prep<B> {
+    fn clone(&self) -> Self {
+        Prep {
+            root: self.root.clone(),
+            ps_root: self.ps_root.clone(),
+            bufs: self.bufs.clone(),
+            vertex: self.vertex.clone(),
+            index: self.index.clone(),
+            blit: self.blit.clone(),
+            indirect: self.indirect.clone(),
+            count: self.count.clone(),
+            heap: self.heap.clone(),
+        }
+    }
+}
+
 /// What one command resolved to: title addresses are made into buffers here, kept alive until the
 /// submission has been handed over.
 struct Prep<B: GraphicsBackend> {
@@ -159,6 +176,15 @@ struct Prep<B: GraphicsBackend> {
     count: Option<(Rc<B::Buffer>, *const u8, u32)>,
     /// The resource heap the work needs in place of the one the title bound (none bound).
     heap: Option<Rc<NativeHeap<B>>>,
+}
+
+/// The bytes of an `ExecuteIndirect` argument record of `cmd`'s kind.
+fn indirect_size<B: GraphicsBackend>(cmd: &Cmd<B>) -> u64 {
+    match cmd {
+        Cmd::Draw { call: DrawCall::Indexed { .. }, .. } => 20,
+        Cmd::Draw { call: DrawCall::Arrays { .. } | DrawCall::Rects, .. } => 16,
+        _ => 12,
+    }
 }
 
 enum Group {
@@ -2198,6 +2224,26 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
     }
 
+    /// The preparations of records 1 to n - 1 of `cmd` ([`Cmd::Draw::records`]), from `p`, the
+    /// first's: each its own record, resolved as the first's, and count index.
+    fn more_records(&self, cmd: &Cmd<B>, p: &Prep<B>) -> Vec<Result<Prep<B>, String>> {
+        let (Cmd::Draw { indirect: Some(first), count, records: (stride, n), .. }
+        | Cmd::Dispatch { indirect: Some(first), count, records: (stride, n), .. }) = cmd
+        else {
+            return Vec::new();
+        };
+        (1..*n)
+            .map(|i| {
+                let mut q = p.clone();
+                q.indirect = Some(self.resolve(first + u64::from(i) * u64::from(*stride), indirect_size(cmd))?);
+                if let (Some((b, at, _)), Some((_, index))) = (&p.count, count) {
+                    q.count = Some((b.clone(), *at, index + i));
+                }
+                Ok(q)
+            })
+            .collect()
+    }
+
     fn prep(&self, cmd: &Cmd<B>) -> Result<Prep<B>, String> {
         let mut p = Prep {
             root: RootArgs::default(),
@@ -2220,6 +2266,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 threads,
                 indirect,
                 count,
+                ..
             } => {
                 if let Some(a) = indirect {
                     p.indirect = Some(self.resolve(*a, 12)?);
@@ -2266,7 +2313,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 ..
             } => {
                 if let Some(a) = indirect {
-                    p.indirect = Some(self.resolve(*a, match call { DrawCall::Indexed { .. } => 20, DrawCall::Mesh { .. } => 12, DrawCall::Arrays { .. } | DrawCall::Rects => 16 })?);
+                    p.indirect = Some(self.resolve(*a, indirect_size(cmd))?);
                 }
                 if let Some((a, index)) = count {
                     let (b, at) = self.resolve(*a, 4)?;
@@ -2432,8 +2479,24 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         self.note_written(root, pso.binding.as_ref());
                     }
                     cut.push(dropped.drain(..).any(|d| !same(d, c)));
+                    // The other records of an `ExecuteIndirect`: the same preparation, each with
+                    // its own record (and count index), as if recorded one by one.
+                    let more = self.more_records(c, &p);
                     cmds.push(c);
                     preps.push(p);
+                    for q in more {
+                        match q {
+                            Ok(q) => {
+                                cut.push(false);
+                                cmds.push(c);
+                                preps.push(q);
+                            }
+                            Err(e) => {
+                                self.unmapped.set(self.unmapped.get() + 1);
+                                tracing::debug!(error = %e, "native host drops a record at unmapped title memory");
+                            }
+                        }
+                    }
                 }
                 Err(e)
                     if e.ends_with(NEVER_SET)

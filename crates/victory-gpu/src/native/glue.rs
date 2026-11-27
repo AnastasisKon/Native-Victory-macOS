@@ -2079,14 +2079,12 @@ pub(crate) fn execute_indirect(
                     n[0] += u64::from(max);
                     n[1] += zero;
                 }
-                for i in 0..max {
-                    match l.list.dispatch_mesh_indirect(at(i), count.map(|c| (c, i))) {
-                        Ok(()) => {
-                            ENCODED.fetch_add(1, Ordering::Relaxed);
-                            l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
-                        }
-                        Err(e) => tracing::warn!(error = %e, "indirect mesh dispatch"),
+                match l.list.indirect_records(at(0), stride, max, count, |l, r, c| l.dispatch_mesh_indirect(r, c)) {
+                    Ok(()) => {
+                        ENCODED.fetch_add(u64::from(max), Ordering::Relaxed);
+                        l.target_keys.iter().for_each(|&k| (0..max).for_each(|_| trace_bump(k, 0)));
                     }
+                    Err(e) => tracing::warn!(error = %e, "indirect mesh dispatch"),
                 }
                 trace_present_draw(t, l);
             });
@@ -2127,13 +2125,13 @@ pub(crate) fn execute_indirect(
                                 tracing::warn!(shader = ?stage_hashes(l.pipeline), ?command, counted = count.is_some(), stride, record = format_args!("{:#x}", at(i)), ?now, "an indirect dispatch (the first three of each pipeline)");
                             }
                         }
-                        let r = match count {
-                            Some(c) => l.list.dispatch_indirect_counted(at(i), c, i),
-                            None => l.list.dispatch_indirect(at(i)),
-                        };
-                        if let Err(e) = r {
-                            tracing::warn!(error = %e, "indirect dispatch");
-                        }
+                    }
+                    let r = l.list.indirect_records(at(0), stride, max, count, |l, r, c| match c {
+                        Some((c, i)) => l.dispatch_indirect_counted(r, c, i),
+                        None => l.dispatch_indirect(r),
+                    });
+                    if let Err(e) = r {
+                        tracing::warn!(error = %e, "indirect dispatch");
                     }
                 }
                 _ => dropped_dispatch(t, l, "indirect"),
@@ -2156,21 +2154,19 @@ pub(crate) fn execute_indirect(
                 Some(rect) => {
                     let found = std::time::Instant::now();
                     let _timed = Defer(|| note_indirect(max, start, found));
-                    for i in 0..max {
-                        let indexed = command == Command::DrawIndexed;
-                        let r = match count {
-                            // As a direct one: four-vertex instances, the record rewritten on the GPU.
-                            _ if rect => l.list.draw_rects_indirect(at(i), count.map(|c| (c, i))),
-                            Some(c) => l.list.draw_indirect_counted(at(i), indexed, c, i),
-                            None => l.list.draw_indirect(at(i), indexed),
-                        };
-                        match r {
-                            Ok(()) => {
-                                ENCODED.fetch_add(1, Ordering::Relaxed);
-                                l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
-                            }
-                            Err(e) => tracing::warn!(error = %e, "indirect draw"),
+                    let indexed = command == Command::DrawIndexed;
+                    let r = l.list.indirect_records(at(0), stride, max, count, |l, r, c| match c {
+                        // As a direct one: four-vertex instances, the record rewritten on the GPU.
+                        _ if rect => l.draw_rects_indirect(r, c),
+                        Some((c, i)) => l.draw_indirect_counted(r, indexed, c, i),
+                        None => l.draw_indirect(r, indexed),
+                    });
+                    match r {
+                        Ok(()) => {
+                            ENCODED.fetch_add(u64::from(max), Ordering::Relaxed);
+                            l.target_keys.iter().for_each(|&k| (0..max).for_each(|_| trace_bump(k, 0)));
                         }
+                        Err(e) => tracing::warn!(error = %e, "indirect draw"),
                     }
                     true
                 }

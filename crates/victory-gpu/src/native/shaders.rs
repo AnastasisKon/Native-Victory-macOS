@@ -69,7 +69,7 @@ pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 
     return crate::shader_cache::native_present(container, &format!("{o:?}"));
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = o;
+        let _ = (container, rect, extra, copy_params, o);
         false
     }
 }

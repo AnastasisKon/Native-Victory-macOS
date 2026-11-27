@@ -68,10 +68,10 @@ impl Drop for Heap {
         // `buf` and `refs` are dropped.
         if let Some(set) = self.set.take() {
             if self.requested {
-                set.endResidency();
+                crate::metal::residency_timed("end", Some(&set), || set.endResidency());
             }
             set.removeAllAllocations();
-            set.commit();
+            crate::metal::residency_timed("drop_commit", Some(&set), || set.commit());
         }
     }
 }
@@ -578,7 +578,7 @@ impl Metal {
             drop(counts);
             if last && let Some(set) = &heap.set {
                 set.removeAllocation(ProtocolObject::from_ref(&*old));
-                set.commit();
+                crate::metal::residency_timed("remove_commit", Some(set), || set.commit());
                 heap.dirty.set(false);
             }
             drop(old_tex_view);
@@ -629,10 +629,13 @@ impl Metal {
     /// set's allocations non-resident whenever no command buffer in flight uses the set, and
     /// make them resident again for the next one: in a run on a 48 GB Mac the wired memory fell
     /// from about 22 GB to 6 GB and came back within 10 s in the world, then command buffers
-    /// timed out (#79). Guess, not measured: that making the set resident again is the stall.
+    /// timed out (#79). Measured since (`VICTORY_TRACE_RESIDENCY`, docs/native-host.md): the
+    /// wired memory falls only after the host has committed no command buffer for a few seconds,
+    /// this request does not stop that, and making the set resident again cost 0.1 to 0.3 s: the
+    /// fall follows a stall, it does not cause it.
     fn request(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
         if self.request_residency {
-            set.requestResidency();
+            crate::metal::residency_timed("request", Some(set), || set.requestResidency());
             self.count(|c| c.requests += 1);
         }
     }
@@ -646,7 +649,7 @@ impl Metal {
     ) {
         if let Some(set) = &heap.set {
             if heap.dirty.replace(false) {
-                set.commit();
+                crate::metal::residency_timed("add_commit", Some(set), || set.commit());
                 self.request(set);
                 self.count(|c| {
                     c.heap_entries = c.heap_entries.max(heap.refs.borrow().len() as u64);
@@ -859,7 +862,7 @@ impl ResourceBackend for Metal {
                 .newResidencySetWithDescriptor_error(&d)
                 .map_err(|e| e.localizedDescription().to_string())?;
             s.addAllocation(ProtocolObject::from_ref(&*buf));
-            s.commit();
+            crate::metal::residency_timed("made", Some(&s), || s.commit());
             self.request(&s);
             Some(s)
         } else {
@@ -1428,7 +1431,7 @@ impl GraphicsBackend for Metal {
         });
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
-        cb.commit();
+        crate::metal::residency_timed("cb_commit", None, || cb.commit());
         self.committed.set(self.committed.get() + 1);
         match refused {
             Some(e) => Err(e),
@@ -1526,7 +1529,7 @@ impl Metal {
         });
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
-        cb.commit();
+        crate::metal::residency_timed("cb_commit", None, || cb.commit());
         self.committed.set(self.committed.get() + 1);
     }
 

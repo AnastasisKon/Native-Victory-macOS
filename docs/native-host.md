@@ -1407,7 +1407,7 @@ submission. The title copies one view into many entries (54 copies of the 174 Mi
 MiB one at the 1,000th look), so a look walks the pool table once for each distinct range, not
 once an entry: a look like that one took 2.7-3.1 ms with the pool table locked, and 60-90 us now
 (about 12 looks a second in that run; measured by `memory::signature_timing`, an ignored test run
-by hand). Test: `tests::copies_of_a_wrapped_view_are_followed_with_one_walk`. Test:
+by hand). Tests: `tests::copies_of_a_wrapped_view_are_followed_with_one_walk`;
 `tests::a_wrapped_view_follows_title_pages_remapped_or_unmapped_under_it` maps a view's second
 page to another pool page, then unmaps it: the view reads the new page, then zeros. Without the
 step it read the old page both times. Limits: work submitted before the change still reads the old

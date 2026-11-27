@@ -639,6 +639,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.resources.borrow().contains_key(&key)
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn texture_at(&self, key: usize) -> Option<Rc<B::Texture>> {
+        match self.resources.borrow().get(&key) {
+            Some(Res::Texture(t)) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
     fn step(kind: HeapKind) -> u64 {
         u64::from(crate::descriptor::increment(u32::from(kind == HeapKind::Sampler)).unwrap_or(32))
     }

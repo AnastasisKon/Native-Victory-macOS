@@ -1440,3 +1440,44 @@ fn depth_stencil_rows_go_in_and_out_as_the_depth_plane() {
         assert_eq!(got, values[at..at + 4], "row {r}");
     }
 }
+
+/// A placed R9G9B9E5 view laid out exactly as a live R32_UINT object at its address (a texture
+/// compute writes as integers and the title samples as floats) names the object's host texture;
+/// one that differs in size gets its own, as before; the shared one goes with the object.
+#[test]
+fn a_placed_rgb9e5_view_over_an_r32_uint_object_shares_its_texture() {
+    let Some(pool) = pool(9109, 4) else { return };
+    // Flags 4: unordered access. DXGI 42: R32_UINT; 67: R9G9B9E5.
+    let object = crate::resource::test_texture_at(pool.va(0), (32, 32), 1, 42, Swizzle::SW_64KB_S.0, 4);
+    let info = crate::resource::texture_info(object).unwrap();
+    with_title(|t| {
+        t.texture_created(object as usize, info);
+        assert!(t.realize(object as usize));
+    });
+    let heap = crate::descriptor::test_heap(false, 4);
+    let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let place = |size: u32| {
+        let res = crate::resource::test_texture_at(pool.va(0), (size.into(), size), 1, 67, Swizzle::SW_64KB_S.0, 4);
+        let words = crate::resource::texture_desc(res).unwrap();
+        let mut view = [0u32; 16];
+        (view[0], view[1], view[5]) = (67, 4, 1);
+        (view[10], view[11]) = (pool.va(0) as u32, (pool.va(0) >> 32) as u32);
+        crate::descriptor::create_placed_srv(std::ptr::null(), &words, &view, start);
+        crate::native::textures::placed_key(pool.va(0), &words)
+    };
+    let key = place(32);
+    with_title(|t| {
+        let shared = t.host.texture_at(key).expect("registered");
+        assert!(std::rc::Rc::ptr_eq(&shared, &t.texture_of(object as usize).unwrap()), "the object's texture");
+        assert!(t.texture_of(key).is_none(), "no copy of its own");
+    });
+    let other = place(16);
+    with_title(|t| {
+        let own = t.texture_of(other).expect("a copy of its own");
+        assert!(!std::rc::Rc::ptr_eq(&own, &t.texture_of(object as usize).unwrap()));
+    });
+    let key = place(32);
+    with_title(|t| assert!(t.host.knows(key)));
+    glue::resource_released(object);
+    with_title(|t| assert!(!t.host.knows(key), "released with the object"));
+}

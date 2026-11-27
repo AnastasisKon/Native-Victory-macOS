@@ -945,6 +945,13 @@ impl<B: PresentBackend> Title<B> {
 
     pub fn texture_released(&mut self, key: usize) {
         self.textures.remove(&key);
+        // A placed view that shares this texture ([`Self::alias_placed`]) goes with it.
+        if let Some((address, placed)) = self.shared.remove(&key)
+            && self.placed.get(&address).is_some_and(|&(k, _)| k == placed)
+        {
+            self.placed.remove(&address);
+            self.host.release_resource(placed);
+        }
         self.pending.remove(&key);
         self.unloaded.remove(&key);
         self.hot_keys.retain(|&k| k != key);
@@ -972,6 +979,40 @@ impl<B: PresentBackend> Title<B> {
             self.host.forget_resource(old);
             self.texture_released(old);
         }
+    }
+
+    /// A placed R9G9B9E5 texture `key` laid out exactly as a live R32_UINT resource object at the
+    /// same memory (the title reads as floats what compute wrote as integers): `key` names the
+    /// object's host texture, which its views cast, instead of a copy only title memory fills.
+    /// `false` (nothing done) for any other placed texture.
+    pub fn alias_placed(&mut self, address: u64, key: usize, info: &TextureInfo) -> bool {
+        let over = |o: &TextureInfo| {
+            o.format == 42 && o.memory == info.memory && o.size == info.size && o.layout == info.layout
+        };
+        // Object keys are addresses; placed keys have the top bit set ([`placed_key`]).
+        let object = |k: usize| k >> 63 == 0;
+        if info.format != 67 {
+            return false;
+        }
+        let Some(obj) = self
+            .textures
+            .iter()
+            .map(|(&k, t)| (k, &t.info))
+            .chain(self.pending.iter().map(|(&k, i)| (k, i)))
+            .find(|&(k, i)| object(k) && over(i))
+            .map(|(k, _)| k)
+        else {
+            return false;
+        };
+        let Some(texture) = self.texture_of(obj) else { return false };
+        self.host.register_texture(key, &texture);
+        self.shared.insert(obj, (address, key));
+        static ALIASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = ALIASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 1000 {
+            tracing::info!(placed = format!("{key:#x}"), object = format!("{obj:#x}"), aliased = n, "a placed R9G9B9E5 view shares an R32_UINT texture");
+        }
+        true
     }
 
     /// Releases the textures placed in pools the title released since the last call.

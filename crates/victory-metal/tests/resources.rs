@@ -735,3 +735,49 @@ fn texture_blit_ops_copy_between_textures_and_buffers() {
         }
     }
 }
+
+/// One dispatch of `dxil` writing `tex` through a UAV (table entry 0) over a `w` x `h` grid of
+/// 4x4 groups, `k` its root constants.
+fn fill(m: &Metal, dxil: &[u8], tex: &<Metal as ResourceBackend>::Texture, k: &[u32], g: [usize; 3], w: usize, h: usize) {
+    let p = m.create_compute_pipeline(dxil).unwrap();
+    let res = m.create_heap(HeapKind::Resource, 2).unwrap();
+    m.write_texture(&res, 0, tex, 0.0);
+    let mut root = RootArgs::default();
+    if !k.is_empty() {
+        root = root.constants(k);
+    }
+    run(
+        m,
+        &[Dispatch {
+            pipeline: &p,
+            root: root.address(m.heap_address(&res, 0)),
+            resources: vec![],
+            heaps: victory_metal::backend::Heaps { resource: Some(&res), sampler: None },
+            groups: [w.div_ceil(g[0]), h.div_ceil(g[1]), 1],
+            threads_per_group: g,
+            indirect: None,
+            count: None,
+        }],
+    );
+}
+
+/// A title's R9G9B9E5 view over an R32_UINT texture compute writes (fix 5): Metal casts the
+/// integer texture to `RGB9E5Float`, and a sample of the view decodes the bits the dispatch stored.
+#[test]
+fn an_rgb9e5_view_reads_what_compute_stored_as_r32_uint() {
+    let Some(m) = backend() else { return };
+    let mut d = d2(Format::R32Uint, 4, 4);
+    d.unordered_access = true;
+    let t = m.create_texture(&d).unwrap();
+    // Exponent 16 (scale 2^-8), red mantissa 256 (1.0, plus the shader's x + 4y), green 128
+    // (0.5), blue 64 (0.25).
+    let k = 256 | 128 << 9 | 64 << 18 | 16 << 27;
+    fill(&m, &fixture("uint_fill"), &t, &[k], [4, 4, 1], 4, 4);
+    let view = m
+        .create_texture_view(&t, &ViewDesc { format: Format::Rgb9e5Float, mips: (0, 1), slices: (0, 1) })
+        .expect("an RGB9E5 view of an R32Uint texture");
+    let g = Grid { m: &m, dxil: &fixture("sample2d"), g: [4, 4], z: 1, filter: Filter::Nearest };
+    for (i, c) in g.run(&view).iter().enumerate() {
+        assert_eq!(*c, [(256 + i) as f32 / 256.0, 0.5, 0.25, 1.0], "texel {i}");
+    }
+}

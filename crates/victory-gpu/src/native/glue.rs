@@ -854,8 +854,10 @@ pub(crate) fn mirror(handle: u64) {
                     && let Some((pool, _)) = t.host.memory().resolve(address, 1)
                 {
                     t.texture_placed(address, key, pool.id);
-                    t.texture_created(key, info);
-                    t.realize(key);
+                    if !t.alias_placed(address, key, &info) {
+                        t.texture_created(key, info);
+                        t.realize(key);
+                    }
                 }
             }
             // A view of a texture object that no list has used yet.

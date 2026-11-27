@@ -425,7 +425,7 @@ impl ComputeBackend for Metal {
 
     fn create_queue(&self) -> Result<Queue, String> {
         let q = self.dev.newCommandQueue().ok_or("newCommandQueue failed")?;
-        let order = self.dev.newSharedEvent().ok_or("newSharedEvent failed")?;
+        let order = crate::gfx::track_event(self.dev.newSharedEvent().ok_or("newSharedEvent failed")?);
         // With the heaps' sets alone the host orders the queue's work from the start; with the
         // pool's set too, from when that set joins the queue (`make_resident`).
         let ordered = self.residency_sets && !self.pool_sets;
@@ -433,7 +433,7 @@ impl ComputeBackend for Metal {
     }
 
     fn create_fence(&self, initial: u64) -> Result<Fence, String> {
-        let e = self.dev.newSharedEvent().ok_or("newSharedEvent failed")?;
+        let e = crate::gfx::track_event(self.dev.newSharedEvent().ok_or("newSharedEvent failed")?);
         e.setSignaledValue(initial);
         Ok(Fence(e))
     }

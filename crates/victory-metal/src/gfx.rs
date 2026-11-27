@@ -44,8 +44,13 @@ pub struct Heap {
     buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     kind: HeapKind,
     count: usize,
-    /// What each entry names, kept alive here and made resident with the heap.
-    refs: RefCell<std::collections::HashMap<usize, Res>>,
+    /// What each entry names: `(resident_allocation, optional_buffer_backed_texture_view)`.
+    /// A buffer-backed `TypeTextureBuffer` shares its parent `MTLBuffer`'s backing allocation, so
+    /// retaining it here keeps its `gpuResourceID` live without duplicating the pool's pages in
+    /// `alloc_counts` / `MTLResidencySet` / per-encoder `useResource`.
+    refs: RefCell<std::collections::HashMap<usize, (Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>>,
+    /// Entries in `refs` that currently hold `Some(texture_buffer)`.
+    typed_views: Cell<usize>,
     /// The distinct allocations `refs` names, by raw `MTLResource` pointer, with how many entries
     /// name each: an allocation is added to `set` once and removed + committed before its last
     /// `refs` entry is dropped, and without a set each is named to an encoder once.
@@ -209,6 +214,12 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
         Format::Bc3Srgb => MTLPixelFormat::BC3_RGBA_sRGB,
         Format::Bgr5a1Unorm => MTLPixelFormat::BGR5A1Unorm,
         Format::Abgr4Unorm => MTLPixelFormat::ABGR4Unorm,
+        Format::Rgba16Uint => MTLPixelFormat::RGBA16Uint,
+        Format::Rgba8Snorm => MTLPixelFormat::RGBA8Snorm,
+        Format::Rg16Snorm => MTLPixelFormat::RG16Snorm,
+        Format::R16Snorm => MTLPixelFormat::R16Snorm,
+        Format::R8Snorm => MTLPixelFormat::R8Snorm,
+        Format::Rgb10a2Uint => MTLPixelFormat::RGB10A2Uint,
     }
 }
 
@@ -495,7 +506,13 @@ fn size(a: [usize; 3]) -> MTLSize {
 }
 
 impl Metal {
-    fn heap_entry(&self, heap: &Heap, index: usize, words: [u64; 3], keep: Option<Res>) {
+    fn heap_entry(
+        &self,
+        heap: &Heap,
+        index: usize,
+        words: [u64; 3],
+        keep: Option<(Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>,
+    ) {
         assert!(
             index < heap.count,
             "descriptor index {index} out of {}",
@@ -515,8 +532,9 @@ impl Metal {
                 .enumerate()
                 .for_each(|(i, w)| p.add(i).write_volatile(*w));
         }
+        let added_typed = matches!(keep, Some((_, Some(_))));
         let old = match keep {
-            Some(r) => {
+            Some((r, tex_view)) => {
                 let ptr = (&*r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
                 let mut counts = heap.alloc_counts.borrow_mut();
                 let (count, _) = counts.entry(ptr).or_insert_with(|| (0, r.clone()));
@@ -528,11 +546,17 @@ impl Metal {
                 }
                 *count += 1;
                 drop(counts);
-                heap.refs.borrow_mut().insert(index, r)
+                heap.refs.borrow_mut().insert(index, (r, tex_view))
             }
             None => heap.refs.borrow_mut().remove(&index),
         };
-        if let Some(old) = old {
+        let removed_typed = matches!(old, Some((_, Some(_))));
+        if added_typed != removed_typed {
+            let n = heap.typed_views.get();
+            heap.typed_views
+                .set(if added_typed { n + 1 } else { n - 1 });
+        }
+        if let Some((old, old_tex_view)) = old {
             let old_ptr = (&*old as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
             let mut counts = heap.alloc_counts.borrow_mut();
             let last = match counts.get_mut(&old_ptr) {
@@ -552,6 +576,7 @@ impl Metal {
                 set.commit();
                 heap.dirty.set(false);
             }
+            drop(old_tex_view);
             drop(old);
         }
     }
@@ -787,6 +812,7 @@ impl ResourceBackend for Metal {
             kind,
             count,
             refs: RefCell::default(),
+            typed_views: Cell::new(0),
             alloc_counts: RefCell::default(),
             set,
             dirty: Cell::new(false),
@@ -809,7 +835,90 @@ impl ResourceBackend for Metal {
         let gpu = self.gpu_address(buffer, title);
         let keep: Res = ProtocolObject::from_ref(&*buffer.buf).retain();
         // IRDescriptorTableSetBuffer(entry, gpu, metadata = size & 0xffffffff).
-        self.heap_entry(heap, index, [gpu, 0, size as u64], Some(keep));
+        self.heap_entry(heap, index, [gpu, 0, size as u64], Some((keep, None)));
+    }
+
+    fn write_typed_buffer(
+        &self,
+        heap: &Heap,
+        index: usize,
+        buffer: &Buffer,
+        title: *const u8,
+        size: u32,
+        format: Format,
+        writable: bool,
+    ) -> bool {
+        debug_assert_eq!(heap.kind, HeapKind::Resource);
+        let (bw, elem_bytes) = format.block();
+        if bw != 1 || format.is_depth() || size == 0 {
+            self.write_buffer(heap, index, buffer, title, size);
+            return false;
+        }
+        let pf = pixel_format(format);
+        let align = self
+            .dev
+            .minimumTextureBufferAlignmentForPixelFormat(pf)
+            .max(elem_bytes);
+        let offset = title as usize - buffer.base as usize;
+        let max_elems = (buffer.buf.length().saturating_sub(offset)) / elem_bytes;
+        let width = ((size as usize) / elem_bytes).min(max_elems).min(1 << 26);
+        if width == 0 {
+            self.write_buffer(heap, index, buffer, title, size);
+            return false;
+        }
+        if !offset.is_multiple_of(align) {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    offset = format!("{offset:#x}"),
+                    align,
+                    ?format,
+                    size,
+                    "typed buffer view offset is not aligned for MTLTextureTypeTextureBuffer; falling back to raw buffer entry (first time)"
+                );
+            } else {
+                tracing::debug!(
+                    offset = format!("{offset:#x}"),
+                    align,
+                    ?format,
+                    size,
+                    "typed buffer view offset is not aligned for MTLTextureTypeTextureBuffer"
+                );
+            }
+            self.write_buffer(heap, index, buffer, title, size);
+            return false;
+        }
+        let td = MTLTextureDescriptor::new();
+        td.setTextureType(MTLTextureType::TypeTextureBuffer);
+        td.setPixelFormat(pf);
+        // SAFETY: `width` is in `1..=(1 << 26)` and fits inside `buffer.buf`.
+        unsafe {
+            td.setWidth(width);
+        }
+        td.setStorageMode(MTLStorageMode::Shared);
+        let mut usage = MTLTextureUsage::ShaderRead;
+        if writable {
+            usage |= MTLTextureUsage::ShaderWrite;
+        }
+        td.setUsage(usage);
+        let Some(tex) = buffer
+            .buf
+            .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, width * elem_bytes)
+        else {
+            self.write_buffer(heap, index, buffer, title, size);
+            return false;
+        };
+        let gpu = self.gpu_address(buffer, title);
+        let tex_id = resource_id(tex.gpuResourceID());
+        let keep_buf: Res = ProtocolObject::from_ref(&*buffer.buf).retain();
+        self.heap_entry(
+            heap,
+            index,
+            [gpu, tex_id, size as u64],
+            Some((keep_buf, Some(tex))),
+        );
+        true
     }
 
     fn write_texture(&self, heap: &Heap, index: usize, t: &Texture, min_lod: f32) {
@@ -817,7 +926,7 @@ impl ResourceBackend for Metal {
         let id = resource_id(t.tex.gpuResourceID());
         let keep: Res = ProtocolObject::from_ref(&*t.tex).retain();
         // IRDescriptorTableSetTexture(entry, tex, minLODClamp, metadata = 0).
-        self.heap_entry(heap, index, [0, id, min_lod.to_bits() as u64], Some(keep));
+        self.heap_entry(heap, index, [0, id, min_lod.to_bits() as u64], Some((keep, None)));
     }
 
     fn write_sampler(&self, heap: &Heap, index: usize, s: &Sampler, lod_bias: f32) {
@@ -831,12 +940,16 @@ impl ResourceBackend for Metal {
         self.heap_entry(heap, index, [0; 3], None);
     }
 
+    fn heap_typed_views(&self, heap: &Heap) -> usize {
+        heap.typed_views.get()
+    }
+
     fn heap_allocations(&self, heap: &Heap, last_used: &[u32]) -> Option<Vec<HeapAllocation>> {
         use objc2_foundation::NSObjectProtocol;
         heap.set.as_ref()?;
         // Each allocation's latest use over the entries naming it.
         let mut latest = std::collections::HashMap::<usize, u32>::new();
-        for (&index, r) in heap.refs.borrow().iter() {
+        for (&index, (r, _)) in heap.refs.borrow().iter() {
             let ptr = (&**r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
             let used = last_used.get(index).copied().unwrap_or(0);
             let e = latest.entry(ptr).or_insert(0);
@@ -3260,6 +3373,156 @@ mod heap_set_tests {
         // SAFETY: the heap buffer holds four entries of `ENTRY` bytes.
         let bytes = unsafe { std::slice::from_raw_parts(heap.buf.contents().as_ptr().cast::<u8>(), 2 * ENTRY) };
         assert!(bytes.iter().all(|b| *b == 0), "a cleared entry reads as one never written");
+
+        let heap_only = set.allocatedSize();
+        let arena = crate::mem::Alias::new(65536).unwrap();
+        let buf = victory_backend::backend::ComputeBackend::wrap_title_memory(
+            &m,
+            arena.primary,
+            arena.len,
+        )
+        .unwrap();
+        let entry_words = |i: usize| -> [u64; 3] {
+            // SAFETY: the heap buffer holds four entries of `ENTRY` (24) bytes.
+            unsafe {
+                heap.buf
+                    .contents()
+                    .as_ptr()
+                    .cast::<[u64; 3]>()
+                    .add(i)
+                    .read_unaligned()
+            }
+        };
+        assert!(m.write_typed_buffer(&heap, 0, &buf, arena.primary, 1024, Format::Rgba32Uint, true));
+        assert_eq!(m.heap_typed_views(&heap), 1);
+        assert_ne!(entry_words(0)[1], 0, "aligned typed buffer writes textureViewID");
+        // SAFETY: `1024` and `4` are inside the 64 KiB `arena` allocation.
+        let second = unsafe { arena.primary.add(1024) };
+        let unaligned = unsafe { arena.primary.add(4) };
+        assert!(m.write_typed_buffer(&heap, 1, &buf, second, 1024, Format::Rgba32Float, true));
+        assert_eq!(m.heap_typed_views(&heap), 2);
+        assert!(!m.write_typed_buffer(&heap, 2, &buf, unaligned, 1024, Format::Rgba32Float, true));
+        assert_eq!(m.heap_typed_views(&heap), 2, "unaligned fallback holds no typed view");
+        assert_ne!(entry_words(2)[0], 0, "unaligned fallback preserves gpuVA in word 0");
+        assert_eq!(entry_words(2)[1], 0, "unaligned fallback leaves textureViewID null");
+        assert_eq!(entry_words(2)[2], 1024);
+        assert_eq!(held(), 2, "typed buffer views over one pool add only the pool allocation");
+        assert_eq!(
+            set.allocatedSize(),
+            heap_only + arena.len as u64,
+            "buffer-backed texture views do not multiply the pool's residency-set size"
+        );
+        m.write_buffer(&heap, 0, &buf, arena.primary, 1024);
+        assert_eq!(m.heap_typed_views(&heap), 1, "overwriting with write_buffer drops the typed view");
+        assert_eq!(entry_words(0)[1], 0, "write_buffer zeroes textureViewID");
+        m.clear_entry(&heap, 0);
+        m.clear_entry(&heap, 2);
+        assert_eq!(held(), 2);
+        assert_eq!(m.heap_typed_views(&heap), 1);
+        m.clear_entry(&heap, 1);
+        assert_eq!(m.heap_typed_views(&heap), 0, "clear_entry drops the last typed view");
+        assert_eq!(held(), 1, "cleared typed buffer entries release the pool allocation");
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test -p victory-metal typed_buffer_view_cost_benchmark -- --ignored --nocapture"]
+    fn typed_buffer_view_cost_benchmark() {
+        fn phys_footprint() -> usize {
+            const TASK_VM_INFO: i32 = 22;
+            unsafe extern "C" {
+                fn mach_task_self() -> u32;
+                fn task_info(task: u32, flavor: i32, info: *mut u64, count: *mut u32) -> i32;
+            }
+            let mut info = [0u64; 64];
+            let mut count = 128u32;
+            // SAFETY: local buffer of `count` 32-bit words for `TASK_VM_INFO`.
+            let kr = unsafe { task_info(mach_task_self(), TASK_VM_INFO, info.as_mut_ptr(), &mut count) };
+            if kr == 0 && count >= 38 { info[18] as usize } else { 0 }
+        }
+
+        let m = Metal::new().unwrap().with_heap_sets();
+        for fmt in [
+            Format::R8Unorm,
+            Format::R16Float,
+            Format::R32Uint,
+            Format::Rg32Float,
+            Format::Rgba16Uint,
+            Format::Rgba32Uint,
+            Format::Rgba32Float,
+        ] {
+            let pf = pixel_format(fmt);
+            let align = m.dev.minimumTextureBufferAlignmentForPixelFormat(pf);
+            println!("align {fmt:?} (MTLPixelFormat {:?}): {align} B", pf);
+        }
+
+        const TOTAL: usize = 40_000;
+        let arena_len = TOTAL * 64;
+        let arena = crate::mem::Alias::new(arena_len).unwrap();
+        // Touch pages upfront so pool page faults do not pollute descriptor measurements.
+        // SAFETY: `arena.primary` is a writable `arena_len` allocation.
+        unsafe { std::ptr::write_bytes(arena.primary, 0, arena_len) };
+        let buf = victory_backend::backend::ComputeBackend::wrap_title_memory(
+            &m,
+            arena.primary,
+            arena.len,
+        )
+        .unwrap();
+        let heap = m.create_heap(HeapKind::Resource, TOTAL).unwrap();
+        if let Some(set) = &heap.set {
+            set.commit();
+        }
+
+        let fp0 = phys_footprint();
+        let t0 = std::time::Instant::now();
+        for i in 0..TOTAL {
+            // SAFETY: `i * 64 < arena_len`.
+            let ptr = unsafe { arena.primary.add(i * 64) };
+            m.write_buffer(&heap, i, &buf, ptr, 64);
+        }
+        let raw_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let fp_raw = phys_footprint();
+        println!(
+            "40,000 write_buffer (lazy mirror): {raw_ms:.2} ms, phys_footprint delta = {:.2} KiB",
+            (fp_raw as isize - fp0 as isize) as f64 / 1024.0
+        );
+
+        for count in [64usize, 512, 1_000, 10_000, 40_000] {
+            for i in 0..count {
+                // SAFETY: `i * 64 < arena_len`.
+                let ptr = unsafe { arena.primary.add(i * 64) };
+                m.write_buffer(&heap, i, &buf, ptr, 64);
+            }
+            let before = phys_footprint();
+            let start = std::time::Instant::now();
+            for i in 0..count {
+                // SAFETY: `i * 64 < arena_len`.
+                let ptr = unsafe { arena.primary.add(i * 64) };
+                let fmt = match i % 3 {
+                    0 => Format::Rgba32Float,
+                    1 => Format::Rg32Float,
+                    _ => Format::R32Uint,
+                };
+                m.write_typed_buffer(&heap, i, &buf, ptr, 64, fmt, true);
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            let after = phys_footprint();
+            let set_bytes = heap.set.as_ref().map_or(0, |s| {
+                s.commit();
+                s.allocatedSize()
+            });
+            let delta_kib = (after as isize - before as isize) as f64 / 1024.0;
+            println!(
+                "materialize {count:>6} write_typed_buffer: {ms:>7.2} ms ({:.2} us/view), phys_footprint delta = {delta_kib:>8.1} KiB ({:.1} B/view), heap_set = {:.2} MiB",
+                ms * 1000.0 / count as f64,
+                (after as isize - before as isize) as f64 / count as f64,
+                set_bytes as f64 / (1024.0 * 1024.0)
+            );
+            for i in 0..count {
+                // SAFETY: `i * 64 < arena_len`.
+                let ptr = unsafe { arena.primary.add(i * 64) };
+                m.write_buffer(&heap, i, &buf, ptr, 64);
+            }
+        }
     }
 }
 

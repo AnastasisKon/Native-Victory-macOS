@@ -420,3 +420,563 @@ fn a_size_query_of_a_writable_image_reads_its_size() {
     assert_eq!(f.get(0x2_0000, 3), [16, 8, 7], "width, height and height - 1 from the descriptor");
     drop(records);
 }
+
+/// `buffer_store_format_xyzw` and `buffer_load_format_xyzw` with `idxen` through a 16-byte
+/// structured writable buffer view, an `R32G32B32A32_UINT` typed writable buffer view, an
+/// `R32G32B32A32_FLOAT` view, and an `R8G8B8A8_UNORM` view write and read back through the same
+/// heap entry that `buffer_store_dwordx4` writes (`#255`).
+#[test]
+fn formatted_buffer_stores_and_loads_through_structured_and_typed_uavs() {
+    // Table at s4: entry 0 (dwords 0..4) is the tested UAV, entry 1 (dwords 4..8) is a raw output UAV.
+    // Lane 0 stores `[v1..v4]` to element 1 of entry 0 with `buffer_store_format_xyzw ... idxen`,
+    // loads element 1 back with `buffer_load_format_xyzw ... idxen` into `v[6:9]`, and writes
+    // `[v6..v9, s14 (num_records)]` to entry 1 via `buffer_store_dwordx4` + `buffer_store_dword`.
+    const CS_FMT_STORE: &[u32] = &[
+        0xBE8A_0304, // s_mov_b32 s10, s4
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+        0xF408_0405, 0xFA00_0020, // s_load_dwordx4 s[16:19], s[10:11], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E00_0281, // v_mov_b32 v0, 1 (element index 1)
+        0xE038_0800, 0x8004_0100, // buffer_load_dwordx4 v[1:4], off, s[16:19], 0 offset:2048
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE01C_2000, 0x8003_0100, // buffer_store_format_xyzw v[1:4], v0, s[12:15], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE00C_2000, 0x8003_0600, // buffer_load_format_xyzw v[6:9], v0, s[12:15], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE078_0000, 0x8004_0600, // buffer_store_dwordx4 v[6:9], off, s[16:19], 0
+        0x7E14_020E, // v_mov_b32 v10, s14 (getDimensions)
+        0xE070_0010, 0x8004_0A00, // buffer_store_dword v10, off, s[16:19], 0 offset:16
+        0xBF81_0000, // s_endpgm
+    ];
+    // Raw `buffer_store_dwordx4` through the same entry 0 descriptor (`gpuVA` in word[0]).
+    const CS_RAW_STORE: &[u32] = &[
+        0xBE8A_0304, // s_mov_b32 s10, s4
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+        0xF408_0405, 0xFA00_0020, // s_load_dwordx4 s[16:19], s[10:11], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE038_0800, 0x8004_0100, // buffer_load_dwordx4 v[1:4], off, s[16:19], 0 offset:2048
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE078_0020, 0x8003_0100, // buffer_store_dwordx4 v[1:4], off, s[12:15], 0 offset:32
+        0xBF81_0000, // s_endpgm
+    ];
+
+    let mut uav0 = [0u8; 32];
+    uav0[0] = 0x41;
+    uav0[4..6].copy_from_slice(&[3, 3]);
+    uav0[16] = 1;
+    uav0[20..23].copy_from_slice(&[4, 4, 0]);
+    let mut uav1 = uav0;
+    uav1[8] = 8; // +8 dwords = +32 bytes (entry 1)
+    let c_fmt = crate::pipeline::test_compute_container(CS_FMT_STORE, &[uav0, uav1], 7);
+    let cs_fmt = shaders::translate(&c_fmt).unwrap();
+    let c_raw = crate::pipeline::test_compute_container(CS_RAW_STORE, &[uav0, uav1], 7);
+    let cs_raw = shaders::translate(&c_raw).unwrap();
+    let mut img_uav = uav1;
+    img_uav[20..23].copy_from_slice(&[8, 4, 1]);
+    let c_img = crate::pipeline::test_compute_container(CS_UAV_SIZE, &[uav0, img_uav], 7);
+    let cs_img = shaders::translate(&c_img).unwrap();
+    assert!(
+        crate::native::list::Binding::of(&cs_fmt).typed_buffers,
+        "bufferLoad/bufferStore marks TypedBuffer use"
+    );
+    assert!(
+        !crate::native::list::Binding::of(&cs_raw).typed_buffers,
+        "rawBufferLoad/rawBufferStore does not mark TypedBuffer use"
+    );
+    assert!(
+        !crate::native::list::Binding::of(&cs_img).typed_buffers,
+        "Texture2D getDimensions does not mark TypedBuffer use"
+    );
+
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let records = vec![0u32; 8 * 20];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 20).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1; // BUFFER
+
+    // Entry 1: raw output/input UAV of 1024 dwords (4096 B) at `VA_A + 0x1000`.
+    let mut raw_out = [0u32; 16];
+    (raw_out[1], raw_out[4], raw_out[8]) = (1, 1024, 1);
+    [raw_out[10], raw_out[11]] = super::addr_tests::halves(super::addr_tests::VA_A + 0x1000);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &raw_out, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+
+    // Entry 19 (past the 16-entry default table check): an unbound 16-byte structured UAV must
+    // never materialize a Metal texture view.
+    let mut unbound_struct = [0u32; 16];
+    (unbound_struct[1], unbound_struct[4], unbound_struct[5]) = (1, 8, 16);
+    [unbound_struct[10], unbound_struct[11]] = super::addr_tests::halves(super::addr_tests::VA_A + 0x2000);
+    crate::descriptor::create_placed_uav(
+        std::ptr::null_mut(),
+        &resource,
+        &unbound_struct,
+        start + 19 * 32,
+    );
+    assert!(t.host.mirror(start + 19 * 32).unwrap());
+    assert_eq!(t.host.typed_views(), 0, "mirror() makes no Metal texture_buffer views");
+
+    let Pipe::Compute(pso_fmt) = t.compute_pipe(&cs_fmt, "fmt store") else {
+        panic!("{:?}", t.shaders)
+    };
+    let Pipe::Compute(pso_raw) = t.compute_pipe(&cs_raw, "raw store") else {
+        panic!("{:?}", t.shaders)
+    };
+
+    let bits = [0x0000_0001u32, 0xDEAD_BEEF, 0x7F80_0001, 0x3F80_0000];
+    for (idx, (label, fmt, stride)) in [
+        ("structured 16B", 0u32, 16u32),
+        ("R32G32B32A32_UINT", 3, 0),
+        ("R32G32B32A32_FLOAT", 2, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        f.put(0x2_0000, &[0u32; 16]);
+        f.put(0x2_1000, &[0u32; 8]);
+        f.put(0x2_1800, &bits);
+        let mut view = [0u32; 16];
+        (view[0], view[1], view[4], view[5]) = (fmt, 1, 8, stride);
+        [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+        crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start);
+        assert!(t.host.mirror(start).unwrap());
+        let views_before = t.host.typed_views();
+        assert!(heap.typed_pending.borrow().contains(0));
+
+        // Running `pso_raw` first must not materialize `texture_buffer` views.
+        let mut l_raw = NativeList::default();
+        l_raw.set_heaps(Some(&heap), None);
+        l_raw.set_compute_pipeline(&pso_raw);
+        l_raw.set_compute_root_table(0, &heap, 0);
+        l_raw.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l_raw]);
+        assert_eq!(
+            t.host.typed_views(),
+            views_before,
+            "{label}: raw shader leaves typed_pending unmaterialized"
+        );
+        assert!(heap.typed_pending.borrow().contains(0));
+
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso_fmt);
+        l.set_compute_root_table(0, &heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+        assert_eq!(
+            t.host.typed_views(),
+            views_before + 1,
+            "{label}: formatted shader materializes only the bound candidate (case {idx})"
+        );
+        assert_eq!(
+            t.host.live_typed_views(),
+            1,
+            "{label}: overwriting slot 0 drops its previous view so only 1 stays live"
+        );
+        assert!(!heap.typed_pending.borrow().contains(0));
+        assert!(
+            heap.typed_pending.borrow().contains(19),
+            "{label}: unbound structured UAV outside the table stays unmaterialized"
+        );
+        assert_eq!(f.get(0x2_0000, 4), [0; 4], "{label}: element 0 untouched");
+        assert_eq!(f.get(0x2_0010, 4), bits, "{label}: element 1 written by buffer_store_format_xyzw");
+        assert_eq!(f.get(0x2_0020, 4), bits, "{label}: element 2 written by buffer_store_dwordx4");
+        assert_eq!(
+            f.get(0x2_1000, 5),
+            [bits[0], bits[1], bits[2], bits[3], 8],
+            "{label}: buffer_load_format_xyzw + getDimensions"
+        );
+    }
+
+    // Format-converting typed UAVs: `R8G8B8A8_UNORM` (28) and `R16G16B16A16_FLOAT` (10).
+    f.put(0x2_0000, &[0u32; 16]);
+    f.put(0x2_1000, &[0u32; 8]);
+    let unorm_in = [0.0f32, 1.0, 1.0, 0.0].map(f32::to_bits);
+    f.put(0x2_1800, &unorm_in);
+    let mut view_unorm = [0u32; 16];
+    (view_unorm[0], view_unorm[1], view_unorm[4]) = (28, 1, 8);
+    [view_unorm[10], view_unorm[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view_unorm, start);
+    assert!(t.host.mirror(start).unwrap());
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso_fmt);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(f.get(0x2_0000, 2), [0, 0x00FF_FF00], "R8G8B8A8_UNORM packed texel 1");
+    assert_eq!(
+        f.get(0x2_1000, 5),
+        [unorm_in[0], unorm_in[1], unorm_in[2], unorm_in[3], 8],
+        "R8G8B8A8_UNORM readback + getDimensions"
+    );
+
+    f.put(0x2_0000, &[0u32; 16]);
+    f.put(0x2_1000, &[0u32; 8]);
+    let f16_in = [1.0f32, -2.0, 0.5, 4.0].map(f32::to_bits);
+    f.put(0x2_1800, &f16_in);
+    let mut view_f16 = [0u32; 16];
+    (view_f16[0], view_f16[1], view_f16[4]) = (10, 1, 8);
+    [view_f16[10], view_f16[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view_f16, start);
+    assert!(t.host.mirror(start).unwrap());
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso_fmt);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(
+        f.get(0x2_0000, 4),
+        [0, 0, 0xC000_3C00, 0x4400_3800],
+        "R16G16B16A16_FLOAT packed texel 1"
+    );
+    assert_eq!(
+        f.get(0x2_1000, 5),
+        [f16_in[0], f16_in[1], f16_in[2], f16_in[3], 8],
+        "R16G16B16A16_FLOAT readback + getDimensions"
+    );
+
+    f.put(0x2_0000, &[0u32; 16]);
+    f.put(0x2_1000, &[0u32; 8]);
+    let u16_in = [0x0000_0012u32, 0x0000_3456, 0x0000_789A, 0x0000_BCDE];
+    f.put(0x2_1800, &u16_in);
+    let mut view_u16 = [0u32; 16];
+    (view_u16[0], view_u16[1], view_u16[4]) = (12, 1, 8);
+    [view_u16[10], view_u16[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view_u16, start);
+    assert!(t.host.mirror(start).unwrap());
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso_fmt);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(
+        f.get(0x2_0000, 4),
+        [0, 0, 0x3456_0012, 0xBCDE_789A],
+        "R16G16B16A16_UINT packed texel 1"
+    );
+    assert_eq!(
+        f.get(0x2_1000, 5),
+        [u16_in[0], u16_in[1], u16_in[2], u16_in[3], 8],
+        "R16G16B16A16_UINT readback + getDimensions"
+    );
+
+    // 1-channel signed 32-bit integer `R32_SINT` (43 -> `R32Uint`) and 2-channel `R16G16_SNORM` (37).
+    f.put(0x2_0000, &[0u32; 16]);
+    f.put(0x2_1000, &[0u32; 8]);
+    f.put(0x2_1800, &[0xDEAD_BEEFu32, 0x1111_2222, 0x3333_4444, 0x5555_6666]);
+    let mut view_i32 = [0u32; 16];
+    (view_i32[0], view_i32[1], view_i32[4]) = (43, 1, 8);
+    [view_i32[10], view_i32[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view_i32, start);
+    assert!(t.host.mirror(start).unwrap());
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso_fmt);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(f.get(0x2_0000, 3), [0, 0xDEAD_BEEF, 0], "R32_SINT single-channel texel 1");
+    let i32_out = f.get(0x2_1000, 5);
+    assert_eq!((i32_out[0], i32_out[4]), (0xDEAD_BEEF, 8), "R32_SINT negative i32 + getDimensions");
+
+    f.put(0x2_0000, &[0u32; 16]);
+    f.put(0x2_1000, &[0u32; 8]);
+    let snorm_in = [-1.0f32, 1.0, 0.5, -0.5].map(f32::to_bits);
+    f.put(0x2_1800, &snorm_in);
+    let mut view_snorm = [0u32; 16];
+    (view_snorm[0], view_snorm[1], view_snorm[4]) = (37, 1, 8);
+    [view_snorm[10], view_snorm[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view_snorm, start);
+    assert!(t.host.mirror(start).unwrap());
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso_fmt);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(f.get(0x2_0000, 3), [0, 0x7FFF_8001, 0], "R16G16_SNORM packed [-1.0, 1.0] texel 1");
+    let snorm_out = f.get(0x2_1000, 5);
+    assert_eq!(
+        (snorm_out[0], snorm_out[1], snorm_out[4]),
+        ((-1.0f32).to_bits(), 1.0f32.to_bits(), 8),
+        "R16G16_SNORM readback + getDimensions"
+    );
+    assert_eq!(t.host.typed_views(), 8, "8 promotions across the 8 mirrored descriptors");
+    assert_eq!(t.host.live_typed_views(), 1, "only 1 entry holds a typed view at the end");
+    drop(records);
+}
+
+/// If `Binding`'s DXIL scan ever missed a `TypedBuffer` operation (`typed_buffers == false` on
+/// purpose), `NativeHost::mirror` wrote `[gpu, 0, size]` (`textureViewID == 0`), so both SRV and
+/// UAV `texture_buffer` loads and `getDimensions` read zero cleanly on Metal without faulting —
+/// both on a fresh heap slot and after overwriting a previously promoted slot.
+#[test]
+fn wrong_typed_buffer_scan_reads_zero_without_crashing() {
+    // Entry 0 (dwords 0..4) is a read-only SRV `Buffer<float4>`, entry 1 (dwords 8..12) is a raw output UAV.
+    const CS_FMT_SRV_LOAD: &[u32] = &[
+        0xBE8A_0304, // s_mov_b32 s10, s4
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+        0xF408_0405, 0xFA00_0020, // s_load_dwordx4 s[16:19], s[10:11], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E00_0281, // v_mov_b32 v0, 1 (element index 1)
+        0xE00C_2000, 0x8003_0600, // buffer_load_format_xyzw v[6:9], v0, s[12:15], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE078_0000, 0x8004_0600, // buffer_store_dwordx4 v[6:9], off, s[16:19], 0
+        0x7E14_020E, // v_mov_b32 v10, s14 (getDimensions)
+        0xE070_0010, 0x8004_0A00, // buffer_store_dword v10, off, s[16:19], 0 offset:16
+        0xBF81_0000, // s_endpgm
+    ];
+    // Entry 0 is a read-write UAV `RWBuffer<float4>`; stores to element 1, loads element 1, and queries size.
+    const CS_FMT_UAV_RW: &[u32] = &[
+        0xBE8A_0304, // s_mov_b32 s10, s4
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+        0xF408_0405, 0xFA00_0020, // s_load_dwordx4 s[16:19], s[10:11], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E00_0281, // v_mov_b32 v0, 1 (element index 1)
+        0xE038_0800, 0x8004_0100, // buffer_load_dwordx4 v[1:4], off, s[16:19], 0 offset:2048
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE01C_2000, 0x8003_0100, // buffer_store_format_xyzw v[1:4], v0, s[12:15], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE00C_2000, 0x8003_0600, // buffer_load_format_xyzw v[6:9], v0, s[12:15], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE078_0000, 0x8004_0600, // buffer_store_dwordx4 v[6:9], off, s[16:19], 0
+        0x7E14_020E, // v_mov_b32 v10, s14 (getDimensions)
+        0xE070_0010, 0x8004_0A00, // buffer_store_dword v10, off, s[16:19], 0 offset:16
+        0xBF81_0000, // s_endpgm
+    ];
+
+    let mut srv0 = [0u8; 32];
+    srv0[0] = 0x41;
+    srv0[4..6].copy_from_slice(&[1, 3]); // SRV in table
+    srv0[16] = 1;
+    srv0[20..23].copy_from_slice(&[4, 4, 0]);
+    let mut uav0 = srv0;
+    uav0[4] = 3; // UAV in table
+    let mut uav1 = uav0;
+    uav1[8] = 8; // +8 dwords (entry 1)
+
+    let cs_srv = shaders::translate(&crate::pipeline::test_compute_container(
+        CS_FMT_SRV_LOAD,
+        &[srv0, uav1],
+        7,
+    ))
+    .unwrap();
+    let cs_uav = shaders::translate(&crate::pipeline::test_compute_container(
+        CS_FMT_UAV_RW,
+        &[uav0, uav1],
+        7,
+    ))
+    .unwrap();
+    assert!(crate::native::list::Binding::of(&cs_srv).typed_buffers);
+    assert!(crate::native::list::Binding::of(&cs_uav).typed_buffers);
+
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let records = vec![0u32; 8 * 4];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 4).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1; // BUFFER
+
+    let mut raw_out = [0u32; 16];
+    (raw_out[1], raw_out[4], raw_out[8]) = (1, 1024, 1);
+    [raw_out[10], raw_out[11]] = super::addr_tests::halves(super::addr_tests::VA_A + 0x1000);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &raw_out, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+
+    let make_wrong_pso = |t: &Title<Metal>, cs: &HostShader, name: &str| {
+        let mut b = crate::native::list::Binding {
+            name: name.into(),
+            ..crate::native::list::Binding::of(cs)
+        };
+        // Force the scan flags wrong on purpose so `materialize_typed_buffers` skips promotion.
+        b.typed_buffers = false;
+        b.heap_typed_buffers = false;
+        let threads = shaders::threads_of(&cs.dxil).unwrap();
+        let pso = victory_backend::backend::ComputeBackend::create_compute_pipeline_with(
+            &t.host.backend,
+            &cs.dxil,
+            b.layout().as_ref().unwrap(),
+        )
+        .unwrap();
+        Rc::new(crate::native::list::ComputePso {
+            pso,
+            threads,
+            binding: Some(b),
+        })
+    };
+    let Pipe::Compute(pso_srv_right) = t.compute_pipe(&cs_srv, "srv right") else {
+        panic!("{:?}", t.shaders)
+    };
+    let pso_srv_wrong = make_wrong_pso(&t, &cs_srv, "srv wrong");
+    let pso_uav_wrong = make_wrong_pso(&t, &cs_uav, "uav wrong");
+
+    let elem0 = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+    let elem1 = [1.5f32, -2.0, 0.5, 4.0].map(f32::to_bits);
+    f.put(0x2_0000, &elem0);
+    f.put(0x2_0010, &elem1);
+    f.put(0x2_1000, &[0xCAFE_BABEu32; 8]);
+
+    // 1. Fresh SRV slot (`mirror()` wrote `[gpu, 0, size]`): wrong scan reads zeros, no crash.
+    let mut srv_desc = [0u32; 16];
+    (srv_desc[0], srv_desc[1], srv_desc[6]) = (2, 1, 8); // RGBA32_FLOAT, BUFFER, 8 elements
+    [srv_desc[10], srv_desc[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &srv_desc, start);
+    assert!(t.host.mirror(start).unwrap());
+    assert_eq!(t.host.live_typed_views(), 0);
+
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso_srv_wrong);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(t.host.typed_views(), 0);
+    assert_eq!(t.host.live_typed_views(), 0);
+    assert_eq!(
+        f.get(0x2_1000, 5),
+        [0, 0, 0, 0, 0],
+        "fresh SRV with forced-false scan reads [0, 0, 0, 0] and width 0 over canary"
+    );
+
+    // 2. Promote the SRV slot with the real scan (`live_typed_views == 1`), verify non-zero read,
+    // then overwrite slot 0 via `mirror()` (`live_typed_views == 0`) and run the wrong-scan UAV
+    // shader: store is dropped cleanly, load and `getDimensions` read `[0, 0, 0, 0, 0]`.
+    let mut l_ok = NativeList::default();
+    l_ok.set_heaps(Some(&heap), None);
+    l_ok.set_compute_pipeline(&pso_srv_right);
+    l_ok.set_compute_root_table(0, &heap, 0);
+    l_ok.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l_ok]);
+    assert_eq!(t.host.typed_views(), 1);
+    assert_eq!(t.host.live_typed_views(), 1);
+    assert_eq!(f.get(0x2_1000, 5), [elem1[0], elem1[1], elem1[2], elem1[3], 8]);
+
+    f.put(0x2_1000, &[0xCAFE_BABEu32; 8]);
+    f.put(0x2_1800, &[0xDEAD_0001u32, 0xDEAD_0002, 0xDEAD_0003, 0xDEAD_0004]);
+    let mut uav_desc = [0u32; 16];
+    (uav_desc[0], uav_desc[1], uav_desc[4]) = (2, 1, 8); // RGBA32_FLOAT UAV, 8 elements
+    [uav_desc[10], uav_desc[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav_desc, start);
+    assert!(t.host.mirror(start).unwrap());
+    assert_eq!(
+        t.host.live_typed_views(),
+        0,
+        "re-mirroring slot 0 drops its previous texture_buffer view"
+    );
+
+    let mut l_uav = NativeList::default();
+    l_uav.set_heaps(Some(&heap), None);
+    l_uav.set_compute_pipeline(&pso_uav_wrong);
+    l_uav.set_compute_root_table(0, &heap, 0);
+    l_uav.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l_uav]);
+    assert_eq!(t.host.typed_views(), 1, "wrong-scan UAV did not promote slot 0");
+    assert_eq!(t.host.live_typed_views(), 0);
+    assert_eq!(
+        f.get(0x2_0010, 4),
+        elem1,
+        "null texture_buffer UAV store leaves title memory untouched"
+    );
+    assert_eq!(
+        f.get(0x2_1000, 5),
+        [0, 0, 0, 0, 0],
+        "overwritten UAV with forced-false scan reads [0, 0, 0, 0] and width 0"
+    );
+    drop(records);
+}
+
+#[test]
+#[ignore = "benchmark: cargo test -p victory-gpu world_heap_mirror_lazy_benchmark -- --ignored --nocapture"]
+fn world_heap_mirror_lazy_benchmark() {
+    fn phys_footprint() -> usize {
+        const TASK_VM_INFO: i32 = 22;
+        unsafe extern "C" {
+            fn mach_task_self() -> u32;
+            fn task_info(task: u32, flavor: i32, info: *mut u64, count: *mut u32) -> i32;
+        }
+        let mut info = [0u64; 64];
+        let mut count = 128u32;
+        // SAFETY: local buffer of `count` 32-bit words for `TASK_VM_INFO`.
+        let kr = unsafe { task_info(mach_task_self(), TASK_VM_INFO, info.as_mut_ptr(), &mut count) };
+        if kr == 0 && count >= 38 { info[18] as usize } else { 0 }
+    }
+
+    let Some(t) = title() else { return };
+    let _f = super::addr_tests::Fixture::new(&t);
+    const TOTAL: usize = 40_000;
+    let records = vec![0u32; 8 * TOTAL];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, TOTAL).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1; // BUFFER
+
+    let mut raw_view = [0u32; 16];
+    (raw_view[1], raw_view[4], raw_view[8]) = (1, 16, 1); // FLAG_RAW (`main` baseline: 0 pending bits)
+    [raw_view[10], raw_view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    for i in 0..TOTAL {
+        crate::descriptor::create_placed_uav(
+            std::ptr::null_mut(),
+            &resource,
+            &raw_view,
+            start + (i as u64) * 32,
+        );
+    }
+    assert!(t.host.mirror(start).unwrap());
+    let fp_base0 = phys_footprint();
+    let t_base = std::time::Instant::now();
+    for i in 0..TOTAL {
+        assert!(t.host.mirror(start + (i as u64) * 32).unwrap());
+    }
+    let base_ms = t_base.elapsed().as_secs_f64() * 1000.0;
+    let fp_base1 = phys_footprint();
+    println!(
+        "baseline NativeHost::mirror 40,000 raw entries: {base_ms:.2} ms ({:.2} us/entry), phys_footprint = {:.2} MiB (cold delta {:.1} KiB)",
+        base_ms * 1000.0 / TOTAL as f64,
+        fp_base1 as f64 / (1024.0 * 1024.0),
+        (fp_base1 as isize - fp_base0 as isize) as f64 / 1024.0,
+    );
+
+    for i in 0..TOTAL {
+        let mut view = [0u32; 16];
+        match i % 4 {
+            0 => (view[0], view[1], view[4], view[5]) = (0, 1, 16, 16), // structured 16B
+            1 => (view[0], view[1], view[4], view[5]) = (0, 1, 16, 8),  // structured 8B
+            2 => (view[0], view[1], view[4], view[5]) = (0, 1, 16, 4),  // structured 4B
+            _ => (view[0], view[1], view[4], view[5]) = (2, 1, 16, 0),  // typed RGBA32_FLOAT
+        }
+        [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+        crate::descriptor::create_placed_uav(
+            std::ptr::null_mut(),
+            &resource,
+            &view,
+            start + (i as u64) * 32,
+        );
+    }
+
+    let fp_before = phys_footprint();
+    let t0 = std::time::Instant::now();
+    for i in 0..TOTAL {
+        assert!(t.host.mirror(start + (i as u64) * 32).unwrap());
+    }
+    let mirror_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let fp_after = phys_footprint();
+    println!(
+        "lazy NativeHost::mirror 40,000 structured+typed entries: {mirror_ms:.2} ms ({:.2} us/entry), typed_views = {}, pending = {}, phys_footprint delta over raw = {:.1} KiB",
+        mirror_ms * 1000.0 / TOTAL as f64,
+        t.host.typed_views(),
+        heap.typed_pending.borrow().count(),
+        (fp_after as isize - fp_before as isize) as f64 / 1024.0,
+    );
+    assert_eq!(t.host.typed_views(), 0);
+    assert_eq!(heap.typed_pending.borrow().count(), TOTAL);
+    drop(records);
+}

@@ -1567,7 +1567,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 continue;
             }
             let n = limits.iter().filter(|(s, _)| *s as usize == slot).map(|(_, n)| *n).max().unwrap_or(if limits.is_empty() { 24 } else { 0 });
-            // Not past the heap's end.
+            // Not past the heap's end; entries the shader names beyond it are counted.
+            let past = n.saturating_sub(h.count.saturating_sub(*at));
+            if past > 0 {
+                reads.push(format!("{slot}.past-heap={past}@{at}/{}", h.count));
+            }
             for k in 0..n.min(h.count.saturating_sub(*at)) as u64 {
                 match crate::descriptor::view(h.start + (*at as u64 + k) * Self::step(HeapKind::Resource)) {
                     Some(View::Shader(r, desc)) => match texture_info_of(r) {

@@ -1952,3 +1952,33 @@ Tests: `victory-shader` `emit::export_tests::a_vertex_id_rect_list_export_makes_
 (64 of 64 texels) and `vertex_id_rectangle_lists_draw_half_tiles_multiple_rects_and_interpolated_params`
 (32 of 64 half-tile, multi-rectangle direct and indirect draws, and interpolated `TEXCOORD` across
 the fourth corner).
+
+
+## Mip-aware texture probes and pool-coalesced partial reads (#179)
+
+In GFX10 `Addr2` layouts (`Layout::tiled` and `Layout::linear`), mips are packed smallest-first:
+`[0..64 KiB)` holds the mip tail (with bytes `0..1024` left as zero padding for 2D surfaces),
+followed by coarse-to-fine standard mips, with mip 0 occupying the top ~75% of the range. When
+world streaming maps physical pages for coarse mips while fine mips stay unmapped (`NO_ACCESS`):
+
+* `probe_nonzero` previously checked only `(size / 2) & !4095` (inside mip 0), missing coarse-mip
+  writes into blank textures until the scanner's round; `probe_read` sampled `0..256` (zero tail
+  padding) and seven offsets mostly inside mip 1 and mip 0, so coarse-mip updates left
+  `sampled_sees_writes = false` and forced immediate whole-texture re-reads (`every = 1`, up to
+  `WHOLE_BUDGET = 8 MiB` per submission). `probe_nonzero` now also checks the coarsest and
+  first-tail mip centers on multi-mip layouts, and `probe_read` adds one `256`-byte center sample
+  per mip level (`Layout::offset` with XOR and pipe-bank XOR applied), while resetting `skipped`
+  whenever a whole read runs.
+* `PoolTable::read_mapped_with` coalesces adjacent mapped title-address pages across pools and
+  out-of-order 64 KiB physical pages into one `safe_read` per contiguous resident span and zeroes
+  unmapped fine-mip gaps without `mach_vm_region` traps (`read_texture_chunk` also coalesces
+  adjacent readable VM regions for non-pool ranges).
+* `detile_changed` (`Tracked::uploaded_mips`) skips staging allocations, CPU detiling, and
+  `replaceRegion` uploads for never-uploaded blank textures and all-zero non-tail mips (fresh
+  `MTLStorageMode::Shared` textures start zeroed), and sampled textures enter `WATCH` once their
+  first submission read populates `seen` rather than being hashed twice at realization.
+
+Tests (`victory-gpu`): `native::memory::tests::read_mapped_with_coalesces_adjacent_pages_across_pools_and_zeroes_gaps`,
+`native::textures::tests::mip_aware_probes_catch_tail_and_coarse_mips_in_reverse_mip_layout`,
+`native::textures::tests::read_texture_chunk_coalesces_adjacent_readable_regions`, and
+`native::tests::texture_tests::streamed_mips_across_scattered_pool_pages_upload_each_step_without_whole_rereads`.

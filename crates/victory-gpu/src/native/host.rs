@@ -1570,9 +1570,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
             // Not past the heap's end.
             for k in 0..n.min(h.count.saturating_sub(*at)) as u64 {
                 match crate::descriptor::view(h.start + (*at as u64 + k) * Self::step(HeapKind::Resource)) {
-                    Some(View::Shader(r, _)) => {
-                        if texture_info_of(r).is_some() { keys.push(r); reads.push(format!("{slot}.{k}={}", d(r, texture_info_of(r)))); }
-                    }
+                    Some(View::Shader(r, _)) => match texture_info_of(r) {
+                        Some(i) => { keys.push(r); reads.push(format!("{slot}.{k}={}", d(r, Some(i)))); }
+                        // Named too, so a table entry the host cannot draw from shows in the trace.
+                        None => reads.push(format!("{slot}.{k}={r:#x}:untracked")),
+                    },
                     Some(View::Unordered(r, _, _)) => {
                         if texture_info_of(r).is_some() { keys.push(r); }
                         writes.push(format!("{slot}.{k}={}", d(r, texture_info_of(r))));
@@ -1580,6 +1582,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     Some(View::Placed(u, res, v)) if res[0] > 1 => {
                         let address = u64::from(v[10]) | u64::from(v[11]) << 32;
                         let s = format!("{slot}.{k}=placed:{}", d(address as usize, placed_info_of(address, &res)));
+                        if u { writes.push(s) } else { reads.push(s) }
+                    }
+                    Some(View::Placed(u, res, _)) => {
+                        let s = format!("{slot}.{k}=placed-dim{}", res[0]);
                         if u { writes.push(s) } else { reads.push(s) }
                     }
                     Some(_) => {}

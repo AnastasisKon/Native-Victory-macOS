@@ -556,6 +556,39 @@ impl Metal {
         }
     }
 
+    /// A command buffer of `queue`, with encoder execution status when tracing failures.
+    fn new_command_buffer(&self, queue: &Queue) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
+        if self.trace_fails {
+            let d = MTLCommandBufferDescriptor::new();
+            d.setErrorOptions(MTLCommandBufferErrorOption::EncoderExecutionStatus);
+            queue.0.commandBufferWithDescriptor(&d)
+        } else {
+            queue.0.commandBuffer()
+        }
+        .ok_or_else(|| "no command buffer".to_string())
+    }
+
+    /// The command buffer for the next piece of a split submission (`VICTORY_PASSES_PER_BUFFER`).
+    /// A residency set keeps its allocations resident only for the command buffers it was given
+    /// to, so every heap is attached again (`attached_heaps` is emptied): without that, pieces 2
+    /// and later read heap entries with nothing keeping them resident, and the GPU faulted
+    /// (`kIOGPUCommandBufferCallbackErrorPageFault`). The submission's waits are encoded again too,
+    /// so no piece starts before what the submission waits for (values already reached cost
+    /// nothing).
+    fn next_piece(
+        &self,
+        queue: &Queue,
+        waits: &[(&crate::metal::Fence, u64)],
+        attached_heaps: &mut Vec<*const Heap>,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
+        let cb = self.new_command_buffer(queue)?;
+        attached_heaps.clear();
+        for (f, v) in waits {
+            cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
+        }
+        Ok(cb)
+    }
+
     /// A set covers all passes in the command buffer. Later uses can still commit new entries.
     fn use_heap_cb(
         &self,
@@ -1109,14 +1142,7 @@ impl GraphicsBackend for Metal {
             report_in_flight();
             self.trace_enc.borrow_mut().clear();
         }
-        let cb = if self.trace_fails {
-            let d = MTLCommandBufferDescriptor::new();
-            d.setErrorOptions(MTLCommandBufferErrorOption::EncoderExecutionStatus);
-            queue.0.commandBufferWithDescriptor(&d)
-        } else {
-            queue.0.commandBuffer()
-        }
-        .ok_or("no command buffer")?;
+        let mut cb = self.new_command_buffer(queue)?;
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut label = String::new();
         if self.trace_fails {
@@ -1157,7 +1183,14 @@ impl GraphicsBackend for Metal {
         // is dropped, the command buffer still commits, and the caller is told.
         let mut refused: Option<String> = None;
         let mut attached_heaps = Vec::new();
-        for pass in work.passes {
+        // A submission's passes go in command buffers of at most `passes_per_buffer` passes
+        // (`VICTORY_PASSES_PER_BUFFER`, default 8; 0: all in one). macOS stops a command buffer
+        // that runs too long on the GPU (`kIOGPUCommandBufferCallbackErrorTimeout`): a world
+        // submission of 72 to 80 passes ran 6 to 21 s with the ray-traced passes on, while none of
+        // its passes alone took more than 1.4 s. The earlier pieces are committed as they fill;
+        // the last one carries the signals and what the submission owes if it fails.
+        let per = self.passes_per_buffer;
+        for (n, pass) in work.passes.iter().enumerate() {
             let encoded = match pass {
                 Pass::Compute(dispatches) => {
                     self.encode_compute(&cb, dispatches, set_on_queue, order, &mut attached_heaps)
@@ -1176,6 +1209,14 @@ impl GraphicsBackend for Metal {
                 // so one bad pass does not cost the frame's whole picture.
                 if refused.is_none() {
                     refused = Some(e);
+                }
+            }
+            if per > 0 && (n + 1) % per == 0 && n + 1 < work.passes.len() {
+                self.commit_piece(&cb);
+                cb = self.next_piece(queue, work.waits, &mut attached_heaps)?;
+                if self.trace_fails {
+                    let piece = format!("{label} piece {}", (n + 1) / per);
+                    cb.setLabel(Some(&objc2_foundation::NSString::from_str(&piece)));
                 }
             }
         }
@@ -1228,6 +1269,7 @@ impl GraphicsBackend for Metal {
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
         cb.commit();
+        self.committed.set(self.committed.get() + 1);
         match refused {
             Some(e) => Err(e),
             None => Ok(()),
@@ -1277,6 +1319,31 @@ fn color_attachments(arr: &MTLRenderPipelineColorAttachmentDescriptorArray, d: &
 }
 
 impl Metal {
+    /// Commits a piece of a submission that is not its last ([`GraphicsBackend::submit_passes`]):
+    /// one the GPU fails is logged as the last piece's failure is. What the submission owes is
+    /// paid by its last piece, which runs after this one.
+    fn commit_piece(&self, cb: &ProtocolObject<dyn MTLCommandBuffer>) {
+        let trace = self.trace_fails;
+        let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            // SAFETY: Metal passes the command buffer that completed.
+            let done = unsafe { done.as_ref() };
+            if let Some(e) = done.error()
+                && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < if trace { 200 } else { 20 }
+            {
+                if trace {
+                    trace_failure(done, &e);
+                } else {
+                    eprintln!("metal: command buffer failed: {e:?} ({})", e.localizedDescription());
+                }
+            }
+        });
+        // SAFETY: the block is retained by Metal until it has run.
+        unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
+        cb.commit();
+        self.committed.set(self.committed.get() + 1);
+    }
+
     /// The pipeline of a compiled state `pso`: what the passes set beside it.
     fn finish_render(&self, d: &RenderPipelineDesc<'_>, pso: RenderState, mesh: Option<MTLSize>) -> Result<RenderPipeline, String> {
         let has_stencil = d.depth == Some(Format::D32FloatS8);
@@ -2906,6 +2973,42 @@ mod owed_tests {
     use crate::backend::ComputeBackend;
     use crate::mem::{Region, page_size};
 
+    /// A submission of more passes than a command buffer takes goes in several, in order: every
+    /// pass runs and the fence is signalled once the last has.
+    #[test]
+    fn a_long_submission_is_cut_into_command_buffers_of_at_most_n_passes() {
+        let m = Metal::new().unwrap().with_passes_per_buffer(8);
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        // SAFETY: inside the region; the GPU is idle.
+        let at = |o: usize| unsafe { region.ptr.add(o) as *const u8 };
+        let q = m.create_queue().unwrap();
+        let fence = m.create_fence(0).unwrap();
+        // Each pass fills its own 8 bytes; the last one also overwrites the first pass's.
+        let mut passes: Vec<_> = (0..20u8)
+            .map(|n| Pass::Blit(vec![BlitOp::Fill { dst: (&buf, at(usize::from(n) * 8)), len: 8, value: n + 1 }]))
+            .collect();
+        passes.push(Pass::Blit(vec![BlitOp::Fill { dst: (&buf, at(0)), len: 8, value: 0xEE }]));
+        let signals = [(&fence, 1)];
+        let before = m.command_buffers();
+        m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }).unwrap();
+        assert_eq!(m.command_buffers() - before, 3, "21 passes, 8 to a command buffer");
+        assert!(m.wait(&fence, 1, 5000), "the last piece signals");
+        // SAFETY: inside the region; the GPU is done with it.
+        let bytes = unsafe { std::slice::from_raw_parts(region.ptr, 20 * 8) };
+        assert_eq!(&bytes[..8], &[0xEE; 8], "the pieces ran in order");
+        for n in 1..20 {
+            assert_eq!(&bytes[n * 8..][..8], &[n as u8 + 1; 8], "pass {n}");
+        }
+
+        // 0: the whole submission in one command buffer.
+        let m = m.with_passes_per_buffer(0);
+        let before = m.command_buffers();
+        m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &[(&fence, 2)] }).unwrap();
+        assert_eq!(m.command_buffers() - before, 1);
+        assert!(m.wait(&fence, 2, 5000));
+    }
+
     #[test]
     fn a_failed_command_buffer_is_paid_on_the_cpu() {
         let m = Metal::new().unwrap();
@@ -3227,6 +3330,30 @@ mod heap_set_tests {
         let mut second = Vec::new();
         assert!(attaches(&a, &mut second));
         assert!(!attaches(&a, &mut second));
+    }
+
+    /// Each piece of a split submission is a command buffer of its own, and a residency set keeps
+    /// its allocations resident only for the command buffers it was given to: the next piece
+    /// attaches every heap again.
+    #[test]
+    fn the_next_piece_of_a_split_submission_attaches_the_heaps_again() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 1).unwrap();
+        if heap.set.is_none() {
+            eprintln!("skipped: no residency sets on this system");
+            return;
+        }
+        let q = m.create_queue().unwrap();
+        let attaches = |attached: &mut Vec<*const Heap>| {
+            let mut called = false;
+            m.use_heap_cb(&heap, attached, |_| called = true);
+            called
+        };
+        let mut attached = Vec::new();
+        assert!(attaches(&mut attached), "the first piece");
+        assert!(!attaches(&mut attached), "once per command buffer");
+        let _next = m.next_piece(&q, &[], &mut attached).unwrap();
+        assert!(attaches(&mut attached), "the next piece is given the heap's set too");
     }
 
     /// A heap's residency set holds the heap buffer and each allocation its entries name, once,

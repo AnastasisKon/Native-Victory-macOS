@@ -803,7 +803,9 @@ D3D12 host through `State::execute_indirect` (kind 10). GPU addresses are title 
 `D3D12_DISPATCH_MESH_ARGUMENTS` (three 32-bit group counts, 12 bytes), `x` is unused when
 `indirect` is set, and `flags` and `payload` change nothing the host needs. "indirect mesh
 dispatches dropped" (D3D12) and "an indirect mesh dispatch" (native) now mean the host could not
-run it. Direct mesh dispatches are still dropped on the native host, counted and warned once.
+run it.
+
+Direct mesh dispatches run too (#353): `DispatchMesh(x, y, z)` (method 0x3f8) and `DispatchMeshX` with `indirect` 0 go to `glue::dispatch_mesh`, which checks the bound pipeline as the indirect path does (`graphics(.., mesh = true)`) and encodes `NativeList::dispatch_mesh`. `DispatchMeshX` runs `[x, 1, 1]` groups, the D3D12 host's guess (`flags` and `payload` ignored). Without a mesh pipeline the dispatch is dropped for the reason `graphics` logs and counted in the frame line's `mesh=`. Before this, every direct one was dropped: a tester's prologue run (#343, Series S) counted `mesh=5` by frame 2048. Tests: `a_direct_dispatch_mesh_x_draws_its_groups`, `a_direct_dispatch_mesh_draws_its_groups`.
 
 #### Dropped work is logged loudly
 

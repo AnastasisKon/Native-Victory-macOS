@@ -1852,6 +1852,31 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
     });
 }
 
+/// A direct mesh dispatch (`DispatchMesh`, or `DispatchMeshX` without an argument address): the
+/// bound mesh pipeline runs `[x, y, z]` groups, as an indirect one runs its record's (#353). With
+/// no mesh pipeline it is dropped for the reason `graphics` gives, and counted in the frame line's
+/// `mesh=` as before.
+pub(crate) fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+    RECORDED.fetch_add(1, Ordering::Relaxed);
+    with_list(this, |t, l| {
+        if graphics(t, l, true).is_none() {
+            crate::list::DROPPED_KINDS[0].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if pass_on() {
+            pass_note_op(l, &format!("mesh[{x},{y},{z}]"), None, None);
+        }
+        match l.list.dispatch_mesh(x, y, z) {
+            Ok(()) => {
+                ENCODED.fetch_add(1, Ordering::Relaxed);
+                l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                trace_present_draw(t, l);
+            }
+            Err(e) => tracing::warn!(error = %e, "mesh dispatch"),
+        }
+    });
+}
+
 pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
     with_list(this, |t, l| {

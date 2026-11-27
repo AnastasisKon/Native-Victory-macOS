@@ -341,6 +341,66 @@ fn a_wrapped_view_follows_title_pages_remapped_or_unmapped_under_it() {
     drop(slots);
 }
 
+/// The title copies one view into many heap entries; following the pages under them walks the
+/// pool table once for that range a look, not once an entry, and every copy still follows a
+/// remap (#267 review: 54 copies of the 174 MiB view cost about 3 ms a look).
+#[test]
+fn copies_of_a_wrapped_view_are_followed_with_one_walk() {
+    let Some(h) = host() else { return };
+    let page = page_size().max(16384);
+    let pool = Alias::new(5 * page).unwrap();
+    let info = PoolInfo { id: 1, base: pool.primary as usize, len: pool.len, memory_entry: None };
+    h.memory().pool_created(&info);
+    let title = TitlePages::new(&h, &pool, &info, &[2 * page, page, 3 * page], page);
+    let (src, dst) = (page - 128, 2 * page);
+    title.write(src, &(0..64u32).collect::<Vec<_>>());
+    // SAFETY: inside the pool's own mapping; the GPU is idle.
+    unsafe { std::ptr::copy_nonoverlapping((100..132u32).collect::<Vec<_>>().as_ptr(), pool.primary.add(4 * page).cast(), 32) };
+    let slots = vec![0u32; 8 * 8];
+    let start = slots.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 8).unwrap();
+    let placed = |at: usize| {
+        let mut d = [0u32; 16];
+        (d[1], d[6], d[8]) = (1, 64, 1);
+        d[10] = (title.va + at as u64) as u32;
+        d[11] = ((title.va + at as u64) >> 32) as u32;
+        d
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    // Entries 0 to 2: three copies of the source view; entry 3: the output.
+    for k in 0..3 {
+        crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &placed(src), start + 32 * k);
+        assert!(h.mirror(start + 32 * k).unwrap());
+    }
+    let mut uav = placed(dst);
+    (uav[4], uav[6]) = (64, 0);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 96);
+    assert!(h.mirror(start + 96).unwrap());
+    let walks = || super::host::SIGNATURES.with(|n| n.replace(0));
+    // A pool-table change elsewhere: one walk for the three copies, none moved.
+    h.memory().pool_created(&PoolInfo { id: 2, base: 0x1000, len: 0x1000, memory_entry: None });
+    walks();
+    run(&h, &[]);
+    assert_eq!(walks(), 1);
+    // Remapped under them: still one walk, and the copy the program reads follows.
+    let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    title.remap(&h, &info, &pool, 1, 4 * page, page);
+    title.write(dst, &[0xCAFE_CAFEu32; 64]);
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[3, 1]);
+    l.set_compute_root_table(1, &heap, 2);
+    l.dispatch(1, 1, 1).unwrap();
+    walks();
+    run(&h, &[&l]);
+    assert_eq!(walks(), 1);
+    let expect: Vec<u32> = (0..64u32).map(|i| if i < 32 { i * 3 + 1 } else { (i + 68) * 3 + 1 }).collect();
+    assert_eq!(title.read::<u32>(dst, 64), expect);
+    drop(slots);
+}
+
 fn run(h: &Host, lists: &[&NativeList<Metal>]) {
     let q = h.backend.create_queue().unwrap();
     let f = h.backend.create_fence(0).unwrap();

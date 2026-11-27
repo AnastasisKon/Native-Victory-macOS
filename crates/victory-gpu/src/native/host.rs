@@ -1827,13 +1827,20 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 continue;
             }
             let n = limits.iter().filter(|(s, _)| *s as usize == slot).map(|(_, n)| *n).max().unwrap_or(if limits.is_empty() { 24 } else { 0 });
-            // Not past the heap's end.
+            // Not past the heap's end; entries the shader names beyond it are counted.
+            let past = n.saturating_sub(h.count.saturating_sub(*at));
+            if past > 0 {
+                reads.push(format!("{slot}.past-heap={past}@{at}/{}", h.count));
+            }
             for k in 0..n.min(h.count.saturating_sub(*at)) as u64 {
                 match crate::descriptor::view(h.start + (*at as u64 + k) * Self::step(HeapKind::Resource)) {
-                    Some(View::Shader(r, _)) => match texture_info_of(r) {
+                    Some(View::Shader(r, desc)) => match texture_info_of(r) {
                         Some(i) => { keys.push(r); reads.push(format!("{slot}.{k}={}", d(r, Some(i)))); }
                         // Named too, so a table entry the host cannot draw from shows in the trace.
-                        None => reads.push(format!("{slot}.{k}={r:#x}:untracked")),
+                        None => {
+                            let buffer = matches!(self.resources.borrow().get(&r), Some(Res::Buffer(..)));
+                            reads.push(format!("{slot}.{k}={}", untextured_srv(r, buffer, desc)));
+                        }
                     },
                     Some(View::Unordered(r, _, _)) => {
                         if texture_info_of(r).is_some() { keys.push(r); }
@@ -1844,8 +1851,27 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         let s = format!("{slot}.{k}=placed:{}", d(address as usize, placed_info_of(address, &res)));
                         if u { writes.push(s) } else { reads.push(s) }
                     }
-                    Some(View::Placed(u, res, _)) => {
-                        let s = format!("{slot}.{k}=placed-dim{}", res[0]);
+                    // A constant buffer view: its address, size and first dwords now (up to 512 bytes).
+                    Some(View::Constant(a, size)) => {
+                        let mut w = vec![0u8; (size as usize).clamp(4, 512) & !3];
+                        let ok = a != 0 && super::safe_read(a as *const u8, &mut w);
+                        let words: Vec<String> = w.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect();
+                        reads.push(format!("{slot}.{k}=cbv:{a:#x}+{size}:{}", if ok { words.join(",") } else { "unreadable".into() }));
+                    }
+                    Some(v @ View::Placed(u, res, _)) => {
+                        // Dimension 1 is a buffer, which the host reads as memory: its range and first dwords (up to 512 bytes).
+                        let s = match res[0] {
+                            1 => match super::descriptors::decode(&v, &self.resources.borrow()) {
+                                Some(super::descriptors::Decoded::Buffer { addr, size }) => {
+                                    let mut w = vec![0u8; (size as usize).clamp(4, 512) & !3];
+                                    let ok = addr != 0 && super::safe_read(addr as *const u8, &mut w);
+                                    let words: Vec<String> = w.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect();
+                                    format!("{slot}.{k}=placed:buf:{addr:#x}+{size}:desc{:?}:{}", if let View::Placed(_, _, d) = &v { &d[..10] } else { &[][..] }, if ok { words.join(",") } else { "unreadable".into() })
+                                }
+                                _ => format!("{slot}.{k}=placed:buf"),
+                            },
+                            n => format!("{slot}.{k}=placed-dim{n}"),
+                        };
                         if u { writes.push(s) } else { reads.push(s) }
                     }
                     Some(_) => {}
@@ -1854,6 +1880,38 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
         }
         (reads, writes, none, keys)
+    }
+
+    /// Pass trace: the table entries of a noted draw or dispatch as they are when it is submitted,
+    /// against its `PASS` line (made when it was recorded). A `PASSSUB` line lists the entries that
+    /// read differently now: the title rewrote them between recording and submitting.
+    #[cfg(target_os = "macos")]
+    fn pass_at_submit(&self, exec: u64, notes: &[(usize, String)], li: usize, ci: usize, c: &Cmd<B>) {
+        // Only work that ran: a dropped draw's note reads its tables to other limits.
+        let Some((_, note)) = notes.iter().find(|(at, n)| *at == ci && n.contains("out=\"ran")) else { return };
+        let (root, limits): (&[Option<Root<B>>], Vec<(u8, usize)>) = match c {
+            Cmd::Draw { root, binding, .. } => {
+                let mut limits: Vec<(u8, usize)> = Vec::new();
+                // As the `PASS` note read them (`glue::pass_note`).
+                if let Some(b) = binding {
+                    limits.extend(b.table_entries.iter().copied());
+                    if let Some(ps) = &b.ps {
+                        limits.extend(ps.table_entries.iter().copied());
+                    }
+                    if limits.is_empty() {
+                        limits.push((255, 0));
+                    }
+                }
+                (root, limits)
+            }
+            Cmd::Dispatch { root, .. } => (root, Vec::new()),
+            _ => return,
+        };
+        let (reads, writes, _, _) = self.pass_views(root, &limits);
+        let changed = changed_entries(note, reads.iter().chain(&writes));
+        if !changed.is_empty() {
+            eprintln!("PASSSUB exec={exec} li={li} ci={ci} changed={changed:?}");
+        }
     }
 
     /// For `VICTORY_TRACE_RECORD_WRITERS`: what the first 64 entries from each of `root`'s tables
@@ -2261,6 +2319,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
             // Reported from this one preparation: preparing again for the trace would mirror tables
             // and write view pairs twice.
             let prepared = self.prep(c);
+            #[cfg(target_os = "macos")]
+            if noted {
+                self.pass_at_submit(exec, &lists[li].notes, li, ci, c);
+            }
             if noted && let Err(e) = &prepared {
                 eprintln!("PASSFAIL exec={exec} li={li} ci={ci} err={e}");
             }
@@ -2651,6 +2713,42 @@ fn texture_info_of(r: usize) -> Option<super::textures::TextureInfo> {
 #[cfg(not(target_os = "macos"))]
 fn texture_info_of(_: usize) -> Option<super::textures::TextureInfo> {
     None
+}
+
+/// The pass trace's name for a shader-resource view the host has no texture for: a buffer the host
+/// knows (`<key>:buf`), a null resource with its view description's format and dimension
+/// (`null:f<format>:dim<dimension>`, read as zeros), or anything else (`<key>:untracked`).
+/// The entries (`<slot>.<index>=<view>`) of `now` that a `PASS` note does not hold as they are.
+#[cfg(any(test, target_os = "macos"))]
+fn changed_entries<'a>(note: &str, now: impl Iterator<Item = &'a String>) -> Vec<&'a String> {
+    now.filter(|e| !note.contains(&format!("\"{e}\""))).collect()
+}
+
+#[test]
+fn an_entry_rewritten_after_recording_is_listed_at_submit() {
+    let note = r#"kind=draw rd=["1.29=0x10:f54:240x135@0xa0", "1.30=null:f34:dim4"] wr=[]"#;
+    let now = ["1.29=0x10:f54:240x135@0xa0".to_owned(), "1.30=0x20:f34:1280x720@0xb0".to_owned()];
+    assert_eq!(changed_entries(note, now.iter()), [&now[1]]);
+    // A prefix of an entry is not that entry.
+    assert_eq!(changed_entries(r#"rd=["1.3=0x2"]"#, ["1.3=0x".to_owned()].iter()).len(), 1);
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn untextured_srv(r: usize, buffer: bool, desc: Option<[u32; 10]>) -> String {
+    match (r, desc) {
+        (0, Some(d)) => format!("null:f{}:dim{}", d[0], d[1]),
+        (0, None) => "null".into(),
+        _ if buffer => format!("{r:#x}:buf"),
+        _ => format!("{r:#x}:untracked"),
+    }
+}
+
+#[test]
+fn the_pass_trace_names_views_without_a_texture_by_kind() {
+    assert_eq!(untextured_srv(0, false, Some([34, 4, 0, 0, 0, 0, 0, 0, 0, 0])), "null:f34:dim4");
+    assert_eq!(untextured_srv(0, false, None), "null");
+    assert_eq!(untextured_srv(0x1000, true, None), "0x1000:buf");
+    assert_eq!(untextured_srv(0x1000, false, None), "0x1000:untracked");
 }
 
 #[cfg(target_os = "macos")]

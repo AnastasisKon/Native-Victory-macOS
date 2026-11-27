@@ -7342,6 +7342,57 @@ impl<'a> Lower<'a> {
         seen
     }
 
+    /// `buffer_load_dword*` through a descriptor the program builds around its constant table
+    /// (`s_getpc_b64` plus an offset, `records` bytes in dword 2, no stride): the table's
+    /// dwords, and 0 for a dword past `records`, as the console's range check gives. `off` is the
+    /// byte from the descriptor's base, `in_view` the part of it the range check covers (all but
+    /// SOFFSET).
+    // shortcut: every OOB_SELECT mode is taken as a check of each dword's end (mode 3, the one
+    // the console compiler's tables use, RDNA2 ISA table 35); an index (`idxen`) is refused.
+    fn code_buffer_load(
+        &mut self,
+        inst: &Inst,
+        address: &Address,
+        (off, in_view): (V, V),
+        records: u32,
+        indexed: bool,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let count = match inst.name().strip_prefix("buffer_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x3") => 3,
+            Some("x4") => 4,
+            _ => return Err("an access other than a dword load through a descriptor built around a table in the code"),
+        };
+        if indexed {
+            return Err("an indexed load through a descriptor built around a table in the code");
+        }
+        let Fields::Buffer { data: Some(Operand::Vector { reg, .. }), .. } = &inst.fields else {
+            return Err("a buffer result");
+        };
+        let c = self.cur;
+        let mut at = self.s.m.i32(address.offset);
+        if let Some(d) = address.dynamic {
+            let d = self.i32_of(d)?;
+            at = self.s.m.bin(c, Bin::Add, at, d);
+        }
+        let at = self.s.m.bin(c, Bin::Add, at, off);
+        let (zero, limit) = (self.s.m.i32(0), self.s.m.i32(records));
+        for k in 0..count {
+            let c = self.cur;
+            let four = self.s.m.i32(4 * k);
+            let byte = self.s.m.bin(c, Bin::Add, at, four);
+            let x = self.code_dword(byte)?;
+            let end = self.s.m.i32(4 * k + 4);
+            let end = self.s.m.bin(c, Bin::Add, in_view, end);
+            let fits = self.s.m.cmp(c, pred::IULE, end, limit);
+            let x = self.s.m.select(c, fits, x, zero);
+            self.write(inst, Reg::V(reg + k as u8), x, guard);
+        }
+        Ok(())
+    }
+
     /// `s_load_dword*` from the program's constant table.
     fn code_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
         let Fields::Smem {
@@ -13065,8 +13116,15 @@ impl<'a> Lower<'a> {
         if let Some(vo) = voffset {
             off = self.s.m.bin(c, Bin::Add, off, vo);
         }
+        // SOFFSET moves the base, not the bounds (as `computed_buffer`).
+        let in_view = off;
         if let Some(so) = so {
             off = self.s.m.bin(c, Bin::Add, off, so);
+        }
+        if let Source::Built { address, words: [records, _], .. } = src
+            && address.param == CODE
+        {
+            return self.code_buffer_load(inst, address, (off, in_view), *records, index.is_some(), guard);
         }
         if let Some(slot) = self.vertex_table_slot(src) {
             return self.vertex_fetch(inst, slot, typed, count, *format, *offset, index.is_some() && !*offen, guard);

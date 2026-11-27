@@ -89,6 +89,9 @@ stop_timer() {
 trap 'pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; stop_timer; wait "$pid"; echo; echo "Stopped. Log: $log"; exit 130' INT TERM
 wait "$pid"
 rc=$?
+# For run-summary.sh: a host crash (139) and the --seconds limit write no log line of their own.
+[[ -z "$timer" ]] || kill -0 "$timer" 2>/dev/null || echo "# stopped by --seconds" >> "$log"
+echo "# exit code $rc" >> "$log"
 stop_timer
 
 echo

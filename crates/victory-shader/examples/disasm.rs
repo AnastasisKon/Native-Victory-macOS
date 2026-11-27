@@ -1,10 +1,16 @@
 //! Disassembles a dumped code piece: `VICTORY_PIECE=<file> [VICTORY_WAVE32=1] cargo run --example disasm`;
 //! `VICTORY_CONTAINER=<file>` takes the code of a guessed graphics container (`FSPG` part) or of
-//! a compute container (`FSPX` part, at its own wave size) instead.
+//! a compute container (`FSPX` part, at its own wave size) instead;
+//! `VICTORY_SHADER=<file>` the first program in a dumped shader's `DXIL` part (a sweep corpus file).
 
 fn main() {
     let mut wave64 = std::env::var_os("VICTORY_WAVE32").is_none();
-    let code = if let Ok(path) = std::env::var("VICTORY_CONTAINER") {
+    let code = if let Ok(path) = std::env::var("VICTORY_SHADER") {
+        let bytes = std::fs::read(path).expect("readable shader");
+        let c = victory_shader::Container::parse(&bytes).expect("a container");
+        let part = c.part(victory_shader::FourCC::DXIL).expect("a DXIL part");
+        victory_shader::native_programs(part.data).expect("native programs")[0].patched_code()
+    } else if let Ok(path) = std::env::var("VICTORY_CONTAINER") {
         let bytes = std::fs::read(path).expect("readable container");
         let c = victory_shader::Container::parse(&bytes).expect("a container");
         let part = c.part(victory_shader::FourCC::ACCC).expect("an ACCC part");

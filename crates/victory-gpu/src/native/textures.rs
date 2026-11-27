@@ -960,6 +960,13 @@ impl<B: PresentBackend> Title<B> {
         self.textures.get(&key).and_then(|t| t.info.desc()).map(|d| d.format)
     }
 
+    /// The description the host keeps of title texture `key` (a placed one too, which no resource
+    /// object describes).
+    #[cfg(target_os = "macos")]
+    pub(super) fn info_of(&self, key: usize) -> Option<&TextureInfo> {
+        self.textures.get(&key).map(|t| &t.info)
+    }
+
     /// The host texture of title texture `key`.
     pub fn texture_of(&mut self, key: usize) -> Option<Rc<B::Texture>> {
         self.realize(key);

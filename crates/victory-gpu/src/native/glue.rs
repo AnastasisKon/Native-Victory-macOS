@@ -1333,13 +1333,13 @@ fn pass_present(resource: This) {
     if !keys.contains(&(resource as usize)) { keys.push(resource as usize); }
     with_title(|t| {
         for key in keys {
-            let Some(info) = crate::resource::texture_info(key as This) else { continue };
+            let Some(info) = crate::resource::texture_info(key as This).or_else(|| t.info_of(key).cloned()) else { continue };
             let (w, h) = (info.width as usize, info.height as usize);
             let bpp = match info.format { 2 => 16, 10 | 11 | 16 => 8, 24 | 26 | 28 | 29 | 34 | 41 | 42 | 67 | 87 | 91 => 4, 49 | 54 | 56 | 57 => 2, 61 | 62 | 65 => 1, _ => 0 };
             // A 3D texture (a colour grading table) is read whole; arrays are skipped.
             let d = if info.dimension == victory_formats::texture::Dimension::Tex3d { info.depth_or_layers.max(1) as usize } else { 1 };
             if bpp == 0 || w * h == 0 || w * h > 3840 * 2160 || d == 1 && info.depth_or_layers > 1 && info.format != 28 {
-                eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} layers={} skipped", info.format, info.depth_or_layers);
+                eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} layers={} skipped{}", info.format, info.depth_or_layers, pass_mips(t, key, &info));
                 continue;
             }
             let Some(tex) = t.texture_of(key) else {
@@ -1392,6 +1392,32 @@ fn pass_present(resource: This) {
             eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} at={:#x} nonzero={nonzero:.4}{slices}{extra} file={name}", info.format, info.memory as usize);
         }
     });
+}
+
+/// For a single 2D texture `PASSTEX` decodes no image of (block-compressed ones): the share of
+/// non-zero elements (blocks) in each mip of the host texture, and in the title memory the
+/// host read it from (mips in the tail, which share a block, are left out), so a trace shows
+/// which mips the title had not filled and which the host had not uploaded.
+fn pass_mips(t: &mut MetalTitle, key: usize, info: &super::textures::TextureInfo) -> String {
+    let l = &info.layout;
+    let n = l.desc.element_bytes as usize;
+    if info.depth_or_layers > 1 || info.dimension != victory_formats::texture::Dimension::Tex2d || n == 0 {
+        return String::new();
+    }
+    let Some(tex) = t.texture_of(key) else { return " no host texture".into() };
+    let share = |bytes: &[u8]| bytes.chunks_exact(n).filter(|e| e.iter().any(|&b| b != 0)).count() as f64 / (bytes.len() / n).max(1) as f64;
+    let (mut host, mut title) = (Vec::new(), Vec::new());
+    for (mip, m) in l.mips.iter().enumerate() {
+        let (w, h) = (m.width as usize, m.height as usize);
+        let mut out = vec![0u8; w * h * n];
+        victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, mip, 0, &mut out, w * n, w * h * n);
+        host.push(format!("{:.3}", share(&out)));
+        if (mip as u32) < l.first_tail_mip {
+            let bytes = super::textures::read_memory(info.memory.wrapping_add(m.offset as usize), (m.pitch * m.rows) as usize * n);
+            title.push(format!("{:.3}", share(&bytes)));
+        }
+    }
+    format!(" at={:#x} mips_nonzero=[{}] title_mips_nonzero=[{}]", info.memory as usize, host.join(","), title.join(","))
 }
 
 /// Work dropped because its pipeline has no host pipeline.

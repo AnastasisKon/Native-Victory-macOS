@@ -1539,7 +1539,7 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
 /// address `records + i * stride`, each read on the GPU; with a count buffer at title address
 /// `count`, record `i` runs only if `i` is below the count, also read on the GPU (D3D12 runs
 /// min(count, max) records). False when the host cannot run it; the caller logs
-/// that. Rectangle lists drop here.
+/// that. Indexed rectangle lists drop here.
 pub(crate) fn execute_indirect(
     this: This,
     command: crate::signature::Command,
@@ -1601,17 +1601,18 @@ pub(crate) fn execute_indirect(
         Command::Draw | Command::DrawIndexed => {
             RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
             with_list(this, |t, l| match graphics(t, l, false) {
-                // shortcut: a rectangle list's records count vertices of three-corner rectangles;
-                // drawing them needs the counts rewritten on the GPU first.
-                Some(true) => {
+                // shortcut: an indexed rectangle list is not drawn, as directly.
+                Some(true) if command == Command::DrawIndexed => {
                     dropped("an indirect rectangle-list draw");
                     trace_drop(l);
                     true
                 }
-                Some(false) => {
+                Some(rect) => {
                     for i in 0..max {
                         let indexed = command == Command::DrawIndexed;
                         let r = match count {
+                            // As a direct one: four-vertex instances, the record rewritten on the GPU.
+                            _ if rect => l.list.draw_rects_indirect(at(i), count.map(|c| (c, i))),
                             Some(c) => l.list.draw_indirect_counted(at(i), indexed, c, i),
                             None => l.list.draw_indirect(at(i), indexed),
                         };

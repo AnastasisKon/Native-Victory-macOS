@@ -470,3 +470,91 @@ fn a_converted_mesh_program_with_run_time_parameters_is_valid_ir() {
     let assembled = Command::new(assembler).arg(path("mesh.ll")).arg("-o").arg(path("mesh.air")).output().unwrap();
     assert!(assembled.status.success(), "{}", String::from_utf8_lossy(&assembled.stderr));
 }
+
+/// A legacy vertex program that takes its position from the vertex id alone (no vertex fetch):
+/// id 1 is (1, -1), id 2 (-1, 1), any other (-1, -1). As a rectangle list's three corners
+/// (0, 1, 2), the rectangle is the whole target.
+const RECT_BY_ID: &[u32] = &[
+    0x7E14_02F3, // v_mov_b32 v10, -1.0
+    0x7E16_02F2, // v_mov_b32 v11, 1.0
+    0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+    0x0204_170A, // v_cndmask_b32 v2, v10, v11, vcc
+    0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
+    0x0206_170A, // v_cndmask_b32 v3, v10, v11, vcc
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0x7E0C_02F2, // v_mov_b32 v6, 1.0
+    0xF800_08CF, 0x0604_0302, // exp pos0 v2, v3, v4, v6 done
+    0xBF81_0000, // s_endpgm
+];
+
+/// A rectangle-list pipeline of [`RECT_BY_ID`] translated as `guess` does (`Options::rect_list`),
+/// and a list into a black 8x8 target with it set as a strip.
+fn rect_list_into(t: &mut Title<Metal>) -> (Rc<Texture>, NativeList<Metal>) {
+    let mut meta = [0; 0x10];
+    meta[12] = 0x40;
+    let bytes: Vec<_> = RECT_BY_ID.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let c = victory_shader::emit::graphics::container(HwStage::Vs, &bytes, &meta).unwrap();
+    let vs = shaders::translate_rect(&c).unwrap();
+    assert_eq!(vs.stage, HwStage::Vs);
+    let ps = translate(HwStage::Ps, RED);
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], true);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "rect") else {
+        panic!("{:?}", t.shaders);
+    };
+    let (color, mut list) = list_into(t, &pso, binding);
+    list.set_graphics_pipeline(&pso, Topology::TriangleStrip);
+    (color, list)
+}
+
+fn lit(t: &Title<Metal>, color: &Texture) -> usize {
+    pixels(t, color).iter().filter(|p| **p == [255, 128, 128, 255]).count()
+}
+
+/// The contributor lead "a rectangle list whose vertex program takes everything from the vertex
+/// id covers half of each rectangle": so here too. The direct path (`glue::draw`, 3 vertices: one
+/// instance of 4) runs the program for ids 0 to 3, and the rectangle translation only builds the
+/// fourth corner from fetched attributes, so id 3 is the program's own (-1, -1): the second
+/// triangle repeats the first, and only the lower-left half of the target is drawn (28 texels:
+/// those strictly below the diagonal). With more rectangles every instance sees ids 0 to 3 again,
+/// so each draws this half of the first one (from the code; not drawn here).
+/// shortcut: recorded as it is; the fourth corner of such a program needs its position for ids
+/// 0 to 2 in one invocation (the program run three times), not a small change.
+#[test]
+fn a_rectangle_of_a_vertex_id_program_covers_half_its_rectangle() {
+    let Some(mut t) = title() else { return };
+    let (color, mut list) = rect_list_into(&mut t);
+    list.draw_instanced(4, 1, 0, 0).unwrap();
+    super::run(&t.host, &[&list]);
+    let n = lit(&t, &color);
+    assert_eq!(n, 28, "{n} of 64 lit");
+}
+
+/// `ExecuteIndirect` of a rectangle list draws each record as the direct path draws its arguments
+/// (the record rewritten on the GPU to four-vertex instances): a record of 3 vertices lights what
+/// the direct draw does, one of 0 vertices, an instanced one, or one past the count, nothing.
+#[test]
+fn an_indirect_rectangle_list_draws_its_records_as_a_direct_one() {
+    let Some(mut t) = title() else { return };
+    let direct = {
+        let (color, mut list) = rect_list_into(&mut t);
+        list.draw_instanced(4, 1, 0, 0).unwrap();
+        super::run(&t.host, &[&list]);
+        pixels(&t, &color)
+    };
+    let pool = super::Pool::new(&t.host, 1);
+    let count = 64;
+    // Records: 3 vertices; 0 vertices; 3 vertices of 2 instances.
+    pool.write(0, &[3u32, 1, 0, 0, 0, 1, 0, 0, 3, 2, 0, 0]);
+    pool.write(count, &[1u32]);
+    for (record, counted, draws) in [(0, None, true), (1, None, false), (2, None, false), (0, Some(0), true), (0, Some(1), false)] {
+        let (color, mut list) = rect_list_into(&mut t);
+        list.draw_rects_indirect(pool.va(16 * record), counted.map(|i| (pool.va(count), i))).unwrap();
+        super::run(&t.host, &[&list]);
+        let got = pixels(&t, &color);
+        if draws {
+            assert_eq!(got, direct, "record {record} {counted:?}");
+        } else {
+            assert!(got.iter().all(|p| *p == [0; 4]), "record {record} {counted:?}");
+        }
+    }
+}

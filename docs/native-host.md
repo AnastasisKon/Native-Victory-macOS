@@ -67,6 +67,8 @@ WINE=... tools/macos/test-wine.sh -p victory-platform # the same conformance tes
 
 `crates/victory-hle/tests/native_probe.rs` builds `tests/fixtures/native-probe/probe.c` with `tools/macos/build-native-probe.sh` (the gnullvm clang and lld, no CRT), maps it, binds it, runs it, and checks 16 things the probe reports in its exit code. The probe also imports a second fixture, `probe_dll.c` (built beside it as `victory-probe-dll.dll`): the test maps it with `native::dll`, and `probe_dll` checks its `DllMain` and TLS callback order, per-thread static TLS, thread notices, an exception raised in the DLL unwinding through its `__finally` to a handler in the exe (and from the exe to a handler in the DLL), and `GetModuleHandle`/`GetProcAddress` by name. The C++ runtime is not ours to build, so the throw is a Windows exception through `__C_specific_handler`, not `_CxxThrowException` through `__CxxFrameHandler`.
 
+`victory-gpu`'s `memory` module and its tests are `#[cfg(windows)]` (`src/lib.rs`), so on macOS `cargo test -p victory-gpu memory::` runs 0 tests and passes; only CI's Windows job (`cargo test --workspace` on WARP) checks them. The two that compile pipelines and submit through the registered copies (`lists_share_a_table_and_copies_keep_their_views`, `a_submission_that_missed_leaves_the_copies_at_once`) hold one test lock, since together they once failed in `CreateRootSignature` and they share the copies' registry and frame counter.
+
 The native probe's waits check must run as `x86_64-apple-darwin` (under Rosetta
 on Apple Silicon); the arm64 binary only runs its two image-mapping tests.
 Its critical-section try check holds the lock on the calling thread until the

@@ -1674,9 +1674,6 @@ impl<'a> Lower<'a> {
                 if self.mask_data != MaskData::Console {
                     return Err("a 16-bit wave reduction outside compute");
                 }
-                if self.halves {
-                    return Err("a 16-bit wave reduction across the host's waves");
-                }
                 let c = self.cur;
                 let &m = self
                     .x
@@ -1705,6 +1702,23 @@ impl<'a> Lower<'a> {
                     119,
                     &[f, sum, signed],
                 );
+                if self.halves {
+                    // A console wave the host splits: the two host waves' f32 sums are added as
+                    // any other float sum is (still one rounding to f16), and lane `hi` is read
+                    // across them. A lane that is elsewhere holds the identity: the exchange
+                    // reads 0 there, so it carries `x ^ ident`.
+                    let r = self.halves_reduce(Op::AddF, r, None)?;
+                    let r = self.s.op(self.cur, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                    let r = self.s.m.bin(self.cur, Bin::And, r, low);
+                    let flipped = self.s.m.bin(self.cur, Bin::Xor, x, id);
+                    let lane = self.s.m.i32(hi);
+                    let top = self.wide_read_lane(flipped, lane)?;
+                    let c = self.cur;
+                    let top = self.s.m.bin(c, Bin::Xor, top, id);
+                    let high = self.s.m.i32(0xFFFF_0000);
+                    let top = self.s.m.bin(c, Bin::And, top, high);
+                    return Ok(self.s.m.bin(c, Bin::Or, top, r));
+                }
                 let r = self
                     .s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);

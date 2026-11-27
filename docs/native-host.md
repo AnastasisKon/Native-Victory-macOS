@@ -1222,6 +1222,18 @@ outside one. That read was refused as "v_readlane_b32 of a constant lane in a pi
 reduction or one lane's value is now that value at any lane (`Lower::section_uniform`).
 Test: `emit::gfx_refusal_tests::a_pixel_program_reads_a_lane_of_a_whole_wave_reduction_as_the_reduction`.
 
+A section of `v_add_f16` steps (`Shape::Half`: the low halves summed, the high half that of
+one console lane) was lowered only where a console wave is one host wave. Where the host splits
+it into two, it was refused as "a 16-bit wave reduction across the host's waves". Now each host
+wave's f32 sum is combined across the pair as other float sums are (`halves_reduce`, still one
+rounding to f16). The high half's lane is read across them with `wide_read_lane`. A lane that is
+elsewhere must give the identity there, but the exchange reads 0 for a lane that wrote nothing, so
+it carries `x ^ ident` and is XORed back. Over a 12,020-shader corpus (Series S boot to the menus,
+27 November) the 2 compute programs refused for it translate, and no other output changes.
+`split_wave_tests::a_whole_wave_half_sum_reads_across_the_host_waves` (`victory-gpu`) runs the
+title's form on Metal in groups of two console waves: 96.0 under lane 63's high half, and 60.0
+with the identity's high half when lanes 40 and up are off.
+
 A section of `v_mul_f32` steps is now followed: it is the product of the lanes
 (`WaveActiveProduct`, identity 1.0), lowered to `waveActiveOp` with the product kind, and the two
 host waves of a console wave multiply their results (`split_wave_tests::

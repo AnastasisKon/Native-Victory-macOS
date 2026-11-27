@@ -1740,3 +1740,56 @@ fn a_lane_holding_half_a_wave_maximum_is_refused() {
     let why = refusal(&max_read_at_lane(0));
     assert!(why.as_deref().is_some_and(|w| w.contains("no reduction or prefix")), "{why:?}");
 }
+
+/// A whole-wave f16 sum of the title's shape (`v_add_f16` steps keeping the high half: row
+/// butterflies, `v_permlanex16_b32` of lane 0, then lane 0 added into every lane), read at lane
+/// 63, in groups of two console waves, so the fast path splits each into two host waves. Each
+/// lane's term is `i & 3` as an f16 with 0x1234 in its high half. Lane 63 of each wave holds the
+/// wave's total in its low half (96.0; 60.0 for the first wave with lanes 40 and up off before the
+/// section, where the second has none on) and lane 63's high half (0x1234, or the identity's 0
+/// when lane 63 is off). It was refused as "a 16-bit wave reduction across the host's waves".
+#[test]
+fn a_whole_wave_half_sum_reads_across_the_host_waves() {
+    let section = [
+        0x3608_0083u32, // v_and_b32 v4, 3, v0
+        0x7E08_A104,    // v_cvt_f16_u16 v4, v4
+        0x3808_08FF,
+        0x1234_0000, // v_or_b32 v4, 0x12340000, v4
+        0xBE96_25C1, // s_or_saveexec_b64 s[22:23], -1
+        0xD501_000C,
+        0x005A_0880, // v_cndmask_b32_e64 v12, 0, v4, s[22:23]
+        0x6418_18FA,
+        0xFF00_B10C, // v_add_f16_dpp v12, v12, v12 quad_perm:[1,0,3,2]
+        0x6418_18FA,
+        0xFF00_4E0C, // v_add_f16_dpp v12, v12, v12 quad_perm:[2,3,0,1]
+        0x6418_18FA,
+        0xFF01_410C, // v_add_f16_dpp v12, v12, v12 row_half_mirror
+        0x6418_18FA,
+        0xFF01_400C, // v_add_f16_dpp v12, v12, v12 row_mirror
+        0xD778_000D,
+        0x0201_010C, // v_permlanex16_b32 v13, v12, 0, 0
+        0x6418_1B0C, // v_add_f16 v12, v12, v13
+        0xD760_000D,
+        0x0001_010C, // v_readlane_b32 s13, v12, 0
+        0x6418_180D, // v_add_f16 v12, s13, v12
+        0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+        0xD760_000D,
+        0x0001_7F0C, // v_readlane_b32 s13, v12, 63
+        0x7E04_020D, // v_mov_b32 v2, s13
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    assert_eq!(refusal(&section), None);
+    let got = run_io(&section, 0, 128, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, vec![0x1234_5600; 128], "96.0 under lane 63's high half, in each wave");
+    let mut below_40 = LANES_BELOW_40.to_vec();
+    below_40.extend(section);
+    let got = run_io(&below_40, 0, 128, 0);
+    let want: Vec<u32> = (0..128).map(|i| if i < 40 { 0x0000_5380 } else { CANARY }).collect();
+    assert_eq!(got, want, "60.0, and lane 63 (off) holds the identity");
+}

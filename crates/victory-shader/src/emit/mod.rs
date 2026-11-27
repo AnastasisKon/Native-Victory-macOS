@@ -470,8 +470,10 @@ pub struct Options {
     pub zero_copy_memory: bool,
     /// A guessed graphics vertex shader ([`graphics`]) drawn as a rectangle list: each fetched
     /// attribute is read for the rectangle's three corners (instance-stepped, so one instance is a
-    /// rectangle) and the vertex id 0 to 3 picks a corner, the fourth being the sum of two corners
-    /// less the right-angle one, found from the first two-channel float fetch (the position).
+    /// rectangle), or when the program reads `SV_VertexID` directly its body runs for console
+    /// vertex ids `3 * instance + 0..2`, and the strip vertex id 0 to 3 picks a corner, the fourth
+    /// being the sum of two corners less the right-angle one (`SV_Position.xy` or the first
+    /// two-channel float fetch).
     pub rect_list: bool,
     /// A guessed graphics vertex shader that must also write these parameters (bit n: `TEXCOORD`
     /// n, undefined values) because its pixel shader reads them.

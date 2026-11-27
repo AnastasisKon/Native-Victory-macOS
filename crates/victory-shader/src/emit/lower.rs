@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod bvh;
 mod halves;
+mod rect;
 
 type Why = &'static str;
 
@@ -433,6 +434,10 @@ struct Lower<'a> {
     /// Rectangle list: which stored corner holds the right angle, `(block, at v0, at v2)`
     /// (neither: v1), picked from the first two-channel float fetch (the position).
     rect_corner: Option<(usize, V, V)>,
+    /// Stage-in input channels already loaded in the entry block.
+    loaded_inputs: Map<(usize, u8), Val>,
+    /// Active corner evaluation pass for `SV_VertexID`-driven rectangle lists (`lower/rect.rs`).
+    rect_pass: Option<rect::RectPass>,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -1152,6 +1157,8 @@ impl<'a> Lower<'a> {
             split_inputs: Map::default(),
             debug_pos: None,
             rect_corner: None,
+            loaded_inputs: Map::default(),
+            rect_pass: None,
         }
     }
 
@@ -1834,102 +1841,18 @@ impl<'a> Lower<'a> {
         if let Some(why) = self.refuse {
             return Err(unsupported(0, why));
         }
-        let p = self.x.p;
-        let order = crate::ir::reverse_postorder(&p.blocks);
+        let order = crate::ir::reverse_postorder(&self.x.p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
         }
-        for (n, &b) in order.iter().enumerate() {
-            self.block[b] = Some(if n == 0 {
-                self.s.entry
-            } else {
-                self.s.m.new_block()
-            });
-        }
-        // Loop headers count iterations (`LOOP_LIMIT`).
-        for &b in &order {
-            let header = p.blocks[b]
-                .preds
-                .iter()
-                .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
-            if header {
-                let blk = self.block[b].expect("reachable");
-                let phi = self.s.m.phi(blk, self.s.t.i32);
-                self.counters.insert(b, (phi, Vec::new()));
-            }
-        }
         self.cur = self.s.entry;
         self.find_sections();
-        self.inputs()?;
-        if p.thread_counts {
-            self.launched();
+        if let Some(vid_val) = self.rect_vertex_id() {
+            self.run_rect_by_id(&order, vid_val)?;
+        } else {
+            self.lower_blocks(&order, self.s.entry)?;
+            self.fill_phis()?;
         }
-        if let Some(mesh) = self.s.mesh {
-            self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
-            self.block[order[0]] = Some(self.cur);
-        }
-        for &b in &order {
-            self.cur = self.block[b].expect("reachable");
-            self.cur_ir = b;
-            let preds: Vec<usize> = p.blocks[b]
-                .preds
-                .iter()
-                .copied()
-                .filter(|&q| self.block[q].is_some())
-                .collect();
-            self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
-            for (i, phi) in p.blocks[b].phis.iter().enumerate() {
-                let val = match phi.reg {
-                    Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
-                    _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
-                    Reg::Scc => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i1);
-                        self.data_phis.push((v, b, i));
-                        Val::Bit(v)
-                    }
-                    _ => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i32);
-                        self.data_phis.push((v, b, i));
-                        Val::I32(v)
-                    }
-                };
-                self.vals.insert(phi.value, val);
-            }
-            let mut i = 0;
-            self.mode16 = self.round16[b];
-            while i < p.blocks[b].insts.len() {
-                if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
-                    // A pixel's discard: the lanes stay on as helpers.
-                    let at = self.cur;
-                    let offset = p.blocks[b].insts[i].machine.offset;
-                    let kill = self
-                        .boolean(lanes, at)
-                        .map_err(|w| unsupported(offset, w))?;
-                    self.s
-                        .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
-                }
-                if self.split_barriers.contains(&(b, i)) {
-                    self.group_barrier();
-                }
-                self.inst(b, i)?;
-                self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
-                if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
-                    for j in i + 1..end {
-                        self.section_inst(b, j, i)?;
-                    }
-                    i = end;
-                    continue;
-                }
-                i += 1;
-            }
-            if self.split_barriers.contains(&(b, p.blocks[b].insts.len())) {
-                self.group_barrier();
-            }
-            self.mask_ok = self.mask_data == MaskData::Console;
-            self.tail[b] = Some(self.cur);
-            self.exit(b)?;
-        }
-        self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -2018,6 +1941,104 @@ impl<'a> Lower<'a> {
             user_data,
             samplers: self.samplers,
         })
+    }
+
+    fn lower_blocks(&mut self, order: &[usize], entry_block: usize) -> Result<(), Stop> {
+        let p = self.x.p;
+        for (n, &b) in order.iter().enumerate() {
+            self.block[b] = Some(if n == 0 {
+                entry_block
+            } else {
+                self.s.m.new_block()
+            });
+        }
+        // Loop headers count iterations (`LOOP_LIMIT`).
+        for &b in order {
+            let header = p.blocks[b]
+                .preds
+                .iter()
+                .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
+            if header {
+                let blk = self.block[b].expect("reachable");
+                let phi = self.s.m.phi(blk, self.s.t.i32);
+                self.counters.insert(b, (phi, Vec::new()));
+            }
+        }
+        self.cur = entry_block;
+        self.inputs()?;
+        if p.thread_counts {
+            self.launched();
+        }
+        if let Some(mesh) = self.s.mesh {
+            self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
+            self.block[order[0]] = Some(self.cur);
+        }
+        for &b in order {
+            self.cur = self.block[b].expect("reachable");
+            self.cur_ir = b;
+            let preds: Vec<usize> = p.blocks[b]
+                .preds
+                .iter()
+                .copied()
+                .filter(|&q| self.block[q].is_some())
+                .collect();
+            self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
+            for (i, phi) in p.blocks[b].phis.iter().enumerate() {
+                let val = match phi.reg {
+                    Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
+                    _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
+                    Reg::Scc => {
+                        let v = self.s.m.phi(self.cur, self.s.t.i1);
+                        self.data_phis.push((v, b, i));
+                        Val::Bit(v)
+                    }
+                    _ => {
+                        let v = self.s.m.phi(self.cur, self.s.t.i32);
+                        self.data_phis.push((v, b, i));
+                        Val::I32(v)
+                    }
+                };
+                self.vals.insert(phi.value, val);
+            }
+            self.begin_rect_block(b, &preds);
+            let mut i = 0;
+            self.mode16 = self.round16[b];
+            while i < p.blocks[b].insts.len() {
+                if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
+                    // A pixel's discard: the lanes stay on as helpers.
+                    let at = self.cur;
+                    let offset = p.blocks[b].insts[i].machine.offset;
+                    let kill = self
+                        .boolean(lanes, at)
+                        .map_err(|w| unsupported(offset, w))?;
+                    self.s
+                        .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+                }
+                if self.split_barriers.contains(&(b, i)) {
+                    self.group_barrier();
+                }
+                self.inst(b, i)?;
+                self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
+                if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
+                    for j in i + 1..end {
+                        self.section_inst(b, j, i)?;
+                    }
+                    i = end;
+                    continue;
+                }
+                i += 1;
+            }
+            if self.split_barriers.contains(&(b, p.blocks[b].insts.len())) {
+                self.group_barrier();
+            }
+            self.mask_ok = self.mask_data == MaskData::Console;
+            self.tail[b] = Some(self.cur);
+            if let Some(rp) = self.rect_pass.as_mut() {
+                rp.block_out[b] = Some(rp.cur_out.clone());
+            }
+            self.exit(b)?;
+        }
+        Ok(())
     }
 
     fn exported_out(&self, b: usize) -> bool {
@@ -2113,6 +2134,14 @@ impl<'a> Lower<'a> {
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
+                    Some(&Input::VertexId)
+                        if self.rect_pass.as_ref().is_some_and(|rp| rp.vid_val == v) =>
+                    {
+                        Val::I32(self.rect_pass.as_ref().expect("rect pass").corner_vid)
+                    }
+                    Some(&Input::InstanceId) if self.rect_pass.is_some() => {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
                     // refuses reads of undef).
@@ -2297,6 +2326,9 @@ impl<'a> Lower<'a> {
 
     /// An input element's channel as declared (16-bit ones as 32-bit floats).
     fn load_any_input(&mut self, id: usize, col: u8) -> Val {
+        if let Some(&cached) = self.loaded_inputs.get(&(id, col)) {
+            return cached;
+        }
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let (int, bit) = (e.comp != 9, e.comp == 1);
@@ -2329,14 +2361,16 @@ impl<'a> Lower<'a> {
             4,
             &args,
         );
-        if bit {
+        let out = if bit {
             let z = self.s.m.cast(entry, Cast::ZExt, v, self.s.t.i32);
             Val::I32(z)
         } else if int {
             Val::I32(v)
         } else {
             Val::I32(self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.i32))
-        }
+        };
+        self.loaded_inputs.insert((id, col), out);
+        out
     }
 
     /// The vertex id input (debugging).
@@ -12610,6 +12644,13 @@ impl<'a> Lower<'a> {
             }
             loaded.push(x);
         }
+        if let Some(corner) = self.rect_pass.as_ref().map(|rp| rp.corner as usize) {
+            for (k, x) in loaded.into_iter().enumerate() {
+                let Some(v) = x[corner] else { return Err("a vertex input") };
+                self.write(inst, Reg::V(reg + k as u8), v, guard);
+            }
+            return Ok(());
+        }
         let float = scaled.is_some() || !matches!(kind, 'U' | 'I' | 'W' | 'K' | 'B' | 'C');
         // shortcut: the first float fetch of two or more channels picks the right-angle corner
         // (taken to be the position), and a float or scaled attribute fetched before it keeps
@@ -13624,6 +13665,11 @@ impl<'a> Lower<'a> {
             };
             ready.push((id, col, suffix, x));
         }
+        if self.rect_pass.is_some() {
+            self.record_rect_export(ready, guard);
+            self.end_guarded(at, &[]);
+            return Ok(());
+        }
         let thread = mesh.then(|| self.mesh_thread());
         for (id, col, suffix, x) in ready {
             let mut args = vec![
@@ -13764,13 +13810,19 @@ impl<'a> Lower<'a> {
                 Term::CondBr(cond, t, f)
             }
             LaneExit::End => {
-                if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
-                    // A lane leaving without its final export was killed.
-                    let t = self.s.m.bool(true);
-                    self.s
-                        .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                if let Some(rp) = self.rect_pass.as_mut() {
+                    let done = rp.done_block;
+                    rp.end_exits.push((rp.cur_out.clone(), self.cur));
+                    Term::Br(done)
+                } else {
+                    if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
+                        // A lane leaving without its final export was killed.
+                        let t = self.s.m.bool(true);
+                        self.s
+                            .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                    }
+                    Term::Ret
                 }
-                Term::Ret
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
@@ -13811,12 +13863,18 @@ impl<'a> Lower<'a> {
             return a;
         }
         let a = self.s.m.new_block();
-        if self.s.pixel {
-            let t = self.s.m.bool(true);
-            self.s
-                .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+        if let Some(rp) = self.rect_pass.as_mut() {
+            let done = rp.done_block;
+            rp.end_exits.push((rp.zeros.clone(), a));
+            self.s.m.terminate(a, Term::Br(done));
+        } else {
+            if self.s.pixel {
+                let t = self.s.m.bool(true);
+                self.s
+                    .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+            }
+            self.s.m.terminate(a, Term::Ret);
         }
-        self.s.m.terminate(a, Term::Ret);
         self.abort = Some(a);
         a
     }

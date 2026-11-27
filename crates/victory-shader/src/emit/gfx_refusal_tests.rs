@@ -2826,3 +2826,41 @@ fn divergent_readlane_in_a_two_wave_group_is_refused() {
         "expected a divergent exchange refusal, got {err:?}",
     );
 }
+
+/// An SGPR joined after an EXEC skip, read only ANDed with EXEC, in a program the lockstep path
+/// translates (there every join is uniform and an SGPR join is taken as a number): on the edge
+/// the skip takes EXEC is empty, so what the SGPR holds there is not needed. Here its low dword
+/// is data and its high dword what a mask left; in the title's programs it was a
+/// descriptor's dwords left over. It was refused as "a lane-mask join of an untracked mask: data
+/// whose high dword is not known" (a world lighting pass of #258, with 27 other compute programs).
+#[test]
+fn a_join_read_only_with_exec_needs_nothing_from_an_exec_skip() {
+    const SKIP: &[u32] = &[
+        0xD4C4_000A,
+        0x0202_0090, // v_cmp_gt_u32 s[10:11], 16, v0
+        0xBE8A_0385, // s_mov_b32 s10, 5 (data; s11 keeps the mask's high dword)
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x4A06_00FF,
+        0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+        0xBF88_0005, // s_cbranch_execz SKIP
+        0xD760_0008,
+        0x0201_4703, // v_readlane_b32 s8, v3, 35 (refused on the fast path: lockstep)
+        0x7E04_0208, // v_mov_b32 v2, s8
+        0xD4C4_000A,
+        0x0202_0088, // v_cmp_gt_u32 s[10:11], 8, v0 (a mask on this path only)
+        0x878C_7E0A, // SKIP: s_and_b64 s[12:13], s[10:11], exec
+        0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+        0x87FE_7E0C, // s_and_b64 exec, s[12:13], exec
+        0x4A04_0487, // v_add_nc_u32 v2, 7, v2
+        0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xBF81_0000, // s_endpgm
+    ];
+    if let Err(e) = emit_wave64_cs(SKIP, 64, false) {
+        panic!("{e}");
+    }
+}

@@ -1599,3 +1599,348 @@ fn a_placed_rgb9e5_view_over_an_r32_uint_object_shares_its_texture() {
     glue::resource_released(object);
     with_title(|t| assert!(!t.host.knows(key), "released with the object"));
 }
+
+/// A mip-streamed 64 KiB XOR-tiled texture placed in an unmapped reservation (`NO_ACCESS`) and
+/// populated step by step across scattered 64 KiB physical pages (tail mips first, then mid mips,
+/// then mip 0): each residency step is caught on the next submission by the mip-aware probes
+/// without forcing immediate unchanged whole-texture re-reads while fine mips remain unmapped.
+#[test]
+fn streamed_mips_across_scattered_pool_pages_upload_each_step_without_whole_rereads() {
+    use victory_platform::mem::{Protect, protect};
+
+    let Ok(metal) = victory_metal::metal::Metal::new() else { return };
+    let mut t = Title::new(metal, Default::default());
+    const TILE: usize = 64 << 10;
+    const POOL_TILES: usize = 32;
+    let mem = Alias::new(POOL_TILES * TILE).unwrap();
+    let pool_info = PoolInfo {
+        id: 9290,
+        base: mem.primary as usize,
+        len: mem.len,
+        memory_entry: None,
+    };
+    t.host.memory().pool_created(&pool_info);
+
+    // 512x512 RGBA8, 10 mips, SW_64KB_D_X: 1,441,792 bytes (22 x 64 KiB pages):
+    //   [0 .. 64 KiB)       = tail mips 3..9
+    //   [64 .. 128 KiB)     = mip 2 (128x128)
+    //   [128 .. 384 KiB)    = mip 1 (256x256, 4 pages)
+    //   [384 .. 1408 KiB)   = mip 0 (512x512, 16 pages)
+    let proto = crate::resource::test_texture_at(mem.alias as u64, (512, 512), 10, 28, Swizzle::SW_64KB_D_X.0, 0);
+    let mut info = crate::resource::texture_info(proto).unwrap();
+    let total_tiles = info.size / TILE;
+    assert_eq!(total_tiles, 22);
+
+    let px = |mip: u32, x: u32, y: u32| [x as u8, y as u8, (mip as u8).wrapping_mul(23).wrapping_add(17), 255];
+    let mut tiled_full = vec![0u8; info.size];
+    for mip in 0..10u32 {
+        let m = &info.layout.mips[mip as usize];
+        let linear: Vec<u8> = (0..m.height)
+            .flat_map(|y| (0..m.width).flat_map(move |x| px(mip, x, y)))
+            .collect();
+        info.layout
+            .tile(&mut tiled_full, mip, 0, &linear, m.width as usize * 4, linear.len())
+            .unwrap();
+    }
+
+    let mut va = 0u64;
+    let task = unsafe { super::mach_task_self() };
+    assert_eq!(unsafe { super::mach_vm_allocate(task, &mut va, info.size as u64, 1) }, 0);
+    // SAFETY: `va..va + info.size` is our freshly allocated reservation.
+    unsafe { protect(va as *mut u8, info.size, Protect::NO_ACCESS) }.unwrap();
+    info.memory = va as *const u8;
+    let key = 0x7E57_0179usize;
+
+    let map_tile = |t: &Title<victory_metal::metal::Metal>, title_idx: usize, pool_idx: usize| {
+        let pool_off = pool_idx * TILE;
+        let title_off = title_idx * TILE;
+        // SAFETY: `pool_off..+TILE` is inside `mem.primary` and `va + title_off..+TILE` is inside `va`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                tiled_full[title_off..title_off + TILE].as_ptr(),
+                mem.primary.add(pool_off),
+                TILE,
+            );
+            let (mut at, mut cur, mut max) = (va + title_off as u64, 0, 0);
+            let r = super::mach_vm_remap(
+                task,
+                &mut at,
+                TILE as u64,
+                0,
+                0x4000,
+                task,
+                mem.primary as u64 + pool_off as u64,
+                0,
+                &mut cur,
+                &mut max,
+                0,
+            );
+            assert_eq!(r, 0, "mach_vm_remap tile {title_idx} -> {pool_idx}");
+        }
+        t.host.memory().mapped(va as usize + title_off, TILE, &pool_info, pool_off);
+    };
+
+    let check_mip = |t: &mut Title<victory_metal::metal::Metal>, mip: u32, expect_zero: bool| {
+        let (w, h) = ((512usize >> mip).max(1), (512usize >> mip).max(1));
+        let tex = t.texture_of(key).unwrap();
+        let mut out = vec![0xffu8; w * h * 4];
+        t.host.backend.read_texture(&tex, mip as usize, 0, &mut out, w * 4, 0);
+        if expect_zero {
+            assert!(out.iter().all(|&b| b == 0), "unmapped mip {mip} must stay zero");
+        } else {
+            for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w / 2, h / 2)] {
+                let p = (y * w + x) * 4;
+                assert_eq!(&out[p..p + 4], &px(mip, x as u32, y as u32), "mip {mip} ({x},{y})");
+            }
+        }
+    };
+
+    // Hold the shared title lock across all steps so no parallel test drains the process-wide
+    // `WATCH.dirty` set while this test's watched texture is live (`5ba3cce6`).
+    with_title(|_shared| {
+        // Step 0: Completely unmapped reservation (`blank` first upload).
+        t.texture_created(key, info);
+        assert!(t.realize(key));
+        t.sync_dirty_without_probe_deadline();
+        assert_eq!(t.uploads_of(key), 1, "initial blank upload");
+        check_mip(&mut t, 0, true);
+        check_mip(&mut t, 4, true);
+
+        // Step 1: Stream tail mips 3..9 (`[0..64 KiB)`) into scattered pool page 29 while mips 0..2
+        // remain `NO_ACCESS`. `probe_nonzero` must catch it on the very next submission.
+        map_tile(&t, 0, 29);
+        t.sync_dirty_without_probe_deadline();
+        assert_eq!(t.uploads_of(key), 2, "tail mips uploaded on next submission");
+        for mip in 3..10 {
+            check_mip(&mut t, mip, false);
+        }
+        for mip in 0..3 {
+            check_mip(&mut t, mip, true);
+        }
+
+        // Step 2: Stream mip 2 (`[64..128 KiB)`) into scattered pool page 7 while mips 0..1 stay
+        // `NO_ACCESS`. Mip-aware `probe_read` must catch it immediately AND keep `sampled_sees_writes`
+        // true so the next `WHOLE_EVERY - 1` idle submissions do 0 whole re-reads.
+        map_tile(&t, 1, 7);
+        t.sync_dirty_without_probe_deadline();
+        assert_eq!(t.uploads_of(key), 3, "mip 2 uploaded on next submission");
+        check_mip(&mut t, 2, false);
+        check_mip(&mut t, 1, true);
+        check_mip(&mut t, 0, true);
+        for sub in 0..crate::native::textures::WHOLE_EVERY - 1 {
+            let jobs = t.sync_jobs_within(None);
+            assert!(
+                !jobs.iter().any(|j| j.key == key),
+                "unchanged partial texture re-read whole at idle submission {sub}"
+            );
+            t.sync(jobs);
+        }
+
+        // Step 3: Stream mip 1 (`[128..384 KiB)`) across 4 scattered out-of-order pool pages.
+        for (k, &pool_idx) in [21usize, 3, 18, 11].iter().enumerate() {
+            map_tile(&t, 2 + k, pool_idx);
+        }
+        t.sync_dirty_without_probe_deadline();
+        assert_eq!(t.uploads_of(key), 4, "mip 1 uploaded on next submission");
+        check_mip(&mut t, 1, false);
+        check_mip(&mut t, 0, true);
+        for sub in 0..crate::native::textures::WHOLE_EVERY - 1 {
+            let jobs = t.sync_jobs_within(None);
+            assert!(!jobs.iter().any(|j| j.key == key), "idle submission {sub} after mip 1");
+            t.sync(jobs);
+        }
+
+        // Step 4: Stream mip 0 (`[384..1408 KiB)`) across 16 scattered pool pages.
+        let mip0_pages = [30usize, 0, 27, 4, 25, 1, 23, 6, 20, 8, 17, 9, 15, 10, 14, 12];
+        for (k, &pool_idx) in mip0_pages.iter().enumerate() {
+            map_tile(&t, 6 + k, pool_idx);
+        }
+        t.sync_dirty_without_probe_deadline();
+        assert_eq!(t.uploads_of(key), 5, "mip 0 uploaded on next submission");
+        check_mip(&mut t, 0, false);
+
+        t.texture_released(key);
+    });
+    t.host.memory().pool_released(&pool_info);
+    // SAFETY: Release our test reservation before dropping `mem`.
+    assert_eq!(unsafe { super::mach_vm_deallocate(task, va, (total_tiles * TILE) as u64) }, 0);
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn bench_streamed_texture_sync_pool_reads_and_mip_probes() {
+    use std::time::Instant;
+    use victory_platform::mem::{Protect, next_region, page_size, protect};
+
+    let Ok(metal) = victory_metal::metal::Metal::new() else { return };
+    let mut t = Title::new(metal, Default::default());
+    const N: usize = 32;
+    const TILE: usize = 64 << 10;
+    const TILES_PER_TEX: usize = 22; // 512x512 RGBA8, 10 mips, SW_64KB_D_X = 1.375 MiB
+    const RESIDENT_TILES: usize = 6; // mips 1..9 (384 KiB) mapped; mip 0 (1 MiB) NO_ACCESS
+
+    let mem = Alias::new(N * RESIDENT_TILES * TILE).unwrap();
+    let pool_info = PoolInfo {
+        id: 9299,
+        base: mem.primary as usize,
+        len: mem.len,
+        memory_entry: None,
+    };
+    t.host.memory().pool_created(&pool_info);
+
+    let proto = crate::resource::test_texture_at(mem.alias as u64, (512, 512), 10, 28, Swizzle::SW_64KB_D_X.0, 0);
+    let base_info = crate::resource::texture_info(proto).unwrap();
+    assert_eq!(base_info.size, TILES_PER_TEX * TILE);
+
+    let mut tiled_template = vec![0u8; base_info.size];
+    for mip in 1..10u32 {
+        let m = &base_info.layout.mips[mip as usize];
+        let linear = vec![0x40u8 + mip as u8 * 9; (m.width * m.height * 4) as usize];
+        base_info
+            .layout
+            .tile(&mut tiled_template, mip, 0, &linear, m.width as usize * 4, linear.len())
+            .unwrap();
+    }
+
+    let task = unsafe { super::mach_task_self() };
+    let mut va = 0u64;
+    let total_va = N * TILES_PER_TEX * TILE;
+    assert_eq!(unsafe { super::mach_vm_allocate(task, &mut va, total_va as u64, 1) }, 0);
+    unsafe { protect(va as *mut u8, total_va, Protect::NO_ACCESS) }.unwrap();
+
+    // Realize all 32 textures blank first.
+    let keys: Vec<usize> = (0..N)
+        .map(|i| {
+            let key = 0xBEEF_0000 + i;
+            let mut info = base_info.clone();
+            info.memory = (va as usize + i * TILES_PER_TEX * TILE) as *const u8;
+            t.texture_created(key, info);
+            assert!(t.realize(key));
+            key
+        })
+        .collect();
+
+    let t_blank = Instant::now();
+    t.sync_dirty();
+    let blank_ms = t_blank.elapsed().as_secs_f64() * 1000.0;
+
+    // Map 6 scattered 64 KiB physical pages per texture (reverse pool order so adjacent pages are
+    // separate `vm_map_entry` regions in XNU) while leaving mip 0 (`1 MiB`) `NO_ACCESS`.
+    for i in 0..N {
+        let tex_va = va as usize + i * TILES_PER_TEX * TILE;
+        for r in 0..RESIDENT_TILES {
+            let pool_slot = (N * RESIDENT_TILES - 1) - (i * RESIDENT_TILES + r);
+            let pool_off = pool_slot * TILE;
+            let src_off = r * TILE;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    tiled_template[src_off..src_off + TILE].as_ptr(),
+                    mem.primary.add(pool_off),
+                    TILE,
+                );
+                // Ensure each texture has a unique content hash.
+                *mem.primary.add(pool_off + 0x800) ^= (i as u8).wrapping_add(1);
+                let (mut at, mut cur, mut max) = ((tex_va + src_off) as u64, 0, 0);
+                assert_eq!(
+                    super::mach_vm_remap(
+                        task,
+                        &mut at,
+                        TILE as u64,
+                        0,
+                        0x4000,
+                        task,
+                        mem.primary as u64 + pool_off as u64,
+                        0,
+                        &mut cur,
+                        &mut max,
+                        0,
+                    ),
+                    0
+                );
+            }
+            t.host.memory().mapped(tex_va + src_off, TILE, &pool_info, pool_off);
+        }
+    }
+
+    // 1. Measure old page-by-page VM region walk vs `PoolTable::read_mapped_with` across 10 rounds
+    //    (320 partial texture reads = 440 MiB logical).
+    let mut buf = vec![0u8; base_info.size];
+    let page = page_size();
+    let mut old_syscalls = 0usize;
+    let t_old_read = Instant::now();
+    for _ in 0..10 {
+        for i in 0..N {
+            let base = va as usize + i * TILES_PER_TEX * TILE;
+            let end = base + base_info.size;
+            let mut cur = base;
+            while cur < end {
+                old_syscalls += 1;
+                let Some(region) = next_region(cur) else { break };
+                let start = cur.max(region.base);
+                let stop = end.min(region.base.saturating_add(region.len));
+                if start >= stop {
+                    break;
+                }
+                if region.protect.0 & Protect::READ.0 == 0 {
+                    buf[start - base..stop - base].fill(0);
+                } else {
+                    old_syscalls += 1;
+                    let _ = crate::native::safe_read(start as *const u8, &mut buf[start - base..stop - base]);
+                }
+                cur = stop;
+            }
+            let _ = page;
+            std::hint::black_box(&buf[0]);
+        }
+    }
+    let old_read_ms = t_old_read.elapsed().as_secs_f64() * 1000.0;
+
+    let pools = t.host.memory();
+    let mut new_syscalls = 0usize;
+    let t_new_read = Instant::now();
+    for _ in 0..10 {
+        for i in 0..N {
+            let base = va as usize + i * TILES_PER_TEX * TILE;
+            let _ = pools.read_mapped_with(base, &mut buf, |span_at, dst| {
+                new_syscalls += 1;
+                crate::native::safe_read(span_at as *const u8, dst)
+            });
+            std::hint::black_box(&buf[0]);
+        }
+    }
+    let new_read_ms = t_new_read.elapsed().as_secs_f64() * 1000.0;
+
+    // 2. Sync all 32 partial textures (probes + prepare + upload, skipping unmapped 1 MiB mip 0),
+    //    then measure whole-read volume across 30 idle submissions (~1 world frame).
+    let t_stream_sync = Instant::now();
+    t.sync_dirty_without_probe_deadline();
+    let stream_sync_ms = t_stream_sync.elapsed().as_secs_f64() * 1000.0;
+    assert!(keys.iter().all(|&k| t.uploads_of(k) == 2));
+
+    let mut idle_whole_jobs = 0usize;
+    let mut idle_whole_bytes = 0usize;
+    let t_idle = Instant::now();
+    for _ in 0..30 {
+        let jobs = t.sync_jobs();
+        idle_whole_jobs += jobs.len();
+        idle_whole_bytes += jobs.iter().map(|_| base_info.size).sum::<usize>();
+        t.sync(jobs);
+    }
+    let idle_ms = t_idle.elapsed().as_secs_f64() * 1000.0;
+
+    eprintln!(
+        "BENCH #179 ({N}x 1.375 MiB partial streamed textures, 6 scattered 64K pages + 1 MiB unmapped mip 0):\n\
+         - initial blank sync ({N} textures): {blank_ms:.2} ms\n\
+         - 320 partial reads (440 MiB): page-by-page VM walk {old_read_ms:.2} ms ({old_syscalls} kernel calls) -> PoolTable coalesced {new_read_ms:.2} ms ({new_syscalls} kernel calls, {:.2}x speedup)\n\
+         - streamed mips 1..9 sync ({N} textures, mip 0 skipped): {stream_sync_ms:.2} ms\n\
+         - 30 idle submissions (~1 world frame): {idle_whole_jobs} whole checks ({:.2} MiB, {idle_ms:.2} ms total; vs ~240 MiB before mip-aware probes)",
+        old_read_ms / new_read_ms.max(1e-6),
+        idle_whole_bytes as f64 / (1024.0 * 1024.0),
+    );
+
+    for k in keys {
+        t.texture_released(k);
+    }
+    t.host.memory().pool_released(&pool_info);
+    assert_eq!(unsafe { super::mach_vm_deallocate(task, va, total_va as u64) }, 0);
+}

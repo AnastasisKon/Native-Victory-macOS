@@ -41,7 +41,12 @@ run_gate "suite-hle" sh -c \
 run_gate "suite-shader" sh -c \
     "$RUNNER cargo test -p victory-shader -p victory-hle"
 
+run_gate "suite-gpu" sh -c \
+    "$RUNNER cargo test -p victory-gpu"
+
 if [ "$GATE" = "full" ]; then
+    run_gate "policy" sh -c \
+        "$RUNNER cargo xtask policy"
     run_gate "clippy-win" sh -c \
         "$RUNNER cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnullvm -- -D warnings"
 fi

@@ -178,8 +178,9 @@ pub(super) fn register_only(inst: &Inst) -> bool {
         Fields::Sop { .. } => {
             matches!(inst.name(), "s_mov_b32" | "s_mov_b64" | "s_and_b32" | "s_and_b64")
                 || Op::salu_of(inst.name()).is_some()
-                // A constant lane set for EXEC (`simulate` follows it); other `s_bfm`s are data.
-                || (inst.name().starts_with("s_bfm_")
+                // A constant lane set for EXEC (`simulate` follows it); other `s_bfm`s and
+                // `s_bitreplicate`s are data.
+                || ((inst.name().starts_with("s_bfm_") || inst.name() == "s_bitreplicate_b64_b32")
                     && inst.write(Reg::S(EXEC)).is_some()
                     && exec_constant(inst).is_some())
         }
@@ -419,7 +420,7 @@ fn simulate(insts: &[Inst], end: usize, wave: u32, saved: Value) -> Section {
                 let (shapes, lane_shapes) = shapes(vec, uni, wave);
                 return Section { end, shapes, lane_shapes, why: why.or(Some(EXEC_WRITE)) };
             };
-            exec = (if matches!(name, "s_mov_b64" | "s_bfm_b64") {
+            exec = (if matches!(name, "s_mov_b64" | "s_bfm_b64" | "s_bitreplicate_b64_b32") {
                 k
             } else {
                 (exec & !0xFFFF_FFFF) | (k & 0xFFFF_FFFF)
@@ -757,13 +758,27 @@ fn simulate(insts: &[Inst], end: usize, wave: u32, saved: Value) -> Section {
     Section { end, shapes, lane_shapes, why }
 }
 
-/// The constant lane set an EXEC write gives: a constant `s_mov`, or an `s_bfm` of two constant
+/// The constant lane set an EXEC write gives: a constant `s_mov`, an `s_bfm` of two constant
 /// counts (`((1 << S0) - 1) << S1`, RDNA2 ISA SOP2 opcodes 36 and 37, with counts of five and six
-/// bits). A wave32 prefix sum selects its upper sixteen lanes with `s_bfm_b32 exec_lo, 16, 16`.
+/// bits), or an `s_bitreplicate_b64_b32` of a constant (bit `i` to bits `2i` and `2i + 1`, SOP1
+/// opcode 59). A wave32 prefix sum selects its upper sixteen lanes with `s_bfm_b32 exec_lo, 16,
+/// 16`; a wave64 one the upper row of each half with `s_bitreplicate_b64_b32 exec, 0xff00ff00`,
+/// then the upper half with `s_bfm_b64 exec, 32, 32`.
 fn exec_constant(inst: &Inst) -> Option<u64> {
     let name = inst.name();
     if name.starts_with("s_mov_b") {
         return constant(inst);
+    }
+    if name == "s_bitreplicate_b64_b32" {
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let x = match *src.first()? {
+            Operand::Const(c @ 128..=208) => crate::resource::inline(c)?,
+            Operand::Literal(x) => x,
+            _ => return None,
+        };
+        return Some((0..32).filter(|i| x >> i & 1 != 0).fold(0, |m, i| m | 3 << (2 * i)));
     }
     let bits = match name {
         "s_bfm_b32" => 31,
@@ -1180,6 +1195,11 @@ mod tests {
         assert_eq!(k(&[bfm(0x25, 128 + 32, 128 + 32)], true), Some(0xFFFF_FFFF_0000_0000));
         // A count in an SGPR is not a constant.
         assert_eq!(k(&[bfm(0x24, 2, 128 + 16)], false), None);
+        // s_bitreplicate_b64_b32 exec, 0xff00ff00 (SOP1 opcode 59): the upper row of each half.
+        let rep = |s0: u8| 0xBE80_0000 | (EXEC as u32) << 16 | 59 << 8 | s0 as u32;
+        assert_eq!(k(&[rep(255), 0xFF00_FF00], true), Some(0xFFFF_0000_FFFF_0000));
+        assert_eq!(k(&[rep(128 + 5)], true), Some(0b11_0011));
+        assert_eq!(k(&[rep(2)], true), None);
     }
 
     #[test]

@@ -1212,18 +1212,34 @@ Both `v_permlane16_b32` and `v_permlanex16_b32` also use those tracked SGPR cons
 selectors. A selector with a runtime value still produces the computed-lane-select refusal.
 
 An EXEC write inside a section is followed when it is a constant lane set. Those were `s_mov`s of
-a constant only; `s_bfm_b32` and `s_bfm_b64` of two constant counts are one too
-(`((1 << S0) - 1) << S1`, `wave::exec_constant`). The title's wave32 prefix sums finish the upper
-row of sixteen lanes under `s_bfm_b32 exec_lo, 16, 16` before adding lane 15 through
-`v_permlanex16_b32`; the section stopped at the `s_bfm` ("s_bfm_b32 is not supported", the
-opcode a step that is no register operation is named by). An `s_bfm` with a count in an SGPR is
-still refused there. Over a 12,020-shader corpus (Series S boot to the menus, 27 November),
-9 compute shaders now translate, 1 is refused for another reason ("a lane-mask join of an
-untracked mask: data, at a join of several edges"), and no other output changes. Tests:
-`emit::wave::tests::s_bfm_gives_exec_its_field_of_constant_counts`,
-`emit::lower::tests::a_wave32_prefix_sum_may_set_its_upper_row_with_s_bfm`, and
-`split_wave_tests::a_wave32_prefix_sum_whose_upper_row_s_bfm_selects_runs` (`victory-gpu`; on
-Metal, with all 32 lanes and with lanes 20 and up off before the section).
+a constant only. `s_bfm_b32` and `s_bfm_b64` of two constant counts (`((1 << S0) - 1) << S1`) and
+`s_bitreplicate_b64_b32` of a constant (bit `i` to bits `2i` and `2i + 1`) are one too
+(`wave::exec_constant`). The title's prefix sums select rows with them:
+- wave32 finishes the upper row of sixteen lanes under `s_bfm_b32 exec_lo, 16, 16`, adding lane 15
+  through `v_permlanex16_b32`;
+- wave64 does the upper row of each half under `s_bitreplicate_b64_b32 exec, 0xff00ff00`, then the
+  upper half under `s_bfm_b64 exec, 32, 32`, adding lane 31.
+
+The section stopped at those writes. Either the opcode was named, as with "s_bfm_b32 is not
+supported" (a step that is no register operation is named by its opcode), or the values it left
+were unknown and a later read was refused instead. An `s_bfm` or `s_bitreplicate` with a
+non-constant operand is still refused there.
+
+Over a 12,020-shader corpus (Series S boot to the menus, 27 November):
+- 17 compute shaders now translate: 9 were refused as `s_bfm_b32`, 2 as `s_bitreplicate_b64_b32`,
+  and 6 as "a lane mask holding lanes elsewhere read as data: written by a scalar instruction of
+  the other width" (each has the wave64 section above);
+- 1 is refused for another reason ("a lane-mask join of an untracked mask: data, at a join of
+  several edges");
+- no other output changes.
+
+Tests:
+- `emit::wave::tests::s_bfm_gives_exec_its_field_of_constant_counts`;
+- `emit::lower::tests::a_wave32_prefix_sum_may_set_its_upper_row_with_s_bfm`;
+- `split_wave_tests::a_wave32_prefix_sum_whose_upper_row_s_bfm_selects_runs` (`victory-gpu`, on
+  Metal, with all 32 lanes and with lanes 20 and up off before the section);
+- `split_wave_tests::a_wave64_prefix_sum_whose_rows_s_bitreplicate_and_s_bfm_select_runs`
+  (`victory-gpu`, on Metal, across the two host waves of a console wave).
 
 The simulator keeps the original source lane of a VGPR value through a shuffle. A constant
 `v_readlane_b32` of that value reads the original lane with `WaveReadLaneAt`, or through the

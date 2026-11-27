@@ -461,6 +461,18 @@ the negated data (`0 - d`): modulo 2^32 the dword left is the same, and the valu
 runs it on Metal, wrapping below zero (1 - 3). The 64-bit, image and global forms are not
 covered: no title shader in the corpus uses them.
 
+## Clamped integer sums and differences
+
+The VOP3 clamp bit on `v_add_nc_u32`, `v_sub_nc_u32` and `v_subrev_nc_u32` saturates the result
+as an unsigned number. LLVM's AMDGPU backend selects `uaddsat` and `usubsat` to these with clamp:
+a sum that wraps gives 0xffffffff, and a difference below zero gives 0 (`Lower::integer`,
+`SATURATING`). It was refused for every integer operation as "integer output modifiers": 8
+compute programs in a 12,020-shader corpus (Series S boot to the menus, 27 November), each a
+`v_sub_nc_u32 ... clamp` whose result goes to LDS. Over that corpus the 8 translate and no other
+output changes. Clamp on other integer operations (the signed `_i32` forms, `v_mad_u32_u24` and
+others) and `omod` stay refused. `split_wave_tests::clamped_unsigned_sums_and_differences_saturate`
+(`victory-gpu`) runs both on Metal.
+
 ## LDS instructions addressed by M0
 
 `ds_append`, `ds_consume`, `ds_read_addtid_b32` and `ds_write_addtid_b32` have no address

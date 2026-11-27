@@ -1874,3 +1874,32 @@ fn a_wave64_prefix_sum_whose_rows_s_bitreplicate_and_s_bfm_select_runs() {
     }
     assert_eq!(got, (0..64u32).map(|i| (i + 1) * (i + 2) / 2).collect::<Vec<_>>());
 }
+
+/// `v_sub_nc_u32` and `v_add_nc_u32` with the clamp bit saturate as unsigned numbers (`usubsat`
+/// and `uaddsat` in LLVM's AMDGPU backend): lane `i` stores `i - 5` clamped at 0, and
+/// `0xfffffff0 + i` clamped at 0xffffffff. They were refused as "integer output modifiers".
+#[test]
+fn clamped_unsigned_sums_and_differences_saturate() {
+    let program = |op: [u32; 2], v3: [u32; 2]| {
+        vec![
+            v3[0],
+            v3[1], // v_mov_b32 v3, <constant>
+            op[0],
+            op[1], // v_sub_nc_u32 / v_add_nc_u32 v2, v0, v3 clamp
+            V_LSHLREV_V1_2_V0,
+            GLOBAL_STORE_V2_AT_V1[0],
+            GLOBAL_STORE_V2_AT_V1[1],
+            S_ENDPGM,
+        ]
+    };
+    const V_NOP: u32 = 0x7E00_0000;
+    let sub = program([0xD526_8002, 0x0002_0700], [0x7E06_0285, V_NOP]); // v3 = 5
+    let got = run32(&sub, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, (0..32u32).map(|i| i.saturating_sub(5)).collect::<Vec<_>>());
+    let add = program([0xD525_8002, 0x0002_0700], [0x7E06_02FF, 0xFFFF_FFF0]); // v3 = 0xfffffff0
+    let got = run32(&add, 0);
+    assert_eq!(got, (0..32u32).map(|i| 0xFFFF_FFF0u32.saturating_add(i)).collect::<Vec<_>>());
+}

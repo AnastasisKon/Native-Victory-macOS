@@ -38,6 +38,10 @@ pub struct Metal {
     /// The most passes of a submission in one command buffer (`VICTORY_PASSES_PER_BUFFER`;
     /// default 0: no limit).
     pub(crate) passes_per_buffer: usize,
+    /// `VICTORY_METAL_REQUEST_RESIDENCY=1`: each heap's set asks to stay resident between the
+    /// command buffers that use it (`requestResidency` after each commit), instead of being made
+    /// resident again for each one.
+    pub(crate) request_residency: bool,
     /// Command buffers `submit_passes` committed.
     pub(crate) committed: std::cell::Cell<u64>,
     /// Pipeline state pointer to name, kept only when tracing.
@@ -89,6 +93,8 @@ pub struct ResidencyCounts {
     pub added: u64,
     /// Queues the pool set was added to.
     pub queues: u64,
+    /// `requestResidency` calls on heaps' sets (`VICTORY_METAL_REQUEST_RESIDENCY`).
+    pub requests: u64,
 }
 
 impl Metal {
@@ -219,6 +225,7 @@ impl Metal {
                 mode,
                 memory_gb = memory >> 30,
                 switch = asked.as_deref().unwrap_or("unset"),
+                request_residency = std::env::var("VICTORY_METAL_REQUEST_RESIDENCY").is_ok_and(|v| v.trim() == "1"),
                 "metal: residency of what descriptor heaps name (VICTORY_METAL_RESIDENCY_SETS: 0, heap or 1)"
             );
         });
@@ -245,6 +252,7 @@ impl Metal {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(PASSES_PER_BUFFER),
+            request_residency: std::env::var("VICTORY_METAL_REQUEST_RESIDENCY").is_ok_and(|v| v.trim() == "1"),
             committed: Default::default(),
             pipe_names: Default::default(),
             trace_enc: Default::default(),
@@ -283,6 +291,12 @@ impl Metal {
     pub fn with_residency_sets(mut self, on: bool) -> Metal {
         self.residency_sets = on && sets_supported(&self.dev);
         self.pool_sets = self.residency_sets;
+        self
+    }
+
+    /// Heaps' sets ask to stay resident (`VICTORY_METAL_REQUEST_RESIDENCY`).
+    pub fn with_requested_residency(mut self, on: bool) -> Metal {
+        self.request_residency = on;
         self
     }
 

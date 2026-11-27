@@ -71,13 +71,23 @@ pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
             Ok(metal) => {
                 let console = crate::console::current();
                 let (gpu_optimal, standard) = console.title_memory();
+                let budget =
+                    super::textures::texture_budget(std::env::var("VICTORY_METAL_TEXTURE_BUDGET_MB").ok().as_deref());
+                let suggested = super::textures::suggested_texture_budget(
+                    metal.recommended_working_set(),
+                    (gpu_optimal + standard) as u64,
+                );
                 tracing::info!(
                     console = console.name(),
                     title_memory_mib = (gpu_optimal + standard) / (1 << 20),
                     recommended_working_set_mib = metal.recommended_working_set() / (1 << 20),
+                    texture_budget_mib = budget >> 20,
+                    suggested_texture_budget_mib = suggested >> 20,
                     "native host: Metal"
                 );
-                *guard = Some(Shared(Title::new(metal, pools().clone())));
+                let mut title = Title::new(metal, pools().clone());
+                title.set_texture_budget(budget);
+                *guard = Some(Shared(title));
                 start_timer();
             }
             Err(e) => {
@@ -174,8 +184,23 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
     // test's submission with textures read but not yet uploaded would upset: there the lock is
     // kept from the probes to the uploads (`Title::submit`).
     let unlocked = !cfg!(test);
+    // The lists' snapshots hold `Rc`s the recording threads share: they are taken and dropped
+    // under the title lock, once here and once for the submission below.
+    let segments = |t: &MetalTitle| {
+        let mut segments = Vec::new();
+        for &l in lists.iter().filter(|l| !l.is_null()) {
+            let list = crate::list::native(l);
+            segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments(t));
+        }
+        segments
+    };
+    let mut named = Default::default();
     if unlocked {
-        let jobs = with_title(|t| t.sync_jobs()).unwrap_or_default();
+        let jobs = with_title(|t| {
+            named = t.keep_named(segments(t).iter().map(|(l, _)| l));
+            t.sync_jobs()
+        })
+        .unwrap_or_default();
         for batch in super::textures::batches(jobs) {
             // Without the lock: the title's other threads go on recording.
             let prepared = super::textures::prepare(&batch);
@@ -190,18 +215,16 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
             t.gpu_written(key);
         }
         if t.ensure_queue(queue as usize).is_err() {
+            t.let_named_go(named);
             return;
         }
-        let mut segments = Vec::new();
-        for &l in lists.iter().filter(|l| !l.is_null()) {
-            let list = crate::list::native(l);
-            segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments());
-        }
+        let segments = segments(t);
         if unlocked {
             t.submit_synced(queue as usize, segments);
         } else {
             t.submit(queue as usize, segments);
         }
+        t.let_named_go(named);
         // `VICTORY_TRACE_DESCRIPTORS=sites`: the heaps' pages are closed again for the next
         // interval, so the title's first store into each is seen.
         if super::descriptor_trace::sites() {
@@ -885,7 +908,7 @@ pub(crate) fn mirror(handle: u64) {
                     && let Some(info) = crate::resource::placed_info(address, &res)
                     && let Some((pool, _)) = t.host.memory().resolve(address, 1)
                 {
-                    t.texture_placed(address, key, pool.id);
+                    t.texture_placed(address, key, pool.id, info.size);
                     if !t.alias_placed(address, key, &info) {
                         t.texture_created(key, info);
                         t.realize(key);

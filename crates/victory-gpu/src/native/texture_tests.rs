@@ -16,6 +16,20 @@ fn pool(id: usize, pages: usize) -> Option<Pool> {
     // Needs a device; the title is made on first use.
     with_title(|_| ())?;
     let mem = Alias::new(pages * page_size().max(16384)).unwrap();
+    // Textures earlier tests left over memory now freed and mapped here again: a new texture laid
+    // out as one of them would share its copy (`Title::realize`). The title releases its own.
+    let span = mem.alias as usize..mem.alias as usize + mem.len;
+    with_title(|t| loop {
+        let stale: Vec<usize> =
+            t.at_memory.iter().filter(|(a, _)| span.contains(a)).flat_map(|(_, k)| k.clone()).collect();
+        if stale.is_empty() {
+            break;
+        }
+        for k in stale {
+            t.host.release_resource(k);
+            t.texture_released(k);
+        }
+    });
     let info = PoolInfo {
         id,
         base: mem.primary as usize,
@@ -1730,4 +1744,507 @@ fn a_depth_twin_and_its_depth_plane_hold_the_same_texels() {
         });
         glue::resource_released(depth);
     }
+}
+
+/// Over the texture budget, the least recently used go first, only until the excess is freed.
+#[test]
+fn the_least_recently_used_textures_go_first_until_the_excess_is_freed() {
+    use crate::native::textures::choose_evictions;
+    // (key, bytes, last used)
+    let c = vec![(1, 100, 5), (2, 100, 1), (3, 100, 3), (4, 100, 3)];
+    assert_eq!(choose_evictions(c.clone(), 0), Vec::<usize>::new());
+    assert_eq!(choose_evictions(c.clone(), 1), vec![2]);
+    assert_eq!(choose_evictions(c.clone(), 150), vec![2, 3], "equal use: the lower key first");
+    assert_eq!(choose_evictions(c.clone(), 300), vec![2, 3, 4]);
+    assert_eq!(choose_evictions(c, 10_000), vec![2, 3, 4, 1]);
+}
+
+/// The budget is off unless `VICTORY_METAL_TEXTURE_BUDGET_MB` sets it; the figure suggested for a
+/// Mac is what Metal's working set leaves after the title's memory, with a floor.
+#[test]
+fn the_texture_budget_is_off_unless_set() {
+    use crate::native::textures::{MIN_TEXTURE_BUDGET, suggested_texture_budget, texture_budget};
+    const MIB: u64 = 1 << 20;
+    assert_eq!(texture_budget(None), 0, "off by default");
+    assert_eq!(texture_budget(Some("2048")), 2048 * MIB);
+    assert_eq!(texture_budget(Some("0")), 0, "0: no budget");
+    assert_eq!(texture_budget(Some("lots")), 0, "not a number: no budget");
+    // An M4 with 16 GB, Series S (#8).
+    assert_eq!(suggested_texture_budget(12124 * MIB, 7776 * MIB), 4348 * MIB);
+    // Series X on the same Mac: the title alone is past the working set.
+    assert_eq!(suggested_texture_budget(12124 * MIB, 13824 * MIB), MIN_TEXTURE_BUDGET);
+}
+
+/// A title host of its own over a pool of its own, and a 16x16 RGBA8 texture of `flags` at `at`
+/// in it, filled with `byte` and made.
+fn budget_title() -> Option<(Title<victory_metal::metal::Metal>, Pool)> {
+    with_title(|_| ())?;
+    let t = Title::new(victory_metal::metal::Metal::new().unwrap(), Default::default());
+    let mem = Alias::new((256 << 10).max(page_size())).unwrap();
+    let info = PoolInfo { id: 9141, base: mem.primary as usize, len: mem.len, memory_entry: None };
+    t.host.memory().pool_created(&info);
+    t.host.memory().mapped(mem.alias as usize, mem.len, &info, 0);
+    Some((t, Pool { mem }))
+}
+
+fn budget_texture(t: &mut Title<victory_metal::metal::Metal>, pool: &Pool, at: usize, flags: u32, byte: u8) -> usize {
+    let res = crate::resource::test_texture_at(pool.va(at), (16, 16), 1, 28, Swizzle::LINEAR.0, flags);
+    let info = crate::resource::texture_info(res).unwrap();
+    pool.write(at, &vec![byte; info.size]);
+    let key = res as usize;
+    t.texture_created(key, info);
+    assert!(t.realize(key));
+    key
+}
+
+/// Over budget, only textures no heap entry shows, no recorded or submitted work holds, and that
+/// are filled only from title memory are given up; one named again is made and filled again.
+#[test]
+fn over_budget_only_textures_nothing_uses_are_given_up_and_come_back() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let idle = budget_texture(&mut t, &pool, 0, 0, 0x11);
+    let shown = budget_texture(&mut t, &pool, 0x4000, 0, 0x22);
+    let held = budget_texture(&mut t, &pool, 0x8000, 0, 0x33);
+    // D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ALLOW_UNORDERED_ACCESS.
+    let target = budget_texture(&mut t, &pool, 0xC000, 1, 0x44);
+    let unordered = budget_texture(&mut t, &pool, 0x10000, 4, 0x55);
+    t.sync_textures();
+    // A heap entry shows `shown`; one showed `unordered` through an unordered access view.
+    let records = [0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let _heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), shown as _, &srv, start);
+    assert!(t.host.mirror(start).unwrap());
+    let uav = [28u32, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::descriptor::create_uav(std::ptr::null(), unordered as _, std::ptr::null(), &uav, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    crate::descriptor::create_srv(std::ptr::null(), shown as _, &srv, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap(), "the unordered view is gone from the heap");
+    // A recorded list copies from `held` (work the GPU has not run yet).
+    let mut list = NativeList::<victory_metal::metal::Metal>::default();
+    let src = t.texture_of(held).unwrap();
+    let dst = t.texture_of(target).unwrap();
+    list.copy_texture_region(&src, 0, 0, [0; 3], [16, 16, 1], &dst, 0, 0, [0; 3]);
+    drop((src, dst));
+
+    t.set_texture_budget(1);
+    t.keep_to_budget();
+    assert!(!t.host.knows(idle), "the one texture nothing uses is given up");
+    for key in [shown, held, target, unordered] {
+        assert!(t.host.knows(key), "{key:#x} is in use");
+    }
+    drop(list);
+    // Still over budget after that check, so the next one waits a while.
+    t.keep_to_budget();
+    assert!(t.host.knows(held), "not checked again at once");
+    for _ in 0..crate::native::textures::RECHECK {
+        t.keep_to_budget();
+    }
+    assert!(!t.host.knows(held), "once the work that held it is gone");
+
+    // Named again (a view, a copy): made again and filled from title memory at the next sync.
+    assert!(t.realize(idle));
+    t.sync_textures();
+    let tex = t.texture_of(idle).unwrap();
+    let mut out = vec![0u8; 16 * 16 * 4];
+    t.host.backend.read_texture(&tex, 0, 0, &mut out, 16 * 4, 0);
+    assert!(out.iter().all(|&b| b == 0x11));
+}
+
+/// The fallback when a record naming an evicted texture is mirrored outside the scan of a
+/// submission's tables ([`Title::keep_named`]): the entry asks for the texture, the next submission
+/// makes it again and the entry is written then. Until then the entry shows nothing (a draw would
+/// sample transparent black), not what it showed before.
+#[test]
+fn an_entry_copied_with_plain_stores_gets_an_evicted_texture_back() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let gone = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    let other = budget_texture(&mut t, &pool, 0x4000, 0, 0x77);
+    let records = [0u32; 8];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 1).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), other as _, &srv, start);
+    assert!(t.host.mirror(start).unwrap());
+    t.set_texture_budget(1);
+    t.keep_to_budget();
+    assert!(!t.host.knows(gone) && t.host.knows(other));
+
+    // The title's record now names the evicted texture.
+    crate::descriptor::create_srv(std::ptr::null(), gone as _, &srv, start);
+    assert!(!t.host.mirror(start).unwrap(), "not made yet");
+    assert!(!heap.shows_texture(other), "the entry no longer shows the texture it showed");
+    t.set_texture_budget(0);
+    t.sync_dirty();
+    assert!(t.host.knows(gone), "made again at the next submission");
+    assert!(t.host.mirror(start).unwrap());
+    assert!(heap.shows_texture(gone));
+}
+
+/// Draws a triangle covering the centre of a 16x16 target, red vertex colour times texture `key`
+/// sampled through entry 0 of a heap whose record the title stored with plain stores (no device
+/// call, so the host has not mirrored it), in one submission of `t`; the centre pixel.
+fn draw_sampling(t: &mut Title<victory_metal::metal::Metal>, pool: &Pool, key: usize, queue: usize) -> [u8; 4] {
+    let (l, color, records) = sampling_list(t, pool, key);
+    let fence = queue + 100;
+    t.ensure_queue(queue).unwrap();
+    t.submit(queue, vec![(l, vec![])]);
+    t.signal_queue(queue, fence, 0, 1);
+    let start = std::time::Instant::now();
+    while !t.try_wait(fence, 0, 1) {
+        assert!(start.elapsed().as_secs() < 10, "the draw did not complete");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let mut out = vec![0u8; SAMPLED * SAMPLED * 4];
+    t.host.backend.read_texture(&color, 0, 0, &mut out, SAMPLED * 4, 0);
+    drop(records);
+    out[(8 * SAMPLED + 8) * 4..][..4].try_into().unwrap()
+}
+
+const SAMPLED: usize = 16;
+
+/// The list [`draw_sampling`] submits, its target, and the heaps' records (kept while it is used).
+#[allow(clippy::type_complexity)]
+fn sampling_list(
+    t: &mut Title<victory_metal::metal::Metal>,
+    pool: &Pool,
+    key: usize,
+) -> (NativeList<victory_metal::metal::Metal>, std::rc::Rc<<victory_metal::metal::Metal as ResourceBackend>::Texture>, (Vec<u32>, Vec<u32>)) {
+    const W: usize = SAMPLED;
+    let v = |x: f32, y: f32| [x, y, 0.5, 0.5, 1.0, 0.0, 0.0, 1.0];
+    pool.write(0x20000, &[v(-0.5, -0.5), v(0.5, -0.5), v(0.0, 0.5)]);
+    let attrs = [
+        VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
+        VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
+        VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+    ];
+    let pso = t
+        .host
+        .render_pipeline(&RenderPipelineDesc {
+            vs: &super::fixture("tri_vs"),
+            ps: Some(&super::fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &attrs,
+            streams: &[VertexStream { slot: 0, stride: 32, per_instance: false }],
+            color: &[Format::Rgba8Unorm],
+            depth: None,
+            depth_test: None,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
+    rt.render_target = true;
+    let color = t.host.texture(&rt).unwrap();
+    let (views, smp) = (vec![0u32; 8], vec![0u32; 4]);
+    let (vstart, sstart) = (views.as_ptr() as u64, smp.as_ptr() as u64);
+    let vheap = t.host.heap(HeapKind::Resource, vstart, 1).unwrap();
+    let sheap = t.host.heap(HeapKind::Sampler, sstart, 1).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), key as _, &srv, vstart);
+    let mut sw = [0u32; 27];
+    (sw[1], sw[2], sw[6], sw[7], sw[8]) = (1, 1, 3, 3, 3);
+    crate::descriptor::create_sampler_x(std::ptr::null_mut(), &sw, sstart);
+    assert!(t.host.mirror(sstart).unwrap());
+
+    let mut l = NativeList::default();
+    l.set_render_targets(std::slice::from_ref(&color), None);
+    l.clear_render_target(&color, [0.0, 0.0, 1.0, 1.0]);
+    l.set_graphics_pipeline(&pso, Topology::Triangles);
+    l.set_heaps(Some(&vheap), Some(&sheap));
+    l.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
+    l.set_graphics_root_table(1, &vheap, 0);
+    l.set_graphics_root_table(2, &sheap, 0);
+    l.set_vertex_buffer(0, pool.va(0x20000));
+    l.draw_instanced(3, 1, 0, 0).unwrap();
+    (l, color, (views, smp))
+}
+
+/// Over the texture budget, a draw samples a texture given up before through an entry the title
+/// stored with plain stores in the table it binds: the texture is made again for that draw, in
+/// that submission (it sampled transparent black, the entry cleared, until the next one).
+#[test]
+fn a_texture_given_up_is_back_for_the_draw_whose_table_names_it() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let gone = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    t.set_texture_budget(1);
+    t.keep_to_budget();
+    assert!(!t.host.knows(gone));
+    assert_eq!(draw_sampling(&mut t, &pool, gone, 1), [0x66, 0, 0, 0x66]);
+    assert!(t.host.knows(gone));
+}
+
+/// Over the texture budget, a texture no entry the host mirrored shows, which the table of a draw
+/// in the submission names through a record the title stored with plain stores, is not given up
+/// at that submission's sync, under the draw.
+#[test]
+fn a_texture_the_submission_names_is_not_given_up_under_its_draw() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let live = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    t.set_texture_budget(1);
+    assert_eq!(draw_sampling(&mut t, &pool, live, 2), [0x66, 0, 0, 0x66]);
+    assert!(t.host.knows(live));
+}
+
+/// Names a submission's tables read stay out of the budget's reach until that submission is with
+/// its queue, even when another submission's sync comes in between (`glue::submit` lets the title
+/// lock go between the two).
+#[test]
+fn a_texture_named_by_a_submission_in_flight_is_not_given_up_by_another() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let named = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    let idle = budget_texture(&mut t, &pool, 0x4000, 0, 0x77);
+    t.set_texture_budget(1);
+    let (a, _color, records) = sampling_list(&mut t, &pool, named);
+    let first = t.keep_named(std::iter::once(&a));
+    assert!(first.contains(&named));
+    // Another queue's submission, with nothing bound, synced in between.
+    let b = NativeList::<victory_metal::metal::Metal>::default();
+    let second = t.keep_named(std::iter::once(&b));
+    let _ = t.sync_jobs();
+    assert!(!t.host.knows(idle), "over budget: the idle one goes");
+    assert!(t.host.knows(named), "the first submission still names it");
+    t.let_named_go(second);
+    for _ in 0..crate::native::textures::RECHECK {
+        t.keep_to_budget();
+    }
+    assert!(t.host.knows(named), "still in flight");
+    t.let_named_go(first);
+    for _ in 0..crate::native::textures::RECHECK {
+        t.keep_to_budget();
+    }
+    assert!(!t.host.knows(named), "given up once nothing in flight names it");
+    drop((a, records));
+}
+
+/// The budget counts a copy by its size in title memory, once per title texture: views of one
+/// object, in other formats or of other mips, name the object, and share its one host texture.
+#[test]
+fn views_of_one_texture_share_one_copy_counted_once() {
+    use crate::descriptor::View;
+    let Some((mut t, pool)) = budget_title() else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (32, 32), 6, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    t.texture_created(key, info.clone());
+    // Two views of it: RGBA8 UNORM, all mips; RGBA8 UNORM sRGB (29), mip 2 only.
+    let heap = crate::descriptor::test_heap(false, 4);
+    let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[2], srv[5]) = (28, 4, 0x1688, u32::MAX);
+    crate::descriptor::create_srv(std::ptr::null(), res, &srv, start);
+    (srv[0], srv[4], srv[5]) = (29, 2, 1);
+    crate::descriptor::create_srv(std::ptr::null(), res, &srv, start + 32);
+    for handle in [start, start + 32] {
+        let Some(View::Shader(r, _)) = crate::descriptor::view(handle) else { panic!("a view") };
+        assert_eq!(r, key, "the view names the object");
+        assert!(t.realize(r));
+    }
+    let a = t.texture_of(key).unwrap();
+    assert!(std::rc::Rc::ptr_eq(&a, &t.texture_of(key).unwrap()), "one host texture");
+    assert_eq!(t.budget.live, info.size as u64, "counted once, all mips");
+}
+
+/// Views of memory the title placed itself are keyed by address and resource description, not
+/// by the view's own description: views of one placed texture share one copy.
+#[test]
+fn placed_views_of_one_description_share_one_key() {
+    use crate::native::textures::placed_key;
+    let res = crate::resource::test_texture_at(0x10_0000_0000, (32, 32), 6, 28, Swizzle::SW_64KB_S.0, 0);
+    let words = crate::resource::texture_desc(res).unwrap();
+    let key = placed_key(0x10_0000_0000, &words);
+    // The key reads no view description at all; padding words do not change it either.
+    let mut padded = words;
+    (padded[1], padded[13]) = (0xdead, 0xbeef);
+    assert_eq!(placed_key(0x10_0000_0000, &padded), key);
+    let mut other = words;
+    other[8] = 29; // another format
+    assert_ne!(placed_key(0x10_0000_0000, &other), key, "another description: another copy");
+    assert_ne!(placed_key(0x10_0001_0000, &words), key, "another address: another copy");
+}
+
+/// Copies are counted, and held, once per title texture, not once per byte of title memory: two
+/// objects over the same memory (aliasing placed resources) and a placed description starting
+/// inside another's memory each get a host texture of their own, so the copies add up to more
+/// than the title memory under them. The trace's distinct figure counts that memory once.
+#[test]
+fn textures_over_one_memory_each_hold_a_copy_of_their_own() {
+    use crate::native::textures::{distinct_bytes, placed_key};
+    let Some((mut t, pool)) = budget_title() else { return };
+    let a = crate::resource::test_texture_at(pool.va(0), (64, 64), 1, 28, Swizzle::LINEAR.0, 0);
+    let b = crate::resource::test_texture_at(pool.va(0), (64, 64), 1, 71, Swizzle::LINEAR.0, 0);
+    let (ia, ib) = (crate::resource::texture_info(a).unwrap(), crate::resource::texture_info(b).unwrap());
+    // A description the title places at 4 KiB into the same memory (no object; a view names it).
+    let c = crate::resource::test_texture_at(pool.va(0x1000), (32, 32), 1, 28, Swizzle::LINEAR.0, 0);
+    let words = crate::resource::texture_desc(c).unwrap();
+    let ic = crate::resource::placed_info(pool.va(0x1000), &words).unwrap();
+    let kc = placed_key(pool.va(0x1000), &words);
+    t.texture_placed(pool.va(0x1000), kc, 9141, 0x1000);
+    for (key, info) in [(a as usize, ia.clone()), (b as usize, ib.clone()), (kc, ic.clone())] {
+        t.texture_created(key, info);
+        assert!(t.realize(key));
+    }
+    let (ta, tb, tc) = (t.texture_of(a as usize).unwrap(), t.texture_of(b as usize).unwrap(), t.texture_of(kc).unwrap());
+    assert!(!std::rc::Rc::ptr_eq(&ta, &tb) && !std::rc::Rc::ptr_eq(&ta, &tc), "three host textures");
+    let counted = (ia.size + ib.size + ic.size) as u64;
+    assert_eq!(t.budget.live, counted);
+    let under = distinct_bytes(vec![(ia.memory as usize, ia.size), (ib.memory as usize, ib.size), (ic.memory as usize, ic.size)]);
+    assert_eq!(under, ia.size as u64, "all three lie in the first one's 16 KiB");
+    assert!(counted > under);
+    assert_eq!(t.memory_under_copies(), (under, 0), "what the trace logs");
+    // The same pool pages mapped at a second title address: a texture there is over the same
+    // bytes, and counts once too.
+    let info = PoolInfo { id: 9141, base: pool.mem.primary as usize, len: pool.mem.len, memory_entry: None };
+    t.host.memory().mapped(pool.mem.primary as usize, pool.mem.len, &info, 0);
+    let d = crate::resource::test_texture_at(pool.mem.primary as u64, (64, 64), 1, 28, Swizzle::LINEAR.0, 0);
+    let id = crate::resource::texture_info(d).unwrap();
+    t.texture_created(d as usize, id.clone());
+    assert!(t.realize(d as usize));
+    assert_eq!(t.budget.live, counted + id.size as u64);
+    assert_eq!(t.memory_under_copies(), (under, 0), "one memory at two addresses");
+}
+
+/// A copy over memory in no title pool is logged as outside them.
+#[test]
+fn a_copy_outside_the_titles_pools_is_logged_so() {
+    let Some((mut t, _pool)) = budget_title() else { return };
+    let own = vec![0u8; 16 * 16 * 4];
+    let res = crate::resource::test_texture_at(own.as_ptr() as u64, (16, 16), 1, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    t.texture_created(res as usize, info.clone());
+    assert!(t.realize(res as usize));
+    assert_eq!(t.memory_under_copies(), (info.size as u64, info.size as u64));
+}
+
+/// The trace's distinct title memory under copies: each byte once, gaps not counted.
+#[test]
+fn distinct_bytes_counts_overlaps_once() {
+    use crate::native::textures::distinct_bytes;
+    assert_eq!(distinct_bytes(vec![]), 0);
+    assert_eq!(distinct_bytes(vec![(0, 100), (0, 100)]), 100);
+    assert_eq!(distinct_bytes(vec![(50, 100), (0, 100)]), 150);
+    assert_eq!(distinct_bytes(vec![(0, 100), (10, 20), (200, 10)]), 110);
+    assert_eq!(distinct_bytes(vec![(0, 100), (100, 1)]), 101);
+}
+
+/// A 16x16 (`size`) RGBA8 texture the title places at `at` in the budget pool (no object; a view
+/// names it), filled with `byte` and made.
+fn budget_placed(t: &mut Title<victory_metal::metal::Metal>, pool: &Pool, at: usize, size: u32, byte: u8) -> usize {
+    let res = crate::resource::test_texture_at(pool.va(at), (size.into(), size), 1, 28, Swizzle::LINEAR.0, 0);
+    let words = crate::resource::texture_desc(res).unwrap();
+    let info = crate::resource::placed_info(pool.va(at), &words).unwrap();
+    pool.write(at, &vec![byte; info.size]);
+    let key = crate::native::textures::placed_key(pool.va(at), &words);
+    t.texture_placed(pool.va(at), key, 9141, info.size);
+    t.texture_created(key, info);
+    assert!(t.realize(key));
+    key
+}
+
+/// A title texture laid out exactly as a live copy over the same memory (here a placed view of
+/// an object's memory in the object's description) uses that copy's texture, counted once; one
+/// in another host format gets its own. A GPU write through the sharing key makes the shared
+/// copy the GPU's.
+#[test]
+fn an_identical_texture_over_the_same_memory_shares_its_copy() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let object = budget_texture(&mut t, &pool, 0, 0, 0x11);
+    let size = t.budget.live;
+    let placed = budget_placed(&mut t, &pool, 0, 16, 0x11);
+    let own = t.texture_of(object).unwrap();
+    assert!(std::rc::Rc::ptr_eq(&own, &t.texture_of(placed).unwrap()), "one texture");
+    assert!(std::rc::Rc::ptr_eq(&own, &t.host.texture_at(placed).expect("registered")));
+    assert_eq!(t.budget.live, size, "counted once");
+    // B8G8R8A8 (87) over the same bytes: another host format, its own copy.
+    let res = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 87, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    t.texture_created(res as usize, info);
+    assert!(t.realize(res as usize));
+    assert!(!std::rc::Rc::ptr_eq(&own, &t.texture_of(res as usize).unwrap()));
+    assert_eq!(t.budget.live, 2 * size);
+    // Uploaded once; a GPU write through the placed key keeps the object's copy from memory.
+    t.sync_textures();
+    assert_eq!(t.uploads_of(object), 1);
+    t.gpu_written(placed);
+    pool.write(0, &[0x22u8; 64]);
+    t.sync_textures();
+    assert_eq!(t.uploads_of(object), 1, "the GPU's now");
+}
+
+/// When the copy a texture shared goes with its title texture, the texture that shared it takes the
+/// copy over: still registered, the same texture, not uploaded again, counted once; a draw reads it.
+#[test]
+fn a_texture_sharing_a_released_copy_takes_it_over() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let object = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    let size = t.budget.live;
+    let placed = budget_placed(&mut t, &pool, 0, 16, 0x66);
+    let copy = t.texture_of(object).unwrap();
+    t.sync_textures();
+    assert_eq!(t.uploads_of(placed), 1);
+    t.host.release_resource(object);
+    t.texture_released(object);
+    assert!(t.host.knows(placed) && !t.host.is_evicted(placed));
+    assert!(std::rc::Rc::ptr_eq(&copy, &t.texture_of(placed).unwrap()), "the same texture");
+    assert_eq!(t.budget.live, size);
+    t.sync_textures();
+    assert_eq!(t.uploads_of(placed), 1, "not uploaded again");
+    assert_eq!(draw_sampling(&mut t, &pool, placed, 3), [0x66, 0, 0, 0x66]);
+}
+
+/// Has the one entry of a host heap over `views` show title texture `key` (a mirrored view).
+fn show(t: &mut Title<victory_metal::metal::Metal>, views: &[u32], key: usize) {
+    let at = views.as_ptr() as u64;
+    if t.host.heap_at(at).is_none() {
+        t.host.heap(HeapKind::Resource, at, 1).unwrap();
+    }
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), key as _, &srv, at);
+    assert!(t.host.mirror(at).unwrap());
+}
+
+/// A placed copy another placement covers at another start is given up at the next sync once
+/// nothing uses it; one a heap entry still shows stays until the title writes another record over
+/// that entry (work in flight may read it through the entry). One named again comes back for its
+/// draw, with its texels. One not overlapped stays, as does one that holds what title memory does
+/// not (GPU-written). A view of a copy given up, written again at its own address, is not a new
+/// placement and covers nothing.
+#[test]
+fn a_placed_copy_another_placement_covers_is_given_up_once_unused() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let old = budget_placed(&mut t, &pool, 0, 32, 0x44);
+    let shown = budget_placed(&mut t, &pool, 0x4000, 32, 0x33);
+    let apart = budget_placed(&mut t, &pool, 0x8000, 16, 0x55);
+    let written = budget_placed(&mut t, &pool, 0xA000, 32, 0x77);
+    t.gpu_written(written);
+    let views = vec![0u32; 8];
+    show(&mut t, &views, shown);
+    let new = budget_placed(&mut t, &pool, 0x800, 16, 0x44);
+    let _ = budget_placed(&mut t, &pool, 0x4800, 16, 0x33);
+    let _ = budget_placed(&mut t, &pool, 0xA800, 16, 0x77);
+    assert!(t.host.knows(old), "not at the placement itself");
+    let _ = t.sync_jobs();
+    assert!(!t.host.knows(old) && t.host.is_evicted(old), "covered and unused: given up");
+    assert!(t.host.knows(shown), "an entry still shows it");
+    assert!(t.host.knows(new) && t.host.knows(apart));
+    assert!(t.host.knows(written), "the GPU's copy stays");
+    assert!(!t.covered.contains(&written), "and is not even marked");
+    show(&mut t, &views, apart);
+    let _ = t.sync_jobs();
+    assert!(!t.host.knows(shown), "given up once its entry shows another");
+    // The old view written again: back, and the new one stays.
+    let res = crate::resource::test_texture_at(pool.va(0), (32, 32), 1, 28, Swizzle::LINEAR.0, 0);
+    let words = crate::resource::texture_desc(res).unwrap();
+    let info = crate::resource::placed_info(pool.va(0), &words).unwrap();
+    t.texture_placed(pool.va(0), old, 9141, info.size);
+    let _ = t.sync_jobs();
+    assert!(t.host.knows(new), "a copy coming back covers nothing anew");
+    assert_eq!(draw_sampling(&mut t, &pool, old, 4), [0x44, 0, 0, 0x44]);
+    drop(views);
 }

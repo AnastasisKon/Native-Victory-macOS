@@ -70,6 +70,13 @@ pub struct NativeHost<B: GraphicsBackend> {
     /// The same keys always, for the title side to stop filling them from title memory
     /// ([`Self::take_gpu_written`]).
     gpu_written: RefCell<std::collections::HashSet<usize>>,
+    /// Textures given up under the texture budget (`Title::keep_to_budget`) and not made again.
+    evicted: RefCell<std::collections::HashSet<usize>>,
+    /// Evicted textures an entry's record named since the last [`Self::take_wanted`].
+    wanted: RefCell<Vec<usize>>,
+    /// Textures a heap entry showed through an unordered access view: what a shader may write,
+    /// so the host texture may hold what title memory does not and is never given up.
+    unordered: RefCell<std::collections::HashSet<usize>>,
     /// Colour twins of depth textures compute writes, by the depth texture's address
     /// ([`Self::depth_twin`]).
     twins: RefCell<HashMap<usize, Rc<DepthTwin<B>>>>,
@@ -207,6 +214,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
             written: Default::default(),
             gpu_written: Default::default(),
             twins: RefCell::default(),
+            evicted: Default::default(),
+            wanted: Default::default(),
+            unordered: Default::default(),
         }
     }
 
@@ -742,6 +752,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     pub fn register_texture(&self, key: usize, texture: &Rc<B::Texture>) {
+        self.evicted.borrow_mut().remove(&key);
         self.resources
             .borrow_mut()
             .insert(key, Res::Texture(texture.clone()));
@@ -864,6 +875,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     /// The title released resource object `key`: later views naming it decode to nothing.
     pub fn forget_resource(&self, key: usize) {
+        self.forget_marks(key);
         if self.resources.borrow_mut().remove(&key).is_some() {
             self.resources_epoch.set(self.resources_epoch.get() + 1);
         }
@@ -877,6 +889,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// texture at this address again ([`Self::register_texture`]). Its old record is not: it may
     /// name the next object at this address, of a format the view cannot be made over.
     pub fn release_resource(&self, key: usize) {
+        self.forget_marks(key);
         let removed = self.resources.borrow_mut().remove(&key);
         if removed.is_some() {
             self.resources_epoch.set(self.resources_epoch.get() + 1);
@@ -895,6 +908,42 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 self.cleared.set(self.cleared.get() + 1);
             }
         }
+    }
+
+    /// What the host noted of texture `key`, which is gone for good (the next object at its
+    /// address starts afresh).
+    fn forget_marks(&self, key: usize) {
+        self.evicted.borrow_mut().remove(&key);
+        self.unordered.borrow_mut().remove(&key);
+    }
+
+    /// Gives up the host texture of `key` under the texture budget: as [`Self::release_resource`]
+    /// (no heap entry shows it, so none is cleared), but an entry that names it again asks for it
+    /// ([`Self::take_wanted`]).
+    pub(crate) fn evict_texture(&self, key: usize) {
+        self.release_resource(key);
+        self.evicted.borrow_mut().insert(key);
+    }
+
+    /// Whether `key` was given up under the texture budget and not made again since.
+    pub(crate) fn is_evicted(&self, key: usize) -> bool {
+        self.evicted.borrow().contains(&key)
+    }
+
+    /// The evicted textures entries named since the last call (`Title` makes them again).
+    pub(crate) fn take_wanted(&self) -> Vec<usize> {
+        std::mem::take(&mut self.wanted.borrow_mut())
+    }
+
+    /// Whether an entry ever showed texture `key` for unordered access.
+    pub(crate) fn ever_unordered(&self, key: usize) -> bool {
+        self.unordered.borrow().contains(&key)
+    }
+
+    /// Whether a heap entry shows texture `key` (shaders index heaps themselves, so a texture an
+    /// entry shows counts as used), or ever showed it for unordered access.
+    pub(crate) fn texture_in_use(&self, key: usize) -> bool {
+        self.unordered.borrow().contains(&key) || self.heaps.borrow().iter().any(|h| h.shows_texture(key))
     }
 
     /// Heap entries cleared so far because the texture they showed was released.
@@ -1082,8 +1131,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 format,
             } => {
                 let Some(Res::Texture(tex)) = resources.get(&resource) else {
+                    // An evicted texture: made again at the next submission, which writes this
+                    // entry then (registering bumps the epoch its retry waits for). Until then the
+                    // entry shows nothing rather than what it showed before.
+                    if self.evicted.borrow().contains(&resource) {
+                        self.wanted.borrow_mut().push(resource);
+                        self.backend.clear_entry(&heap.heap, index);
+                        heap.shows(index, None);
+                    }
                     return Ok(false);
                 };
+                if matches!(view, crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(true, ..)) {
+                    self.unordered.borrow_mut().insert(resource);
+                }
                 // A colour view of a depth texture that compute writes shows its twin. Twins are
                 // made at unordered views of texture objects only (a placed view's key is no
                 // object to read the description of); a placed view shows an existing one.
@@ -1179,6 +1239,64 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.gpu_written.borrow_mut().extend(written);
     }
 
+    /// The entries of the table bound at root `slot` from entry `at` that a submission checks
+    /// ([`Self::remirror_tables`]): as many as the shader's table ranges reach, at least
+    /// [`Self::TABLE_CHECK`], within the heap.
+    fn table_span(h: &NativeHeap<B>, slot: usize, at: usize, binding: Option<&Binding>) -> std::ops::Range<usize> {
+        at..(at + table_check_count(slot, binding, Self::TABLE_CHECK)).min(h.count)
+    }
+
+    /// The resources the records of the tables `lists`' draws and dispatches bind name now: the
+    /// entries [`Self::remirror_tables`] mirrors when the lists are encoded, so a texture named
+    /// there must be made before (the texture budget).
+    pub(crate) fn resources_named<'a>(
+        &self,
+        lists: impl Iterator<Item = &'a NativeList<B>>,
+    ) -> std::collections::HashSet<usize>
+    where
+        B: 'a,
+    {
+        use crate::descriptor::View;
+        let (mut tables, mut named) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+        for cmd in lists.flat_map(|l| &l.cmds) {
+            let (root, binding) = match cmd {
+                Cmd::Dispatch { root, pso, .. } => (root, pso.binding.as_ref()),
+                Cmd::Draw { root, binding, .. } => (root, binding.as_deref()),
+                _ => continue,
+            };
+            for (slot, r) in root.iter().enumerate() {
+                let Some(Root::Table(h, at)) = r else { continue };
+                let span = Self::table_span(h, slot, *at, binding);
+                if h.kind != HeapKind::Resource || !tables.insert((h.start, span.clone())) {
+                    continue;
+                }
+                let step = Self::step(h.kind) as usize;
+                let mut records = vec![0u8; span.len() * step];
+                if !super::safe_read((h.start + (span.start * step) as u64) as *const u8, &mut records) {
+                    continue;
+                }
+                for (i, record) in records.chunks(step).enumerate() {
+                    if record[..12] == [0; 12] {
+                        continue;
+                    }
+                    match crate::descriptor::view(h.start + ((span.start + i) * step) as u64) {
+                        Some(View::Shader(r, _) | View::Unordered(r, ..)) => named.insert(r),
+                        Some(View::Placed(_, res, d)) => {
+                            named.insert(super::textures::placed_key(u64::from(d[10]) | u64::from(d[11]) << 32, &res))
+                        }
+                        _ => continue,
+                    };
+                }
+            }
+        }
+        named
+    }
+
+    /// Whether any texture is given up under the texture budget and not made again.
+    pub(crate) fn any_evicted(&self) -> bool {
+        !self.evicted.borrow().is_empty()
+    }
+
     /// Mirrors again the entries of each table `root` binds whose title record changed since
     /// they were last mirrored. The title copies records into its shader-visible heaps with plain
     /// stores (the content draws' constant buffers, from frame ~700), which no device call reports,
@@ -1188,10 +1306,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let res_gen = self.resources_epoch.get();
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
-            let check = table_check_count(slot, binding, Self::TABLE_CHECK);
             let (mut checked, mut changed) = (0, 0);
             let step = Self::step(h.kind) as usize;
-            let end = (*at + check).min(h.count);
+            let end = Self::table_span(h, slot, *at, binding).end;
             if heap_set_trace().is_some() {
                 let frame = (crate::frame::current() as u32).saturating_add(1);
                 let mut used = h.used.borrow_mut();

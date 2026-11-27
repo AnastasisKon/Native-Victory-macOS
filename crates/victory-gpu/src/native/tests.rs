@@ -1002,6 +1002,43 @@ fn a_command_at_unmapped_title_memory_is_dropped_alone() {
     assert_eq!(kept, (0..16).collect::<Vec<u32>>(), "the copy was dropped, not run");
 }
 
+/// A committed buffer's memory is the host's own (no pool holds it): root views and copies into it
+/// reach it while the buffer lives, and are refused as unmapped once it is released.
+#[test]
+fn root_views_and_copies_reach_committed_buffer_memory() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 1);
+    pool.write(0, &(0..N as u32).collect::<Vec<_>>());
+    // What `XMemAllocDefault` gives a committed buffer: host heap memory, 64 KiB aligned.
+    let layout = std::alloc::Layout::from_size_align(3 * N * 4, 1 << 16).unwrap();
+    // SAFETY: non-zero size; freed below, after the GPU is done with it.
+    let mem = unsafe { std::alloc::alloc_zeroed(layout) };
+    let at = mem as u64;
+    let (src, dst) = (at + (N * 4) as u64, at + (2 * N * 4) as u64);
+    let key = 0xC0FFEE;
+    h.register_own_buffer(key, at, layout.size() as u64);
+    let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+
+    let mut l = NativeList::default();
+    l.copy_buffer_region(src, pool.va(0), N * 4);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[5, 7]);
+    l.set_compute_root_view(1, src);
+    l.set_compute_root_view(2, dst);
+    l.dispatch((N / 64) as u32, 1, 1).unwrap();
+    run(&h, &[&l]);
+    assert_eq!(h.unmapped(), 0);
+    // SAFETY: inside the allocation; read after the fence wait.
+    let out = unsafe { std::slice::from_raw_parts(dst as *const u32, N) };
+    assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "{:?}", &out[..4]);
+
+    h.release_resource(key);
+    run(&h, &[&l]);
+    assert_eq!(h.unmapped(), 2, "the copy and the dispatch were refused once the buffer went");
+    // SAFETY: allocated above with this layout; the GPU is idle.
+    unsafe { std::alloc::dealloc(mem, layout) };
+}
+
 /// A dispatch that reads a root parameter nothing was set in is dropped by itself: the value
 /// write recorded before it and the dispatch after it still run (a queue may wait for that value).
 #[test]

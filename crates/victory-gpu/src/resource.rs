@@ -1823,14 +1823,17 @@ fn hand_out_resource(
     // The native host names a buffer by its object, to decode views of it, and keeps a texture
     // of its own for each title texture.
     #[cfg(target_os = "macos")]
-    let made = (desc.dimension == BUFFER).then(|| (resource.data() as u64, desc.width));
+    let made = (desc.dimension == BUFFER).then(|| {
+        let own = !matches!(resource.backing, Backing::Address(_));
+        (resource.data() as u64, desc.width, own)
+    });
     let hr = object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out);
     #[cfg(target_os = "macos")]
     if hr == S_OK && !out.is_null() {
         // SAFETY: handed out just now.
         let this = unsafe { *out };
         match made {
-            Some((address, width)) => crate::native::glue::buffer_created(this, address, width),
+            Some((address, width, own)) => crate::native::glue::buffer_created(this, address, width, own),
             None => crate::native::glue::texture_created(this),
         }
     }

@@ -183,6 +183,12 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
         }
     }
     with_title(|t| {
+        // What the GPU drew, cleared or wrote through views is no longer filled from title
+        // memory, which the title changes under its render targets (noise uploaded over them).
+        let drew = std::mem::take(&mut *DREW.lock().unwrap_or_else(|e| e.into_inner()));
+        for key in drew.into_iter().chain(t.host.take_gpu_written()) {
+            t.gpu_written(key);
+        }
         if t.ensure_queue(queue as usize).is_err() {
             return;
         }
@@ -293,7 +299,16 @@ static DROP_REASONS: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
 static DROP_PIPES: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
 static DROPPED_OPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// Textures a recorded draw or clear writes, made the GPU's ([`Title::gpu_written`]) at the next
+/// submission.
+static DREW: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Counts texture `key` for the frame trace: `which` 0 drawn or copied into, 1 cleared, 2 a draw
+/// into it dropped. Drawn and cleared, it is also the GPU's from the next submission on ([`DREW`]).
 fn trace_bump(key: usize, which: usize) {
+    if which < 2 {
+        DREW.lock().unwrap_or_else(|e| e.into_inner()).insert(key);
+    }
     if tracing_targets() {
         TRACE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().entry(key).or_default()[which] += 1;
     }
@@ -669,8 +684,12 @@ pub fn last_frame() -> Option<(usize, usize, Vec<u8>)> {
 // --- resources and descriptors ---
 
 /// A buffer resource object `res` of `len` bytes at title address `addr`.
-pub(crate) fn buffer_created(res: This, addr: u64, len: u64) {
-    with_title(|t| t.host.register_buffer(res as usize, addr, len));
+/// `own`: its memory is the host's (committed, or in a heap), not title memory a pool holds.
+pub(crate) fn buffer_created(res: This, addr: u64, len: u64, own: bool) {
+    with_title(|t| match own {
+        true => t.host.register_own_buffer(res as usize, addr, len),
+        false => t.host.register_buffer(res as usize, addr, len),
+    });
 }
 
 /// A pipeline object's last reference went: the host pipelines made for it are forgotten, as the
@@ -779,6 +798,7 @@ pub(crate) fn clear_dsv(this: This, handle: u64, flags: u32, depth: f32, stencil
     }
     with_list(this, |t, l| {
         if let Some(tex) = t.texture_of(record.resource as usize) {
+            trace_bump(record.resource as usize, 1);
             l.list.clear_depth_stencil(
                 &tex,
                 (flags & 1 != 0).then_some(depth),

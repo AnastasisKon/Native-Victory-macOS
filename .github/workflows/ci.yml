@@ -32,6 +32,8 @@ jobs:
         run: /bin/bash tools/macos/tests/verify-msc.sh
       - name: Run-log summary self-test (Bash 3.2)
         run: /bin/bash tools/macos/run-summary.sh --self-test
+      - name: Test-native converter fail-fast (Bash 3.2)
+        run: /bin/bash tools/macos/tests/msc-check.sh
       - name: Tester report script regressions (Bash 3.2)
         run: /bin/bash tools/macos/tests/tester-report.sh
       - name: Run-log summary --compare (Bash 3.2)

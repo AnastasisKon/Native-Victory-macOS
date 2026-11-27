@@ -3262,7 +3262,6 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
     /// `v_fma_legacy_f32` and `v_fmac_legacy_f32`, RDNA2's encodings of what GFX10.1 had as
     /// `v_mad_legacy_f32` and `v_mac_legacy_f32`: one rounding, with DX9's rule that a zero
     /// factor makes the product +0 against anything (both factors made 0, so `0 * 0 + c`).
@@ -3277,6 +3276,7 @@ impl<'a> Lower<'a> {
         self.fmad(a, b, cc)
     }
 
+    /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);

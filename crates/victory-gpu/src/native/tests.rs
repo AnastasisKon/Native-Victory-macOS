@@ -333,6 +333,11 @@ fn a_wrapped_view_follows_title_pages_remapped_or_unmapped_under_it() {
     assert_eq!(pass(), expect(&|i| i + 68), "the view still read the old pool page");
     title.unmap(&h, 1, page);
     assert_eq!(pass(), vec![1; 64], "a view with an unmapped page is the null view");
+    // A null view (address 0) written over a followed entry is not followed any more.
+    assert!(heap.title_views.borrow().contains_key(&0));
+    crate::descriptor::create_cbv(std::ptr::null_mut(), &[0, 0, 256, 0], start);
+    assert!(h.mirror(start).unwrap());
+    assert!(!heap.title_views.borrow().contains_key(&0), "a null view's pages are followed");
     drop(slots);
 }
 

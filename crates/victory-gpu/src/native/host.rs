@@ -623,10 +623,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
         match decoded {
             // A buffer view of address 0 (what D3D12 writes for a null view): the null view, and
-            // mirrored like any other entry. Taken for memory in no pool, it was tried again at
-            // every draw after any change to the pool table, which world streaming makes all the
-            // time (about 10,000 entries a submission in the world).
+            // mirrored like any other entry, whatever its size. Nothing is ever mapped at 0 here
+            // (title addresses are this process's, and `apps/victory/build.rs` keeps page 0 as
+            // `__PAGEZERO`), and no buffer object is at 0 (a resource at address 0 is refused), so
+            // neither a pool nor a wrap of the title's pages can ever hold it. Taken for memory in
+            // no pool, it was tried again after every change to the pool table, which world
+            // streaming makes all the time. Not a view whose title pages are followed either.
             Decoded::Buffer { addr: 0, .. } => {
+                heap.title_views.borrow_mut().remove(&index);
                 let null = self.null_view()?;
                 self.backend.write_buffer(&heap.heap, index, &null.buf, null.ptr().cast_const(), 0);
                 heap.shows(index, None);

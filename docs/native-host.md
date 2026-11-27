@@ -473,6 +473,33 @@ output changes. Clamp on other integer operations (the signed `_i32` forms, `v_m
 others) and `omod` stay refused. `split_wave_tests::clamped_unsigned_sums_and_differences_saturate`
 (`victory-gpu`) runs both on Metal.
 
+## A half kept by one `v_fma_mix` and replaced by the other
+
+The title's pixel programs often pack two f16 results into a register that still holds an input
+they are done with, a barycentric (`v0`/`v1`) or the first half of an interpolation.
+`v_fma_mixlo_f16 v1, ...` writes the low half and keeps the high half, then
+`v_fma_mixhi_f16 v1, ...` replaces it (or the two come in the other order), and `exp ... compr`
+writes the pair. The kept half has no DXIL form. A `v_fma_mixlo_f16` already recorded such a value
+as unknown, with the low half it made in `low16`, but `v_fma_mixhi_f16` refused it outright.
+
+Now either one records the half it writes (`low16` or `high16`) when the half it keeps is unknown,
+and the other one, finding that entry, keeps the known half and makes the value whole. Entries
+exist only for those `mix` results, so anything else that reads such a value is refused as before.
+So is a kept half that is exported or read: 2 shaders now name the other half's input, the first
+half of an interpolation, where they named the barycentric before, and some of the corpus's
+shaders export `v0` after a `mixlo` alone.
+
+Over a 12,020-shader corpus (Series S boot to the menus, 27 November), 91 shaders now translate
+(90 pixel, 1 vertex), and no other output changes. They were refused as:
+- "barycentrics read directly": 69;
+- "the first half of an interpolation": 18;
+- "a lane mask holding lanes elsewhere read as data: not written by a scalar ALU instruction": 3;
+- "a descriptor built around a table in the code": 1 (vertex).
+
+Each of the 91 has `mix` pairs. `mesh_tests::a_half_kept_by_mixlo_and_replaced_by_mixhi_draws_without_the_barycentric`
+(`victory-gpu`) draws the shape on Metal in both orders: a pixel program that interpolates with
+`v0`/`v1` and then packs (1.0, 0.5) into `v1` draws (1.0, 0.5, 1.0, 1.0).
+
 ## LDS instructions addressed by M0
 
 `ds_append`, `ds_consume`, `ds_read_addtid_b32` and `ds_write_addtid_b32` have no address

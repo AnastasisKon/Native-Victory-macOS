@@ -288,6 +288,9 @@ struct Lower<'a> {
     /// Values (missing in `vals`) whose low 16 bits are known: a 16-bit
     /// result written over a value with no DXIL form keeps its high half.
     low16: Map<Value, V>,
+    /// Values (missing in `vals`) whose high 16 bits are known: a `v_fma_mixhi_f16` written over a
+    /// value with no DXIL form, kept for a `v_fma_mixlo_f16` that replaces the low half.
+    high16: Map<Value, V>,
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
     cur: usize,
@@ -1074,6 +1077,7 @@ impl<'a> Lower<'a> {
             vals: Map::default(),
             floats: Map::default(),
             low16: Map::default(),
+            high16: Map::default(),
             block: vec![None; p.blocks.len()],
             cur: 0,
             bools: Map::default(),
@@ -9122,7 +9126,16 @@ impl<'a> Lower<'a> {
                 let old = match inst.read(Reg::V(reg)) {
                     Some(o) => match self.i32_of(o) {
                         Ok(x) => x,
-                        Err(w) if name == "v_fma_mixlo_f16" && guard.is_none() => {
+                        // The half this writes replaces the unknown one: the other `mix` kept it
+                        // beside a half it made (`low16` or `high16`), and only that half stays.
+                        Err(_) if name == "v_fma_mixlo_f16" && self.high16.contains_key(&o) => {
+                            self.high16[&o]
+                        }
+                        Err(_) if name == "v_fma_mixhi_f16" && self.low16.contains_key(&o) => {
+                            self.low16[&o]
+                        }
+                        // Otherwise the kept half stays unknown, the written one is known.
+                        Err(w) if guard.is_none() => {
                             unknown = Some(w);
                             self.s.m.i32(0)
                         }
@@ -9143,7 +9156,11 @@ impl<'a> Lower<'a> {
                 self.write(inst, Reg::V(reg), x, guard);
                 if let (Some(w), Some(new)) = (unknown, inst.write(Reg::V(reg))) {
                     self.vals.insert(new, Val::Missing(w));
-                    self.low16.insert(new, x);
+                    if name == "v_fma_mixlo_f16" {
+                        self.low16.insert(new, x);
+                    } else {
+                        self.high16.insert(new, x);
+                    }
                 }
                 Ok(())
             }

@@ -1087,6 +1087,22 @@ A render target view whose host texture cannot be made keeps its attachment slot
 
 A render target view's format says how its writes are stored, so a view that names the other format of its texture's sRGB pair (R8G8B8A8 or B8G8R8A8, UNORM against UNORM_SRGB) is drawn and cleared through a host view of the texture in that format (`Title::target_of`). The title draws its boot movie through a plain view (28) of an sRGB texture (29): drawn into the texture itself, the picture was encoded a second time and shown too bright. A described single-sampled 1D or 2D view selects one mip and one array slice. Both the draw binding and the clear use a cached Metal view narrowed to that subresource, so the render pass uses the selected mip's size and distinct attachments do not merge into one pass. Invalid ranges, nonzero planes, and unsupported explicit layered 1D/2D or multisampled views are refused. A null description or a 3D view based at mip 0 and W slice 0 keeps the existing base attachment. Rectangles in a clear remain unsupported.
 
+### Scaled byte vertex fetches
+
+The shared shader translator supports GFX10 `8`, `8_8`, and `8_8_8_8` USCALED/SSCALED
+vertex fetches, including partial channel loads. The existing unsigned/signed integer
+stage-in formats supply zero/sign-extended values, which the shader converts to float
+before rectangle reconstruction. Scaling here is numeric conversion, not normalization:
+unsigned 255 becomes 255.0 and signed byte 0x80 becomes -128.0. The GFX10 encodings were
+checked with LLVM's `gfx1030` assembler; the conversion also follows the existing
+`Numeric::Uscaled`/`Sscaled` buffer decoding in `emit/lower.rs`.
+
+Synthetic tests cover translation in wave32/wave64 and rectangle modes, all 256 byte
+values in every loaded channel through Metal readback, preserved registers after partial
+loads, and reconstructed rectangles compared with explicit floating-point quads. 16-bit
+and packed scaled formats remain unsupported by vertex fetches. No game shaders were
+used, so this does not establish which of issue #4's reported title shaders now translate.
+
 ## Whole-wave sections the simulation does not follow
 
 The section emitter can reproduce register results. If it encounters a store, atomic, export,

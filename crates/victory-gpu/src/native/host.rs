@@ -667,6 +667,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
             strides.write_at(index, &[self.stride_word(view.as_ref())]);
         }
         let Some(view) = view else {
+            // Emptied (by the title's stores): not mirrored any more, so a submission does not
+            // look at it again until the title writes a record there.
+            heap.mirrored.borrow_mut().remove(&index);
             return Ok(false);
         };
         let resources = self.resources.borrow();
@@ -857,8 +860,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     record_at(handle)
                 };
                 checked += 1;
-                if record == [0; 12]
-                    || h.mirrored.borrow().get(&index) == Some(&record)
+                let seen = h.mirrored.borrow().get(&index).copied();
+                // An empty record is mirrored only if a view was mirrored there before: the title
+                // zeroed it with stores, and its view-stride dword must go to 0.
+                if seen == Some(record)
+                    || (record == [0; 12] && seen.is_none())
                     || h.pending_mirror.borrow().get(&index) == Some(&(record, pool_gen, res_gen))
                 {
                     continue;
@@ -1056,8 +1062,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// One dword for every index a shader can compute (`HEAP_VIEWS`): the buffer view's element
     /// size at the title's entries, 0 elsewhere (the shader then reads the null buffer view).
     /// Made at first use from the heap as the title's memory has it now and kept current by
-    /// [`Self::mirror`]. shortcut: an entry the title copied as bytes outside a bound table
-    /// keeps its old dword until it is mirrored.
+    /// [`Self::mirror`] (also for a bound table's record the title zeroed with stores,
+    /// [`Self::remirror_tables`]). shortcut: an entry the title copied or zeroed as bytes outside
+    /// a bound table keeps its old dword until it is mirrored.
     fn view_strides(&self, heap: &NativeHeap<B>) -> Result<Rc<Pages<B>>, String> {
         if let Some(made) = &*heap.strides.borrow() {
             return Ok(made.clone());

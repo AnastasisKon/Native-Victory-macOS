@@ -401,13 +401,11 @@ fn a_compute_shader_stores_through_a_buffer_view_it_takes_from_the_heap() {
     assert_eq!((t.host.unset_roots(), t.host.unmapped(), t.host.failed()), (0, 0, 0));
 }
 
-/// #264 review: the title zeroes a heap record with plain stores (no device call). The host does
-/// not see it: the per-submission table check skips empty records, so the dispatch still finds
-/// the old stride and the old buffer view and stores through it. Only a mirror of that record
-/// (a device write there, or the host mirroring it for another reason) brings the stride to 0,
-/// and then the shader reads the null view.
+/// #264 review: the title zeroes a heap record with plain stores (no device call). The record is
+/// in a bound table and a view was mirrored there, so the next submission mirrors it: its
+/// view-stride dword goes to 0 and the shader reads the null view, not the old buffer.
 #[test]
-fn a_heap_record_the_title_zeroes_with_plain_stores_keeps_its_stride_until_mirrored() {
+fn a_heap_record_the_title_zeroes_with_plain_stores_reads_the_null_view_at_the_next_dispatch() {
     let mut uav = [0u8; 32];
     uav[0] = 0x41;
     uav[4..6].copy_from_slice(&[3, 3]);
@@ -444,11 +442,13 @@ fn a_heap_record_the_title_zeroes_with_plain_stores_keeps_its_stride_until_mirro
     // SAFETY: entry 2's 32 bytes inside `heap._records`, which the heap's records are.
     unsafe { std::ptr::write_bytes(slot as *mut u8, 0, 32) };
     assert!(crate::descriptor::view(slot).is_none(), "an empty record");
-    // Not seen: the stride and the view stay, and the stores land through the old view.
-    assert_eq!(run(&t), stored, "stale stride and view");
-    // Mirrored again: the stride is 0 and the shader reads the null view.
-    assert!(!t.host.mirror(slot).unwrap());
-    assert_eq!(run(&t), [canary; 3], "after a mirror of the zeroed record");
+    // Seen at the dispatch: the stride is 0 and the stores go to the null view.
+    assert_eq!(run(&t), [canary; 3], "the zeroed record's old view");
+    assert!(!heap.heap.mirrored.borrow().contains_key(&2), "nothing mirrored there any more");
+    assert_eq!(run(&t), [canary; 3], "a second dispatch");
+    // A view written there again with plain stores is mirrored again.
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
+    assert_eq!(run(&t), stored, "a view written there again");
     assert_eq!((t.host.unset_roots(), t.host.unmapped(), t.host.failed()), (0, 0, 0));
 }
 

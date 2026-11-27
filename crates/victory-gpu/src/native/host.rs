@@ -1591,22 +1591,22 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         let s = format!("{slot}.{k}=placed:{}", d(address as usize, placed_info_of(address, &res)));
                         if u { writes.push(s) } else { reads.push(s) }
                     }
-                    // A constant buffer view: its address, size and first four dwords now.
+                    // A constant buffer view: its address, size and first dwords now (up to 512 bytes).
                     Some(View::Constant(a, size)) => {
-                        let mut w = [0u8; 16];
+                        let mut w = vec![0u8; (size as usize).clamp(4, 512) & !3];
                         let ok = a != 0 && super::safe_read(a as *const u8, &mut w);
                         let words: Vec<String> = w.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect();
                         reads.push(format!("{slot}.{k}=cbv:{a:#x}+{size}:{}", if ok { words.join(",") } else { "unreadable".into() }));
                     }
                     Some(v @ View::Placed(u, res, _)) => {
-                        // Dimension 1 is a buffer, which the host reads as memory: its range and first dwords.
+                        // Dimension 1 is a buffer, which the host reads as memory: its range and first dwords (up to 512 bytes).
                         let s = match res[0] {
                             1 => match super::descriptors::decode(&v, &self.resources.borrow()) {
                                 Some(super::descriptors::Decoded::Buffer { addr, size }) => {
-                                    let mut w = [0u8; 16];
+                                    let mut w = vec![0u8; (size as usize).clamp(4, 512) & !3];
                                     let ok = addr != 0 && super::safe_read(addr as *const u8, &mut w);
                                     let words: Vec<String> = w.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect();
-                                    format!("{slot}.{k}=placed:buf:{addr:#x}+{size}:{}", if ok { words.join(",") } else { "unreadable".into() })
+                                    format!("{slot}.{k}=placed:buf:{addr:#x}+{size}:desc{:?}:{}", if let View::Placed(_, _, d) = &v { &d[..10] } else { &[][..] }, if ok { words.join(",") } else { "unreadable".into() })
                                 }
                                 _ => format!("{slot}.{k}=placed:buf"),
                             },

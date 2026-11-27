@@ -35,8 +35,17 @@ run_gate() {
 
 echo "== native VIctory verification gate ($GATE) =="
 
+# The HLE suite builds for x86_64-apple-darwin on an Apple Silicon Mac (the
+# tests run x86_64 binaries under Rosetta); on any other host the hostless
+# build (#316) lets it run for the host target.
+if [ "$(uname)" = "Darwin" ]; then
+    HLE_TARGET="--target x86_64-apple-darwin"
+else
+    HLE_TARGET=""
+fi
+
 run_gate "suite-hle" sh -c \
-    "$RUNNER cargo test --target x86_64-apple-darwin -p victory-hle -p victory-loader -p victory"
+    "$RUNNER cargo test $HLE_TARGET -p victory-hle -p victory-loader -p victory"
 
 run_gate "suite-shader" sh -c \
     "$RUNNER cargo test -p victory-shader -p victory-hle"

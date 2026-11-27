@@ -132,6 +132,8 @@ pub(crate) struct Section {
     /// The first step the simulation does not model, if any: why a value
     /// the section leaves may have no shape.
     pub why: Option<&'static str>,
+    /// What each lane of each VGPR value it writes holds.
+    pub lanes: HashMap<Value, Vec<Sym>>,
 }
 
 /// A refusal of a value a section leaves: the first step not modelled.
@@ -165,6 +167,18 @@ pub(super) fn register_only(inst: &Inst) -> bool {
     }
 }
 
+/// A scalar ALU step inside a section that only writes SGPRs (or SCC) and does
+/// not touch EXEC: it runs once for the wave whatever the lanes, so it is
+/// lowered as anywhere else. (`s_setreg` writes no register: still refused.)
+pub(super) fn scalar_alone(inst: &Inst) -> bool {
+    matches!(inst.fields, Fields::Sop { .. })
+        && !register_only(inst)
+        && !inst.writes.is_empty()
+        && [EXEC, EXEC + 1]
+            .iter()
+            .all(|&r| inst.read(Reg::S(r)).is_none() && inst.write(Reg::S(r)).is_none())
+}
+
 /// Every whole-wave section of `block`, by start index.
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
@@ -172,8 +186,9 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let mut out = HashMap::new();
     let mut from = 0;
     while let Some((start, end, saved)) = next_section(insts, from) {
-        let (shapes, why) = simulate(&insts[start + 1..end], wave, saved);
-        out.insert(start, Section { end, shapes, why });
+        let (lanes, uni, why) = simulate(&insts[start + 1..end], wave, saved);
+        let shapes = shapes(&lanes, uni, wave);
+        out.insert(start, Section { end, shapes, why, lanes });
         from = end + 1;
     }
     out
@@ -363,11 +378,14 @@ std::thread_local! {
     pub(super) static SIMULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Each VGPR value's lanes, each SGPR value, and the first step not modelled.
+type Simulated = (HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>, Option<&'static str>);
+
 fn simulate(
     insts: &[Inst],
     wave: u32,
     saved: Value,
-) -> (HashMap<Value, Shape>, Option<&'static str>) {
+) -> Simulated {
     #[cfg(test)]
     SIMULATIONS.set(SIMULATIONS.get() + 1);
     let mut why = None;
@@ -391,7 +409,7 @@ fn simulate(
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return (shapes(vec, uni, wave), why.or(Some(EXEC_WRITE)));
+                return (vec, uni, why.or(Some(EXEC_WRITE)));
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -406,7 +424,7 @@ fn simulate(
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return (shapes(vec, uni, wave), why.or(Some(EXEC_WRITE)));
+                return (vec, uni, why.or(Some(EXEC_WRITE)));
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -674,7 +692,7 @@ fn simulate(
             .collect();
         vec.insert(dst, merged);
     }
-    (shapes(vec, uni, wave), why)
+    (vec, uni, why)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -700,7 +718,7 @@ fn constant(inst: &Inst) -> Option<u64> {
 
 /// The shape of each value, where every lane agrees on one.
 fn shapes(
-    vec: HashMap<Value, Vec<Sym>>,
+    vec: &HashMap<Value, Vec<Sym>>,
     uni: HashMap<Value, Sym>,
     wave: u32,
 ) -> HashMap<Value, Shape> {
@@ -715,15 +733,15 @@ fn shapes(
             out.insert(v, sh);
         }
     }
-    for (v, lanes) in vec {
-        if let Some(sh) = per_lane(&lanes, all) {
+    for (&v, lanes) in vec {
+        if let Some(sh) = per_lane(lanes, all) {
             out.insert(v, sh);
         }
     }
     out
 }
 
-fn uniform_shape(s: Sym, all: u64) -> Option<Shape> {
+pub(crate) fn uniform_shape(s: Sym, all: u64) -> Option<Shape> {
     match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Uni(x) => Some(Shape::Value(x)),

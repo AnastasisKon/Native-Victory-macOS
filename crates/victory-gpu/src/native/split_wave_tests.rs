@@ -1422,3 +1422,55 @@ fn a_loop_register_that_is_exec_on_every_edge_counts_the_lanes_still_looping() {
     };
     assert_eq!(got, (0..64).map(lane).collect::<Vec<_>>());
 }
+
+/// A wave maximum the compiler finishes only in the upper half (lanes 32..63 take lane 0's half
+/// maximum), read at lane 63 by a later whole-wave section that shifts it with a scalar step
+/// inside the section, and again after it. Lanes 0..39 are on: every read is 39, the shift 19.
+fn max_read_at_lane(lane_after: u32) -> Vec<u32> {
+    vec![
+        0x7D88_00A8, // v_cmp_gt_u32_e32 vcc, 40, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0001, 0x0022_0080, // v_cndmask_b32_e64 v1, 0, v0, s[8:9]
+        0x2802_02FA, 0xFF04_B101, // v_max_u32_dpp v1, v1, v1 quad_perm:[1,0,3,2] fi:1
+        0x2802_02FA, 0xFF04_4E01, // v_max_u32_dpp v1, v1, v1 quad_perm:[2,3,0,1] fi:1
+        0x2802_02FA, 0xFF05_4101, // v_max_u32_dpp v1, v1, v1 row_half_mirror fi:1
+        0x2802_02FA, 0xFF05_4001, // v_max_u32_dpp v1, v1, v1 row_mirror fi:1
+        0xD778_0002, 0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0x2802_0501, // v_max_u32_e32 v1, v1, v2
+        0xD760_000A, 0x0201_0101, // v_readlane_b32 s10, v1, 0
+        0x2802_020A, // v_max_u32_e32 v1, s10, v1
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD760_000E, 0x0201_7F01, // v_readlane_b32 s14, v1, 63
+        0x900F_810E, // s_lshr_b32 s15, s14, 1
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xD760_0010, 0x0200_0101 | (128 + lane_after) << 9, // v_readlane_b32 s16, v1, lane_after
+        0x8F10_8810, // s_lshl_b32 s16, s16, 8
+        0x880F_100F, // s_or_b32 s15, s15, s16
+        0x7E06_020F, // v_mov_b32_e32 v3, s15
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        0x0002_0301, // global_store_dword v1, v3, s[2:3]
+        S_ENDPGM,
+    ]
+}
+
+#[test]
+fn a_wave_maximum_read_at_its_last_lane_after_its_section_is_the_maximum() {
+    let w = max_read_at_lane(63);
+    assert_eq!(refusal(&w), None);
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..40], [19 | 39 << 8; 40]);
+    assert_eq!(got[40..64], [CANARY; 24]);
+}
+
+/// Lane 0 holds only the lower half's maximum: no wave operation gives it, so it stays refused.
+#[test]
+fn a_lane_holding_half_a_wave_maximum_is_refused() {
+    let why = refusal(&max_read_at_lane(0));
+    assert!(why.as_deref().is_some_and(|w| w.contains("no reduction or prefix")), "{why:?}");
+}

@@ -21,7 +21,7 @@ Two problems stop it, in this order:
    - `VICTORY_TRACE_OWNERS=1` names who owns the memory, and `VICTORY_DUMP_REFUSED=<dir>` dumps the refused shaders.
    - **Ruled out:** linear root views (those shaders go through the page table), pool pages owned twice (fixed by #108; a pool audit finds 0 differences), and GPU command buffers that fail (their signals are now paid on the CPU).
 
-**Start here:** `crates/victory-gpu/src/native/shaders.rs`, `crates/victory-gpu/src/pipeline.rs`, `crates/victory-metal/src/gfx.rs`, and the run-game skill. `tools/macos/run-summary.sh <log>` shows how a run ended.
+**Start here:** `crates/victory-gpu/src/native/shaders.rs`, `crates/victory-gpu/src/pipeline.rs`, `crates/victory-metal/src/gfx.rs`, and the run-game skill. `tools/macos/run-summary.sh <log>` shows how a run ended. `tools/macos/tester-report.sh` turns a log into a scrubbed attachment and a tester-report body.
 
 ## 2. Frame rate and memory in the world
 

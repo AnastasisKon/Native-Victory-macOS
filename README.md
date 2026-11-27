@@ -115,7 +115,7 @@ Point it at the folder that holds `game_scarlett_master.exe`. A window opens; af
 
 Add `--headless` to run without a window, or `--seconds 60` to stop after a minute.
 
-**3. Tell us what happened.** Open a [Tester report](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/new?template=tester-report.yml) and attach the log. Reports from different Macs (M1 to M5, 8 GB to 128 GB) are very useful.
+**3. Tell us what happened.** Open a [Tester report](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/new?template=tester-report.yml) and attach the log. `tools/macos/tester-report.sh` does the work for you: it writes a copy of the newest log with your home folder, user name and Mac's name replaced, gzips it into `~/victory-reports/`, and prints the report text with your Mac, commit and a run summary filled in. It never uploads anything; you paste the text and attach the `.gz` file yourself. Reports from different Macs (M1 to M5, 8 GB to 128 GB) are very useful.
 
 ## Help wanted
 

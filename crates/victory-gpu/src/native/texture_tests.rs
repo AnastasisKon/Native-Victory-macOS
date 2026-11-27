@@ -335,17 +335,16 @@ fn hot_textures_cool_by_submissions_even_when_probe_round_is_capped() {
             let jobs = t.sync_jobs_within(Some(std::time::Duration::ZERO));
             t.sync(jobs);
         }
-        // One more budget-capped submission sweeps every expired texture without spending probes.
-        let jobs = t.sync_jobs_within(Some(std::time::Duration::ZERO));
-        t.sync(jobs);
+        // One more submission sweeps every expired texture. Without a deadline: the shared title
+        // can hold other tests' hot textures that take a capped round's probes before ours.
+        t.sync_dirty_without_probe_deadline();
 
         let still_hot = keys[..N - 1].iter().filter(|&&k| t.hot_keys.contains(&k)).count();
         assert_eq!(still_hot, 0, "all unchanged textures cooled after HOT submissions");
         assert!(t.hot_keys.contains(&refreshed), "texture written inside the window stays hot");
 
         pool.write((N - 1) * STRIDE, &vec![0xCCu8; size]);
-        let jobs = t.sync_jobs_within(Some(std::time::Duration::ZERO));
-        t.sync(jobs);
+        t.sync_dirty_without_probe_deadline();
         assert_eq!(t.uploads_of(refreshed), 4, "still-hot texture is probed on the next submission");
     });
 }

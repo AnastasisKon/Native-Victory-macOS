@@ -197,6 +197,16 @@ pub enum Compare {
     Always,
 }
 
+/// An allocation a heap keeps resident ([`ResourceBackend::heap_allocations`]): its identity (for
+/// counting it once over several heaps), bytes, latest use of an entry naming it, and kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapAllocation {
+    pub id: usize,
+    pub bytes: u64,
+    pub latest: u32,
+    pub texture: bool,
+}
+
 /// Descriptor heaps, textures and samplers. Heap entries are the converter's 24-byte
 /// `IRDescriptorTableEntry`; a root descriptor table is the address of its first entry
 /// (`heap_address`), pushed into `RootArgs` like a root view. Resources a heap entry names are kept
@@ -224,6 +234,12 @@ pub trait ResourceBackend: ComputeBackend {
     /// Entry `index` names nothing any more: it reads as one never written, and what it kept
     /// alive and resident is let go.
     fn clear_entry(&self, heap: &Self::Heap, index: usize);
+    /// Diagnostics: the distinct allocations `heap` keeps resident, each with its bytes, the latest
+    /// use of the entries naming it (`last_used[index]`, a frame number; 0: never) and whether it
+    /// is a texture. `None` where the backend keeps nothing resident for its heaps.
+    fn heap_allocations(&self, _heap: &Self::Heap, _last_used: &[u32]) -> Option<Vec<HeapAllocation>> {
+        None
+    }
 
     fn create_texture(&self, desc: &TextureDesc) -> Result<Self::Texture, String>;
     fn create_texture_view(

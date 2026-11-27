@@ -455,6 +455,94 @@ pub(crate) fn dropped_op(what: &str, dst: This, src: This) {
     }
 }
 
+/// `VICTORY_TRACE_RECORD_WRITERS`: one compute program's dispatches since the last present, run
+/// or dropped: the buffers its tables hold for unordered access (title memory start and size),
+/// and the textures they hold as shader resources and for unordered access.
+#[derive(Default)]
+struct RecordDispatches {
+    buffers: std::collections::BTreeSet<(u64, u64)>,
+    reads: std::collections::BTreeSet<usize>,
+    writes: std::collections::BTreeSet<usize>,
+}
+
+/// `VICTORY_TRACE_RECORD_WRITERS`: the compute dispatches since the last present by program and
+/// outcome, and each indirect mesh execution's first record address with its records and how
+/// many had a group count of 0 in title memory as the execution was recorded.
+#[derive(Default)]
+struct RecordTrace {
+    dispatches: std::collections::BTreeMap<String, RecordDispatches>,
+    executions: std::collections::BTreeMap<u64, [u64; 2]>,
+}
+
+static RECORD_TRACE: Mutex<Option<RecordTrace>> = Mutex::new(None);
+
+fn tracing_record_writers() -> bool {
+    env_set!("VICTORY_TRACE_RECORD_WRITERS")
+}
+
+/// The records and zero records of the executions whose first record is inside one of `buffers`.
+fn records_in(buffers: &std::collections::BTreeSet<(u64, u64)>, executions: &std::collections::BTreeMap<u64, [u64; 2]>) -> [u64; 2] {
+    executions
+        .iter()
+        .filter(|(at, _)| buffers.iter().any(|&(start, size)| (start..start.saturating_add(size)).contains(at)))
+        .fold([0; 2], |a, (_, n)| [a[0] + n[0], a[1] + n[1]])
+}
+
+#[cfg(test)]
+#[test]
+fn records_are_counted_for_the_buffers_that_hold_their_first_record() {
+    let executions = [(0x1000, [4, 4]), (0x1ff4, [2, 1]), (0x2000, [8, 0])].into_iter().collect();
+    assert_eq!(records_in(&[(0x1000, 0x1000)].into_iter().collect(), &executions), [6, 5]);
+    assert_eq!(records_in(&[(0x1000, 0x1000), (0x1800, 0x1000)].into_iter().collect(), &executions), [14, 5]);
+    assert_eq!(records_in(&[(0x3000, 0x10), (u64::MAX, 2)].into_iter().collect(), &executions), [0, 0]);
+}
+
+fn trace_record_dispatch(t: &MetalTitle, l: &MetalList, outcome: &str) {
+    if !tracing_record_writers() {
+        return;
+    }
+    let (buffers, reads, writes) = t.host.table_views(l.list.compute_args());
+    let mut trace = RECORD_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    let d = trace.get_or_insert_default().dispatches.entry(format!("{:?} {outcome}", stage_hashes(l.pipeline))).or_default();
+    d.buffers.extend(buffers);
+    d.reads.extend(reads);
+    d.writes.extend(writes);
+}
+
+/// `VICTORY_TRACE_RECORD_WRITERS`, at each present: the frame's indirect mesh records and how
+/// many were 0 as recorded (the GPU may still write them: a culling pass that ran fills them
+/// later, one that was dropped never does); each compute program whose tables hold a record
+/// buffer for unordered access, with the records in those buffers and the textures it reads;
+/// and for each such texture, the compute programs that hold it for unordered access.
+#[inline(never)]
+fn trace_record_writers() {
+    let Some(trace) = RECORD_TRACE.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let total = trace.executions.values().fold([0u64; 2], |a, n| [a[0] + n[0], a[1] + n[1]]);
+    if total[0] == 0 {
+        return;
+    }
+    let texture = |r: usize| {
+        let i = crate::resource::texture_info(r as This);
+        let (f, w, h) = i.map_or((0, 0, 0), |i| (i.format, i.width, i.height));
+        format!("{r:#x} fmt {f} {w}x{h}")
+    };
+    tracing::info!(records = total[0], zero = total[1], "mesh records");
+    let mut read = std::collections::BTreeSet::new();
+    for (name, d) in &trace.dispatches {
+        let n = records_in(&d.buffers, &trace.executions);
+        if n[0] == 0 {
+            continue;
+        }
+        read.extend(&d.reads);
+        let reads: Vec<String> = d.reads.iter().map(|&r| texture(r)).collect();
+        tracing::info!(records = n[0], zero = n[1], holder = name, ?reads, "mesh record buffer holder");
+    }
+    for r in read {
+        let writers: Vec<&String> = trace.dispatches.iter().filter(|(_, d)| d.writes.contains(&r)).map(|(n, _)| n).collect();
+        tracing::info!(texture = texture(r), ?writers, "texture read by a mesh record buffer holder");
+    }
+}
+
 #[inline(never)]
 fn trace_present(resource: This) {
         let stats = TRACE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -548,6 +636,9 @@ pub(crate) fn present(queue: This, resource: This) {
     });
     if ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    if tracing_record_writers() {
+        trace_record_writers();
     }
     if tracing_targets() {
         trace_present(resource);
@@ -955,6 +1046,12 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let indirect = crate::list::indirect_dropped();
     let (r, heap_cleared) = with_title(|t| (t.host.backend.residency_counts(), t.host.cleared())).unwrap_or_default();
     tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, "native draws so far");
+    if let Some(n) = super::host::heap_set_trace()
+        && let Some([all, idle, never]) = with_title(|t| t.host.heap_set_report(n)).flatten()
+    {
+        let mb = |b: u64| b >> 20;
+        tracing::info!(frame, idle_frames = n, textures = all.0, textures_mb = mb(all.1), buffers = all.2, buffers_mb = mb(all.3), idle_textures = idle.0, idle_textures_mb = mb(idle.1), idle_buffers = idle.2, idle_buffers_mb = mb(idle.3), never_textures = never.0, never_textures_mb = mb(never.1), never_buffers = never.2, never_buffers_mb = mb(never.3), "heap set: allocations (once over all heaps) no bound table named for that many frames (idle), or ever (never)");
+    }
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_SHADER_CACHE").is_some_and(|v| !v.is_empty() && v != "0")) {
         let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
@@ -1094,6 +1191,7 @@ pub(crate) fn install_test_render_pipeline(
 pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
     with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
         Pipe::Compute(pso) => {
+            trace_record_dispatch(t, l, "ran");
             l.list.set_compute_pipeline(&pso);
             if let Err(e) = l.list.dispatch(x, y, z) {
                 tracing::warn!(error = %e, "dispatch");
@@ -1108,6 +1206,7 @@ pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
 /// unordered-access views (what it may have written) for the frame line.
 fn dropped_dispatch(t: &MetalTitle, l: &MetalList, how: &str) {
     dropped("a dispatch without a host compute pipeline");
+    trace_record_dispatch(t, l, "dropped");
     if tracing_targets() {
         let uavs: Vec<String> = t
             .host
@@ -1452,6 +1551,15 @@ pub(crate) fn execute_indirect(
                 if graphics(t, l, true).is_none() {
                     return;
                 }
+                if tracing_record_writers() {
+                    let zero = (0..max)
+                        .filter(|&i| super::textures::read_memory(at(i) as *const u8, 4).iter().all(|&b| b == 0))
+                        .count() as u64;
+                    let mut trace = RECORD_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = trace.get_or_insert_default().executions.entry(at(0)).or_default();
+                    n[0] += u64::from(max);
+                    n[1] += zero;
+                }
                 for i in 0..max {
                     match l.list.dispatch_mesh_indirect(at(i), count.map(|c| (c, i))) {
                         Ok(()) => {
@@ -1468,6 +1576,7 @@ pub(crate) fn execute_indirect(
         Command::Dispatch => {
             with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
                 Pipe::Compute(pso) => {
+                    trace_record_dispatch(t, l, "ran");
                     l.list.set_compute_pipeline(&pso);
                     for i in 0..max {
                         let r = match count {

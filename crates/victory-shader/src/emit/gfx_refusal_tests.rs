@@ -2604,6 +2604,47 @@ fn a_cross_lane_operation_outside_compute_says_which_and_where() {
     }
 }
 
+/// A pixel program reads back an SGPR spilled to lane 3 on two paths into a join. At 57b7ebd
+/// this counted as "a cross-lane operation outside compute: v_readlane_b32 of a constant lane";
+/// since `Lower::spill_slot` (269e7d5) it is a phi of the spilled SGPRs, in a pixel program too.
+#[test]
+fn a_pixel_program_reads_back_an_sgpr_spilled_on_two_paths() {
+    let code = [
+        0xBE94_03F2, // s_mov_b32 s20, 1.0
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0xBF0D_9F08, // s_bitcmp1_b32 s8, 31
+        0xBF85_0003, // s_cbranch_scc1 3
+        0xD761_000E, 0x0001_0614, // v_writelane_b32 v14, s20, 3
+        0xBF82_0002, // s_branch 2
+        0xD761_000E, 0x0001_0615, // v_writelane_b32 v14, s21, 3
+        0xD760_0016, 0x0001_070E, // v_readlane_b32 s22, v14, 3
+        0x7E02_0216, // v_mov_b32 v1, s22
+        0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let l = lower_ps(&code, false, vec![], vec![], 0, 0, vec![], false).expect("lowers");
+    assert!(l.wave_read_lane_calls.is_empty(), "{:?}", l.wave_read_lane_calls);
+}
+
+/// DPP8 in a pixel program stays refused under its own name. No open lowering (#259, #261,
+/// #262) takes it; whether to lower it waits for the op tally of current main on #4.
+#[test]
+fn a_pixel_program_with_dpp8_is_refused_by_name() {
+    let code = [
+        0x7E02_02E9, 0xDE54_C100, // v_mov_b32_dpp8 v1, v0 dpp8:[1,0,3,2,5,4,7,6]
+        0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let err = lower_ps(&code, false, vec![], vec![], 0, 0, vec![], false)
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(
+        err.contains("a cross-lane operation outside compute: DPP8 in a pixel program"),
+        "{err}"
+    );
+}
+
 /// A pixel program reads lane 31 of a whole-wave minimum in a second section: every lane of
 /// the first section's result holds the minimum, so the lane read is the reduction itself, with
 /// no read of a console lane (`WaveReadLaneAt`) in the host's wave. Outside a section too.

@@ -24,6 +24,8 @@ mod mesh_tests;
 mod shader_tests;
 #[path = "split_wave_tests.rs"]
 mod split_wave_tests;
+#[path = "stale_tests.rs"]
+mod stale_tests;
 #[path = "state_tests.rs"]
 mod state_tests;
 #[path = "texture_tests.rs"]

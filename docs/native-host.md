@@ -1502,11 +1502,26 @@ through (16 MiB for 2^20 entries), made only for those heaps. shortcut: an entry
 as bytes outside a bound table keeps its old words until it is mirrored, as for the view-stride
 table. Measured offline (27 November): the 7 compute programs of the boot-dumped corpus that #304
 lets translate but the host refused for view addresses now make their Metal pipelines (not run;
-six walk title memory from a view's address, one reads the heap only). Test:
+six walk title memory from a view's address, one reads the heap only). In the all-shaders boot set
+(4,921 containers) 44 translated programs read the table: 42 compute, 2 pixel, no vertex. Test:
 `heap_tests::a_compute_shader_reads_title_memory_at_a_heap_views_address` (a raw SRV's address read
 from its descriptor, the word there stored to the output; refused before, and with only the
 refusal lifted the converter refused the pipeline: "Resource SRV in space 2 register 1 ... is not
 referenced by the root signature").
+
+A shader can need both per-heap tables: the view-stride table (#264) and the view addresses. The
+argument buffer then holds, in order:
+1. the user-data block;
+2. the root views, the stride table among them (root SRV 255 of the root-view space);
+3. the page table (`t0` of the memory space);
+4. the view addresses (`t1`).
+
+`Binding::layout` gives the converter that order, and `NativeHost::translated_args`,
+`memory_args` and `view_address_args` fill the buffer in that same order. Test:
+`heap_tests::a_compute_shader_reads_both_the_view_strides_and_the_view_addresses`. Its compute
+program stores through a buffer it takes from the heap itself, and loads the word at an SRV's
+title address. Swapping the two memory-space tables, in the layout or in the fill, makes it read
+a decoy view's word instead.
 
 The table gives every field it doesn't hold as 0. The translator refuses a program that can see a
 bit of one of them, rather than let it read 0 (`Lower::view_addresses`, `Lower::seen_bits`).

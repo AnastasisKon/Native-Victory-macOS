@@ -16,6 +16,12 @@ use std::sync::Arc;
 use victory_backend::backend::{Dispatch, Heaps, RootArgs};
 use victory_backend::resources::*;
 
+#[cfg(test)]
+thread_local! {
+    /// Walks of the pool table for a wrap's signature ([`NativeHost::alias_signature`]), for tests.
+    pub(crate) static SIGNATURES: Cell<u64> = const { Cell::new(0) };
+}
+
 /// Buffers over ranges of the title's own addresses, by `(start, end)`: the signature of the
 /// mappings they were made over, when they were last used, and the buffer.
 type TitleAliases<Buf> = RefCell<HashMap<(u64, u64), (u64, u64, Rc<Buf>)>>;
@@ -332,6 +338,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// part of it is not mapped.
     fn alias_signature(&self, addr: u64, len: u64) -> Option<u64> {
         let (base, end) = Self::alias_range(addr, len)?;
+        #[cfg(test)]
+        SIGNATURES.with(|n| n.set(n.get() + 1));
         self.memory.signature(base, end - base)
     }
 
@@ -358,13 +366,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 .collect();
             tracing::info!(looks, generation, ?large, "following the title's pages under heap buffer views");
         }
+        // The title copies one view into many entries (54 of the 174 MiB one in a world run): each
+        // range's walk is made once a look (about 3 ms a look before, the pool table locked).
+        let mut walked: HashMap<(u64, u64), Option<u64>> = HashMap::new();
         for heap in heaps {
             let moved: Vec<_> = heap
                 .title_views
                 .borrow()
                 .iter()
                 .filter_map(|(&index, &(addr, len, was))| {
-                    let now = self.alias_signature(addr, len);
+                    let now = match Self::alias_range(addr, len) {
+                        Some(range) => *walked.entry(range).or_insert_with(|| self.alias_signature(addr, len)),
+                        None => None,
+                    };
                     (now != was).then_some((index, addr, len, was, now))
                 })
                 .collect();

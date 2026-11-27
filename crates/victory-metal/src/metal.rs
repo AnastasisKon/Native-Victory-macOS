@@ -35,6 +35,11 @@ pub struct Metal {
     pub(crate) compiling_render: Compiling<Result<(crate::gfx::RenderState, Option<MTLSize>), String>>,
     /// `VICTORY_TRACE_GPU_FAILS`: label command buffers and encoders, report failures with them.
     pub(crate) trace_fails: bool,
+    /// The most passes of a submission in one command buffer (`VICTORY_PASSES_PER_BUFFER`;
+    /// default 0: no limit).
+    pub(crate) passes_per_buffer: usize,
+    /// Command buffers `submit_passes` committed.
+    pub(crate) committed: std::cell::Cell<u64>,
     /// Pipeline state pointer to name, kept only when tracing.
     pub(crate) trace_enc: std::cell::RefCell<Vec<String>>,
     pub(crate) pipe_names: std::cell::RefCell<std::collections::HashMap<usize, String>>,
@@ -48,6 +53,12 @@ pub struct Metal {
         Vec<(crate::resources::SamplerDesc, Retained<ProtocolObject<dyn MTLSamplerState>>)>,
     >,
 }
+
+/// The most passes of a submission in one command buffer unless `VICTORY_PASSES_PER_BUFFER` says
+/// otherwise: no limit (0), the whole submission in one, until other Macs than the one it was
+/// measured on (an M4 Pro) have run the split. 1 is the safest value there; see
+/// docs/native-host.md.
+const PASSES_PER_BUFFER: usize = 0;
 
 type ComputeState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 /// Pipelines a `pipeline-compile` thread is making or has made, by what they are made of.
@@ -230,6 +241,11 @@ impl Metal {
                 since_start();
                 std::env::var_os("VICTORY_TRACE_GPU_FAILS").is_some()
             },
+            passes_per_buffer: std::env::var("VICTORY_PASSES_PER_BUFFER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(PASSES_PER_BUFFER),
+            committed: Default::default(),
             pipe_names: Default::default(),
             trace_enc: Default::default(),
             gate: Default::default(),
@@ -249,6 +265,17 @@ impl Metal {
     /// The pipeline archive, if the cache is on.
     pub(crate) fn archive(&self) -> Option<&std::sync::Arc<crate::archive::Archive>> {
         self.archive.get_or_init(|| crate::archive::Archive::open(&self.dev)).as_ref()
+    }
+
+    /// At most `n` passes of a submission in one command buffer (0: no limit).
+    pub fn with_passes_per_buffer(mut self, n: usize) -> Metal {
+        self.passes_per_buffer = n;
+        self
+    }
+
+    /// Command buffers committed for submissions so far.
+    pub fn command_buffers(&self) -> u64 {
+        self.committed.get()
     }
 
     /// All residency through `MTLResidencySet` (`true`: the heaps' sets and the pool's on the

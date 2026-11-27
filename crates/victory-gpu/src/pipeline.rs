@@ -140,7 +140,12 @@ fn prewarm(shader: &Arc<Shader>) {
             return false;
         }
         let cores = std::thread::available_parallelism().map_or(8, usize::from);
-        let n = crate::prewarm::pool_size(cores);
+        // `VICTORY_PREWARM_WORKERS=<n>`: the pool's size instead of all cores but two.
+        let n = std::env::var("VICTORY_PREWARM_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| crate::prewarm::pool_size(cores));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("shader-prewarm-{i}")).spawn(|| {
                 crate::prewarm::lower_priority();

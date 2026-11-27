@@ -68,6 +68,12 @@ pub enum Format {
     Abgr4Unorm,
     /// BC6H of signed half floats (DXGI `BC6H_SF16`).
     Bc6hSigned,
+    Rgba16Uint,
+    Rgba8Snorm,
+    Rg16Snorm,
+    R16Snorm,
+    R8Snorm,
+    Rgb10a2Uint,
 }
 
 impl Format {
@@ -77,13 +83,13 @@ impl Format {
         match self {
             Rgba8Unorm | Rgba8UnormSrgb | Bgra8Unorm | Bgra8UnormSrgb | R32Float | D32Float => (1, 4),
             Rgb10a2Unorm | Rg11b10Float | Rgba8Uint | Rg16Float | Rg16Unorm | R32Uint | Rgb9e5Float => (1, 4),
-            Rg16Uint => (1, 4),
+            Rg16Uint | Rgba8Snorm | Rg16Snorm | Rgb10a2Uint => (1, 4),
             D32FloatS8 => (1, 8),
-            Rgba16Float | Rg32Float | Rgba16Unorm | Rgba16Snorm | Rg32Uint => (1, 8),
+            Rgba16Float | Rg32Float | Rgba16Unorm | Rgba16Snorm | Rg32Uint | Rgba16Uint => (1, 8),
             Bc1 | Bc1Srgb | Bc4 => (4, 8),
             Bc2 | Bc3 | Bc3Srgb | Bc5 | Bc6h | Bc6hSigned | Bc7 | Bc7Srgb => (4, 16),
-            R8Unorm | A8Unorm | R8Uint => (1, 1),
-            R16Unorm | R16Float | R16Uint | D16Unorm | Rg8Unorm | Rg8Uint | Rg8Snorm | Bgr5a1Unorm | Abgr4Unorm => (1, 2),
+            R8Unorm | A8Unorm | R8Uint | R8Snorm => (1, 1),
+            R16Unorm | R16Float | R16Uint | R16Snorm | D16Unorm | Rg8Unorm | Rg8Uint | Rg8Snorm | Bgr5a1Unorm | Abgr4Unorm => (1, 2),
             Rgba32Float | Rgba32Uint => (1, 16),
         }
     }
@@ -91,7 +97,19 @@ impl Format {
     /// An integer format: its render targets cannot blend.
     pub fn is_integer(self) -> bool {
         use Format::*;
-        matches!(self, Rgba8Uint | R32Uint | R8Uint | Rgba32Uint | Rg32Uint | Rg16Uint | Rg8Uint | R16Uint)
+        matches!(
+            self,
+            Rgba8Uint
+                | R32Uint
+                | R8Uint
+                | Rgba32Uint
+                | Rg32Uint
+                | Rg16Uint
+                | Rg8Uint
+                | R16Uint
+                | Rgba16Uint
+                | Rgb10a2Uint
+        )
     }
 
     /// A depth or depth-stencil format.
@@ -228,6 +246,23 @@ pub trait ResourceBackend: ComputeBackend {
         title: *const u8,
         size: u32,
     );
+    /// A buffer SRV or UAV that also carries a typed `texture_buffer` view (`format`) when the
+    /// backend supports one, so both raw/structured accesses (`gpuVA`) and typed `bufferLoad` /
+    /// `bufferStore` (`textureViewID`) work through the same heap entry.
+    #[allow(clippy::too_many_arguments)]
+    fn write_typed_buffer(
+        &self,
+        heap: &Self::Heap,
+        index: usize,
+        buffer: &Self::Buffer,
+        title: *const u8,
+        size: u32,
+        format: Format,
+        writable: bool,
+    ) {
+        let _ = (format, writable);
+        self.write_buffer(heap, index, buffer, title, size);
+    }
     /// A texture SRV or UAV.
     fn write_texture(&self, heap: &Self::Heap, index: usize, tex: &Self::Texture, min_lod: f32);
     fn write_sampler(&self, heap: &Self::Heap, index: usize, s: &Self::Sampler, lod_bias: f32);

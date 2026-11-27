@@ -6,7 +6,7 @@
 //! per pool (see [`super::memory`]); nothing is copied to or from it.
 
 use super::addr::{self, Mapping, Pages, Pairs};
-use super::descriptors::{Decoded, Res, decode};
+use super::descriptors::{Decoded, Res, decode, typed_buffer};
 use super::list::{Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
 use super::memory::PoolTable;
 use std::cell::{Cell, RefCell};
@@ -50,6 +50,8 @@ pub struct NativeHost<B: GraphicsBackend> {
     failed: std::cell::Cell<u64>,
     /// Passes handed to the backend.
     passes: std::cell::Cell<u64>,
+    /// Buffer heap entries promoted lazily to `texture_buffer` views so far.
+    typed_views: std::cell::Cell<u64>,
     /// With texture copy-back on: the keys dispatches had bound for unordered access, not yet
     /// taken by [`Self::take_written`].
     written: RefCell<Option<std::collections::HashSet<usize>>>,
@@ -161,6 +163,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             cleared: std::cell::Cell::new(0),
             failed: std::cell::Cell::new(0),
             passes: std::cell::Cell::new(0),
+            typed_views: std::cell::Cell::new(0),
             written: Default::default(),
         }
     }
@@ -189,6 +192,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// Passes handed to the backend so far (compute, render and blit; a clear is a render pass).
     pub fn passes(&self) -> u64 {
         self.passes.get()
+    }
+
+    /// Buffer heap entries promoted lazily to `texture_buffer` views so far.
+    pub fn typed_views(&self) -> u64 {
+        self.typed_views.get()
     }
 
     /// The table the pool observer keeps current; register it as (or call it from) the observer.
@@ -479,6 +487,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             title_views: Default::default(),
             images: Default::default(),
             used: Default::default(),
+            typed_pending: Default::default(),
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
@@ -569,6 +578,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
         for heap in self.heaps.borrow().iter() {
             for index in heap.take_entries(key) {
+                heap.typed_pending.borrow_mut().set(index, false, false);
                 self.backend.clear_entry(&heap.heap, index);
                 self.cleared.set(self.cleared.get() + 1);
             }
@@ -696,6 +706,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             null.ptr().cast_const(),
                             0,
                         );
+                        heap.typed_pending.borrow_mut().set(index, false, false);
                         // The null view has replaced whatever the cached record used to show.
                         heap.mirrored.borrow_mut().remove(&index);
                         heap.pending_mirror.borrow_mut().insert(
@@ -712,6 +723,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 };
                 self.backend
                     .write_buffer(&heap.heap, index, &buf, ptr, size);
+                let (is_typed, is_explicit) = match typed_buffer(&view, &resources) {
+                    Some((_, _, explicit)) => (true, explicit),
+                    None => (false, false),
+                };
+                heap.typed_pending
+                    .borrow_mut()
+                    .set(index, is_typed, is_explicit);
                 heap.shows(index, None);
             }
             Decoded::Image {
@@ -739,11 +757,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
                 }
+                heap.typed_pending.borrow_mut().set(index, false, false);
                 heap.shows(index, Some(resource));
             }
             Decoded::Sampler { desc, lod_bias } => {
                 let s = self.backend.create_sampler(&desc)?;
                 self.backend.write_sampler(&heap.heap, index, &s, lod_bias);
+                heap.typed_pending.borrow_mut().set(index, false, false);
                 heap.shows(index, None);
             }
         }
@@ -854,6 +874,77 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 }
             }
             super::descriptor_trace::record(h.start, checked, changed);
+        }
+    }
+
+    /// Promotes unmaterialized buffer entries to `texture_buffer` views lazily when the bound
+    /// shader uses DXIL `TypedBuffer` operations: only the bound `Root::Table` spans, plus
+    /// explicit (`stride == 0`) typed buffer views in `heap` when the shader also indexes
+    /// `ResourceDescriptorHeap` directly.
+    fn materialize_typed_buffers(
+        &self,
+        root: &[Option<Root<B>>],
+        binding: Option<&Binding>,
+        heap: Option<&Rc<NativeHeap<B>>>,
+    ) {
+        let any_typed = binding
+            .is_none_or(|b| b.typed_buffers || b.ps.as_ref().is_some_and(|p| p.typed_buffers));
+        if !any_typed {
+            return;
+        }
+        let promote = |h: &NativeHeap<B>, index: usize| {
+            let handle = h.start + index as u64 * Self::step(h.kind);
+            let Some(view) = crate::descriptor::view(handle) else { return };
+            let resources = self.resources.borrow();
+            let (Some(Decoded::Buffer { addr, size }), Some((format, writable, _))) =
+                (decode(&view, &resources), typed_buffer(&view, &resources))
+            else {
+                return;
+            };
+            drop(resources);
+            let resolved = self
+                .resolve(addr, u64::from(size))
+                .ok()
+                .or_else(|| self.title_alias(addr, u64::from(size)).map(|(b, p, _)| (b, p)));
+            if let Some((buf, ptr)) = resolved {
+                self.backend.write_typed_buffer(
+                    &h.heap,
+                    index,
+                    &buf,
+                    ptr,
+                    size,
+                    format,
+                    writable,
+                );
+                self.typed_views.set(self.typed_views.get() + 1);
+            }
+        };
+        let mut indices = Vec::new();
+        for (slot, r) in root.iter().enumerate() {
+            let Some(Root::Table(h, at)) = r else { continue };
+            if h.kind != HeapKind::Resource {
+                continue;
+            }
+            let check = table_check_count(slot, binding, Self::TABLE_CHECK);
+            let end = (*at + check).min(h.count);
+            indices.clear();
+            h.typed_pending.borrow_mut().drain_range(*at, end, &mut indices);
+            for &index in &indices {
+                promote(h, index);
+            }
+        }
+        let heap_typed = binding.is_some_and(|b| {
+            b.heap_typed_buffers || b.ps.as_ref().is_some_and(|p| p.heap_typed_buffers)
+        });
+        if heap_typed
+            && let Some(h) = heap
+            && h.typed_pending.borrow().has_explicit()
+        {
+            indices.clear();
+            h.typed_pending.borrow_mut().drain_explicit(&mut indices);
+            for &index in &indices {
+                promote(h, index);
+            }
         }
     }
 
@@ -1109,6 +1200,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             title_views: Default::default(),
             images: Default::default(),
             used: Default::default(),
+            typed_pending: Default::default(),
         });
         self.contract.borrow_mut().heap = Some(heap.clone());
         Ok(heap)
@@ -1508,6 +1600,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 self.trace_draw(root, pso.binding.as_ref(), true);
                 self.trace_root_span(root, pso.binding.as_ref(), groups);
                 self.remirror_tables(root, pso.binding.as_ref());
+                self.materialize_typed_buffers(root, pso.binding.as_ref(), heaps.0.as_ref());
                 self.note_written(root, pso.binding.as_ref());
                 match &pso.binding {
                 Some(b) => {
@@ -1543,6 +1636,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     self.trace_draw(root, binding.as_deref(), false);
                 }
                 self.remirror_tables(root, binding.as_deref());
+                self.materialize_typed_buffers(root, binding.as_deref(), heaps.0.as_ref());
                 self.trace_root_span(root, binding.as_deref(), &[0; 3]);
                 self.trace_content(root, vertex, call, binding.as_deref(), targets);
                 match binding {

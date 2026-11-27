@@ -1292,7 +1292,7 @@ const DISPATCH_WAVE32: u32 = 0x8000;
 
 /// `VICTORY_TRACE_DISPATCH_FLAGS=1`: the flags of dispatches are logged,
 /// each value once, so one the host does not honour shows.
-fn trace_dispatch_flags() -> bool {
+pub(crate) fn trace_dispatch_flags() -> bool {
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_DISPATCH_FLAGS").is_some())
 }

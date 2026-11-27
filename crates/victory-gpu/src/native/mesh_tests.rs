@@ -165,6 +165,28 @@ fn a_counted_indirect_mesh_dispatch_runs_only_the_records_below_the_count() {
     }
 }
 
+/// A mesh dispatch record that asks for more than 2^22 groups in all (D3D12's most for
+/// `DispatchMesh`) is what a culling pass left unfinished in title memory: it draws nothing
+/// (Metal would run it, for as long as it takes), and one below that still draws.
+#[test]
+fn an_indirect_mesh_dispatch_past_the_most_groups_draws_nothing() {
+    let (ms, ps) = (translate(HwStage::Vs, TRIANGLE), translate(HwStage::Ps, RED));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders);
+    };
+    let pool = super::Pool::new(&t.host, 1);
+    let red = [255, 128, 128, 255];
+    for (record, want) in [([1u32, 1, 1], red), ([256, 256, 65], [0; 4]), ([1, 1_182_027_346, 1_314_076_063], [0; 4]), ([1, 1, 64], red)] {
+        pool.write(0, &record);
+        let (color, mut list) = list_into(&t, &pso, binding.clone());
+        list.dispatch_mesh_indirect(pool.va(0), None).unwrap();
+        super::run(&t.host, &[&list]);
+        assert!(pixels(&t, &color).iter().all(|p| *p == want), "record {record:?}: {:?}", pixels(&t, &color));
+    }
+}
+
 /// 16-bit parameters across guessed stages (`graphics::HALF`): the triangle program exports
 /// param0 as two packed dwords (x: 1.0 high, 0.5 low; y: 0.25 high, 0.75 low), and the pixel
 /// program interpolates each half with `v_interp_p1ll_f16`/`v_interp_p2_f16` (low and `high`)

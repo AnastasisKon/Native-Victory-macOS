@@ -46,6 +46,8 @@ pub struct Metal {
     pub(crate) committed: std::cell::Cell<u64>,
     /// Pipeline state pointer to name, kept only when tracing.
     pub(crate) trace_enc: std::cell::RefCell<Vec<String>>,
+    /// Tracing: the gate buffers of the indirect dispatches encoded since the last commit.
+    pub(crate) trace_args: std::cell::RefCell<Vec<(String, usize, usize)>>,
     pub(crate) pipe_names: std::cell::RefCell<std::collections::HashMap<usize, String>>,
     /// The kernel that gates `ExecuteIndirect` records by a count (`gfx.rs`), made at first use.
     pub(crate) gate:
@@ -297,6 +299,7 @@ impl Metal {
             committed: Default::default(),
             pipe_names: Default::default(),
             trace_enc: Default::default(),
+            trace_args: Default::default(),
             gate: Default::default(),
             samplers: Default::default(),
         })

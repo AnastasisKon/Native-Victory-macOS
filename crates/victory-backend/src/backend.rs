@@ -63,7 +63,8 @@ pub struct Dispatch<'a, B: ComputeBackend + ?Sized> {
     pub groups: [usize; 3],
     pub threads_per_group: [usize; 3],
     /// `ExecuteIndirect`: the group counts are read on the GPU from this title address (three
-    /// words) instead of `groups`.
+    /// words) instead of `groups`. A record that asks for more than 2^22 groups in all
+    /// dispatches nothing.
     pub indirect: Option<(&'a B::Buffer, *const u8)>,
     /// `ExecuteIndirect` with a count buffer: the count's title address and this record's index.
     /// The record runs only if the index is below the count, which the GPU reads when it runs.

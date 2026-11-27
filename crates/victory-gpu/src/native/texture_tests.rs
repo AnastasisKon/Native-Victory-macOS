@@ -1133,6 +1133,49 @@ fn an_indirect_dispatch_mesh_x_draws_the_groups_its_record_holds() {
     }
 }
 
+/// A render target a recorded draw wrote is the GPU's: when the title then changes the memory
+/// under it, the next submission does not upload that memory over what was drawn.
+#[test]
+fn a_drawn_target_is_not_filled_from_title_memory_again() {
+    use super::mesh_tests::{RED, TRIANGLE, translate};
+    use victory_backend::backend::ComputeBackend;
+    use victory_shader::native::HwStage;
+    let Some(pool) = pool(9206, 4) else { return };
+    let (ms, ps) = (translate(HwStage::Vs, TRIANGLE), translate(HwStage::Ps, RED));
+    let state = crate::native::state::Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let pso = match with_title(|t| t.render_pipe(&ms, Some(&ps), &state, "mesh")).unwrap() {
+        crate::native::title::Pipe::Render(pso, _) => pso,
+        _ => panic!("no mesh pipeline"),
+    };
+    let pipe_key = 0xDEAD_BEE9usize;
+    glue::install_test_render_pipeline(pipe_key, pso);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let records = 0x8000;
+    pool.write(records, &[1u32, 1, 1]);
+    let rt = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::SW_64KB_R_X.0, 1);
+    crate::descriptor::create_rtv(std::ptr::null(), rt, std::ptr::null(), handle);
+    let list = crate::list::test_list(false, std::ptr::null());
+    glue::set_pipeline(list, pipe_key as This);
+    slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(list, 1, &handle, 0, std::ptr::null());
+    slot::<extern "system" fn(This, u32, u64, u64, u64)>(list, 0x310)(list, 7, 0, pool.va(records), 0);
+    run_title_list(list);
+    let red = [255u8, 128, 128, 255];
+    let drawn = || read_mip(rt as usize, 0, 16, 16).as_chunks::<4>().0.iter().all(|p| *p == red);
+    assert!(drawn(), "the draw coloured the target");
+    // The title changes the memory under the target, and the scanner reports it at the next
+    // submission.
+    let uploads = with_title(|t| t.uploads_of(rt as usize)).unwrap();
+    with_title(|_| pool.write(0, &[0x55u8; 16 * 16 * 4])).unwrap();
+    run_title_list(crate::list::test_list(false, std::ptr::null()));
+    with_title(|t| {
+        let jobs = t.jobs(vec![rt as usize]);
+        t.sync(jobs);
+    });
+    assert_eq!(with_title(|t| t.uploads_of(rt as usize)).unwrap(), uploads, "not uploaded again");
+    assert!(drawn(), "what was drawn stays");
+}
+
 /// `CopyResource` between textures and `CopyTextureRegion` (subresource-to-subresource and
 /// footprint-to/from-subresource) execute on Metal without dropping to `dropped_op`.
 #[test]

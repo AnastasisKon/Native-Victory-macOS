@@ -61,6 +61,9 @@ pub struct NativeHost<B: GraphicsBackend> {
     /// With texture copy-back on: the keys dispatches had bound for unordered access, not yet
     /// taken by [`Self::take_written`].
     written: RefCell<Option<std::collections::HashSet<usize>>>,
+    /// The same keys always, for the title side to stop filling them from title memory
+    /// ([`Self::take_gpu_written`]).
+    gpu_written: RefCell<std::collections::HashSet<usize>>,
 }
 
 /// Warns that a dropped command was a fill: a bottom-of-pipe value write, which another queue's
@@ -172,6 +175,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             passes: std::cell::Cell::new(0),
             typed_views: std::cell::Cell::new(0),
             written: Default::default(),
+            gpu_written: Default::default(),
         }
     }
 
@@ -835,14 +839,20 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.written.borrow_mut().as_mut().map_or_else(Vec::new, |w| w.drain().collect())
     }
 
-    /// Notes the textures the tables `root` binds hold unordered access views of: what a dispatch
-    /// may write. More than it does write (the shader may not use every entry).
+    /// The textures dispatches prepared since the last call bound for unordered access, copy-back
+    /// or not ([`Self::note_written`]).
+    #[cfg(target_os = "macos")]
+    pub(super) fn take_gpu_written(&self) -> Vec<usize> {
+        self.gpu_written.borrow_mut().drain().collect()
+    }
+
+    /// Notes the textures the tables `root` binds hold unordered access views of: what a prepared
+    /// dispatch may write. More than it does write (the shader may not use every entry).
     ///
     /// shortcut: a shader that indexes the descriptor heap itself, and pixel shader writes, are
     /// not seen; add them when a title texture needs it.
     fn note_written(&self, root: &[Option<Root<B>>], binding: Option<&Binding>) {
-        let mut written = self.written.borrow_mut();
-        let Some(written) = written.as_mut() else { return };
+        let mut written = Vec::new();
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
             if h.kind != HeapKind::Resource {
@@ -851,17 +861,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
             let end = (*at + table_check_count(slot, binding, Self::TABLE_CHECK)).min(h.count);
             for index in *at..end {
                 match crate::descriptor::view(h.start + index as u64 * Self::step(h.kind)) {
-                    Some(crate::descriptor::View::Unordered(r, ..)) => {
-                        written.insert(r);
-                    }
+                    Some(crate::descriptor::View::Unordered(r, ..)) => written.push(r),
                     Some(crate::descriptor::View::Placed(true, res, d)) if res[0] > 1 => {
                         let address = u64::from(d[10]) | u64::from(d[11]) << 32;
-                        written.insert(super::textures::placed_key(address, &res));
+                        written.push(super::textures::placed_key(address, &res));
                     }
                     _ => {}
                 }
             }
         }
+        if let Some(back) = self.written.borrow_mut().as_mut() {
+            back.extend(written.iter().copied());
+        }
+        self.gpu_written.borrow_mut().extend(written);
     }
 
     /// Mirrors again the entries of each table `root` binds whose title record changed since
@@ -1646,7 +1658,6 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 self.trace_root_span(root, pso.binding.as_ref(), groups);
                 self.remirror_tables(root, pso.binding.as_ref());
                 self.materialize_typed_buffers(root, pso.binding.as_ref(), heaps.0.as_ref());
-                self.note_written(root, pso.binding.as_ref());
                 match &pso.binding {
                 Some(b) => {
                     self.translated_args(root, b, heaps.0.as_ref(), *threads, &mut p)?;
@@ -1796,6 +1807,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
             match self.prep(c) {
                 Ok(p) => {
+                    // Only a dispatch that will run writes its views.
+                    if let Cmd::Dispatch { root, pso, .. } = c {
+                        self.note_written(root, pso.binding.as_ref());
+                    }
                     cut.push(dropped.drain(..).any(|d| !same(d, c)));
                     cmds.push(c);
                     preps.push(p);

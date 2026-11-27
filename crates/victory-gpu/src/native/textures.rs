@@ -490,13 +490,13 @@ pub struct Tracked<B: ResourceBackend> {
     /// Render-target views already made, kept so the same attachment keeps its identity.
     #[cfg(target_os = "macos")]
     target_views: Vec<(ViewDesc, Rc<B::Texture>)>,
-    /// A GPU copy wrote it: its host texture holds what title memory does not, and is never
-    /// filled from that memory again.
+    /// The GPU wrote it (a copy, draw, clear or dispatch): its host texture holds what title
+    /// memory does not, and is never filled from that memory again.
     gpu_written: bool,
 }
 
 impl<B: ResourceBackend> Tracked<B> {
-    /// Whether the host texture is no longer filled from title memory: a GPU copy wrote it
+    /// Whether the host texture is no longer filled from title memory: the GPU wrote it
     /// ([`Title::gpu_written`]). One never uploaded and not a render target takes its first upload.
     fn kept_from_memory(&self) -> bool {
         self.gpu_written && (self.uploads > 0 || self.info.render_target())
@@ -925,12 +925,14 @@ impl<B: PresentBackend> Title<B> {
         None
     }
 
-    /// A GPU copy writes title texture `key` (made already): from now on the host texture is the
-    /// GPU's, as a render target's is, and the CPU-side sync no longer fills it from title memory.
+    /// The GPU writes title texture `key` (made already): a copy, draw or clear recorded into it,
+    /// or a prepared dispatch's unordered-access view of it. From now on the host texture is the
+    /// GPU's and the CPU-side sync no longer fills it from title memory (which titles change under
+    /// their render targets: uploaded, that was block noise over what the GPU drew).
     /// A sampled texture not uploaded yet still takes its first upload, at the submission and so
-    /// before the copy runs (a copy of a region keeps the rest).
+    /// before the write runs (a copy of a region keeps the rest).
     /// shortcut: what the title writes into its memory afterwards is not seen; when a title is
-    /// found to refill a copy's destination from the CPU, upload a change again.
+    /// found to refill a GPU-written texture from the CPU, upload a change again.
     pub fn gpu_written(&mut self, key: usize) {
         if let Some(t) = self.textures.get_mut(&key) {
             t.gpu_written = true;

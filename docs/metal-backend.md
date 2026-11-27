@@ -438,7 +438,9 @@ start-up residency line logs `request_residency`.
 
 Not known: how the default does on a Mac with 16 or 18 GB; it was run with 48 GB. The frame line
 (`native draws so far`, every 64 frames) logs `heap_set_mb`, the most bytes one heap's set held
-(pool buffers its entries name count whole), and `heap_allocations`. Not done: an entry that names a
+(pool buffers its entries name count whole), `heap_allocations`, and, to see where the memory is
+when command buffers stall (#79), `metal_mb` (the device's `currentAllocatedSize`) and
+`footprint_mb` (the process's physical footprint). Not done: an entry that names a
 texture the title has released keeps it, alive and in the set, until the title overwrites the entry,
 as naming per encoder did; `useHeap` for `MTLHeap`-placed textures.
 

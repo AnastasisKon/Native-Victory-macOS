@@ -1231,17 +1231,23 @@ were refused, so their dispatches were dropped and every count stayed 0.
   lane read is the console wave's (#254), the exclusion is only conservative for compute. But the
   culling shaders branch exactly this way: after the title's barrier, every lane reads LDS word 0
   (the group flag) and the branch is on its first lane. A first lane read of a `ds_read_b32`
-  therefore splits nothing when its address is a constant, it follows one of the title's
-  `s_barrier`s in its block with no LDS write between, and no LDS write that can follow it before a
-  barrier can touch the word (one at constant bytes elsewhere is fine): the group barrier brings
-  every thread there with the same LDS, and nothing changes the word until all have passed the next
-  one (`barrier_reads`; test
-  `wave32_tests::a_barrier_block_behind_a_branch_on_an_lds_word_read_after_a_barrier`, which also
-  refuses a write to the word before the read or before the next barrier). Over the 4,129 refused
-  compute and graphics containers of a boot run (Series S, offline, both with and without thread
-  counts), `4e2edbd69fe414f1` and `f44473ebe75e0047` now translate and nothing else changes;
-  `898d9c1a5605ad81` stays refused, as two LDS writes at computed addresses can follow its read
-  before the next barrier.
+  therefore splits nothing when its address is a constant, it runs in one known barrier phase n ≥ 1
+  (after the title's n-th `s_barrier` on every path: `barrier_phases`, a bit set per block, any
+  where a loop holds a barrier), and no LDS write of the program that can run in phase n, on any
+  path, can touch the word. Atomics, `ds_append` and `ds_consume` count as writes (the last two at
+  no known address; a split wave refuses them first anyway), and one at constant bytes elsewhere is
+  fine. A group barrier's k-th instance pairs every live wave's k-th `s_barrier`, whichever
+  instruction it is, so a write of another phase is ordered against the read, and a wave that leaves
+  the read's path (or passes a barrier instruction of its own) still has its phase-n writes checked.
+  A wave that ends early writes nothing more, and the console's barrier does not wait for it;
+  whatever it wrote before ending is in some phase and checked the same way (`barrier_reads`; test
+  `wave32_tests::a_barrier_block_behind_a_branch_on_an_lds_word_read_after_a_barrier`: accepted with
+  a write to another word or to the word in an earlier phase; refused with a write or an atomic to
+  the word in the read's phase, before or after the read, or on another wave's path that ends). Over
+  the 4,129 refused compute and graphics containers of a boot run (Series S, offline, both with and
+  without thread counts), `4e2edbd69fe414f1` and `f44473ebe75e0047` now translate and nothing else
+  changes; `898d9c1a5605ad81` stays refused, as two LDS writes at computed addresses can run in its
+  read's phase.
 
 `VICTORY_TRACE_TARGETS=1` cannot show this: an indirect draw counts as drawn when it is encoded,
 whatever the GPU later reads as its count.

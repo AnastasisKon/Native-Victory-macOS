@@ -14353,11 +14353,20 @@ pub(crate) fn barrier_blocks(p: &Program, st: &Structured) -> Vec<bool> {
 }
 
 /// Values of `ds_read_b32`s both host waves of a console wave read alike: a constant LDS address
-/// read after one of the title's `s_barrier`s in its block, with no LDS write between them, and
-/// no LDS write that can follow the read before a barrier unless at constant bytes apart from
-/// the word. The group barrier brings every thread there with the same LDS, and nothing changes
-/// the word until all have passed the next one (the G-buffer cullers' group flag, #182).
+/// read in one known barrier phase n ≥ 1 (after the title's n-th `s_barrier` on every path,
+/// [`barrier_phases`]), where no LDS write of the program that can run in phase n, on any path
+/// and in any wave, can touch the word (an atomic, `ds_append` or
+/// `ds_consume` counts as a write; one at constant bytes elsewhere is fine). The group barrier
+/// brings every live thread to phase n with the same LDS, a wave that ended writes nothing more,
+/// and a write of another phase is ordered by the barriers around it, so nothing changes the
+/// word while any thread may read it in phase n (the G-buffer cullers' group flag, #182).
 fn barrier_reads(p: &Program, st: &Structured) -> Set<Value> {
+    let phases = barrier_phases(p);
+    let barriers = |b: usize, i: usize| {
+        p.blocks[b].insts[..i].iter().filter(|x| x.name() == "s_barrier").count() as u32
+    };
+    // The possible barrier phases at instruction `i` of block `b`, None: any.
+    let phase = |b: usize, i: usize| phases[b].and_then(|m| shift_phases(m, barriers(b, i)));
     let mut defs: Map<Value, (usize, usize)> = Map::default();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
@@ -14423,37 +14432,57 @@ fn barrier_reads(p: &Program, st: &Structured) -> Set<Value> {
                 continue;
             }
             let Some((word, _)) = bytes(inst) else { continue };
-            let Some(k) = block.insts[..i].iter().rposition(|x| x.name() == "s_barrier") else {
+            // One phase, after at least one barrier.
+            let Some(n) = phase(b, i).filter(|m| m.count_ones() == 1 && m & 1 == 0) else {
                 continue;
             };
-            if block.insts[k + 1..i].iter().any(writes_lds) {
-                continue;
-            }
-            // Every LDS write from the read on, up to a barrier on each path.
-            let apart = |w: &Inst| {
-                !writes_lds(w) || bytes(w).is_some_and(|(at, n)| at + n <= word || word + 4 <= at)
-            };
-            let mut ok = true;
-            let mut seen = vec![false; p.blocks.len()];
-            let mut work = vec![(b, i + 1)];
-            while let Some((q, from)) = work.pop() {
-                let rest = &p.blocks[q].insts[from..];
-                let end = rest.iter().position(|x| x.name() == "s_barrier").unwrap_or(rest.len());
-                ok &= rest[..end].iter().all(apart);
-                if end == rest.len() {
-                    for t in p.blocks[q].exit.successors() {
-                        if !std::mem::replace(&mut seen[t], true) {
-                            work.push((t, 0));
-                        }
-                    }
-                }
-            }
+            // Every LDS write that can run in phase n misses the word.
+            let ok = p.blocks.iter().enumerate().all(|(q, other)| {
+                other.insts.iter().enumerate().all(|(j, w)| {
+                    !writes_lds(w)
+                        || phase(q, j).is_some_and(|m| m & n == 0)
+                        || bytes(w).is_some_and(|(at, size)| at + size <= word || word + 4 <= at)
+                })
+            });
             if ok {
                 out.extend(inst.writes.iter().map(|w| w.1));
             }
         }
     }
     out
+}
+
+/// `phases` after `n` more barriers; None past 63.
+fn shift_phases(phases: u64, n: u32) -> Option<u64> {
+    (n < 64 && phases.leading_zeros() >= n).then(|| phases << n)
+}
+
+/// Per block: the numbers of `s_barrier`s a path from the entry can have passed on entering it,
+/// as a bit set (bit k: k barriers; 0: not reached), None where it can be any (a loop that holds
+/// a barrier, or more than 63). A group barrier's k-th instance pairs every live wave's k-th
+/// `s_barrier`, whichever instruction it is, so these are the phases a thread can be in there.
+fn barrier_phases(p: &Program) -> Vec<Option<u64>> {
+    let n = p.blocks.len();
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut entry: Vec<Option<u64>> = vec![Some(0); n];
+    loop {
+        let mut changed = false;
+        for &b in &order {
+            let mut m = Some(u64::from(b == 0));
+            for &q in &p.blocks[b].preds {
+                let k = p.blocks[q].insts.iter().filter(|x| x.name() == "s_barrier").count() as u32;
+                let out = entry[q].and_then(|e| shift_phases(e, k));
+                m = m.zip(out).map(|(a, o)| a | o);
+            }
+            if m != entry[b] {
+                entry[b] = m;
+                changed = true;
+            }
+        }
+        if !changed {
+            return entry;
+        }
+    }
 }
 
 /// SCC values that can differ between the host waves of one console wave:

@@ -466,6 +466,10 @@ compute programs append to a counter with `ds_append` at offset 0 or 4 and never
 LDS bytes 0 to 7 at address 0 and reads the counter back at 0 + 4, so the base must be 0. These
 were refused as "a hardware SGPR input".
 
+## Legacy multiply-adds on RDNA2 (#321)
+
+VOP3 0x140 and VOP2 0x006 were named and lowered as GFX10.1's `v_mad_legacy_f32` and `v_mac_legacy_f32`: the legacy product (a zero factor gives +0 against anything), rounded, then the add. On GFX10.3, which is RDNA2, the same encodings are `v_fma_legacy_f32` and `v_fmac_legacy_f32`, one rounding: `llvm-mc -mcpu=gfx1030` assembles `v_fma_legacy_f32` to the bytes gfx1010 gives `v_mad_legacy_f32` and refuses the latter, and gfx1010 and gfx1013 do the opposite (`GFX10_3Insts` brings `FeatureFmaLegacy32Insts`). They are now lowered as DXIL's `fmad` of both factors made 0 where either is 0, which Metal fuses: `legacy_fma_tests` reads (1 + 2^-12)^2 - 1 as 0x3a000400, as `v_fma_f32` gives, where rounding the product first gave 0x3a000000.
+
 ## Scalar absolute difference
 
 `s_absdiff_i32` was decoded but refused ("s_absdiff_i32 is not supported", one compute program in

@@ -18,6 +18,8 @@ use victory_metal::metal::Metal;
 mod addr_tests;
 #[path = "heap_tests.rs"]
 mod heap_tests;
+#[path = "legacy_fma_tests.rs"]
+mod legacy_fma_tests;
 #[path = "mesh_tests.rs"]
 mod mesh_tests;
 #[path = "shader_tests.rs"]

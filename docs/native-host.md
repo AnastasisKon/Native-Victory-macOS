@@ -853,6 +853,40 @@ views so Metal clamps it to the remaining levels. Previously the decoder returne
 the host bound the whole texture, so a shader reading level 0 saw the base mip even when
 the view started farther down the chain.
 
+#### Typed and structured buffer views lazily carry a Metal `texture_buffer`
+
+`victory-shader` lowers MUBUF `buffer_load_format_*`, `buffer_store_format_*`, and their
+`getDimensions` size queries to DXIL `TypedBuffer` (`bufferLoad.f32` / `bufferStore.f32`), which the
+Metal Shader Converter compiles (tested on a small synthetic DXIL shader) to
+`air.read_texture_buffer_1d.v4f32`, `air.write_texture_buffer_1d.v4f32`, and
+`air.get_width_texture_buffer_1d` reading `textureViewID` (word 1) of the 24-byte
+`IRDescriptorTableEntry`. `Metal::write_buffer` previously left word 1 at `0` (null
+`MTLResourceID`) for every buffer view, so formatted buffer stores wrote nothing and formatted
+buffer loads and size queries returned `0` (`#255`).
+
+To keep `NativeHost::mirror` free of Metal texture allocations across ~40,000-entry world heaps,
+`mirror` continues to write `[gpu, 0, size]` via `write_buffer` and marks two pending bits per
+entry (`list::PendingTyped`, ~10 KiB for 40,000 entries, `descriptors::typed_buffer`) for typed
+buffer SRVs/UAVs and for 4-, 8-, and 16-byte structured buffer SRVs/UAVs (guess, marked in
+`descriptors.rs`: on RDNA2 a structured `V#` of 4-, 8-, or 16-byte elements carries a 1-, 2-, or
+4-dword 32-bit data format, so shaders may access the same descriptor with both
+`buffer_store_format_*` / `buffer_load_format_*` and `buffer_store_dword*` / `buffer_load_dword*`).
+`Binding::of` scans the module's DXIL symbol and constant tables once
+(`list::dxil_uses_typed_buffers`) to flag shaders that use `bufferLoad`, `bufferStore`, or
+`TypedBuffer` `getDimensions`. At draw/dispatch submission, `NativeHost::materialize_typed_buffers`
+is a no-op unless a bound stage sets `typed_buffers`; when set, it calls `Metal::write_typed_buffer`
+only for pending bits inside the draw or dispatch's bound `Root::Table` ranges (plus explicit
+`stride == 0` typed buffer views in the bound heap if the shader also indexes
+`ResourceDescriptorHeap` directly), leaving unbound structured buffers unmaterialized. If a view's pool offset is not a multiple of
+`minimumTextureBufferAlignmentForPixelFormat` (16 bytes on Apple Silicon), `write_typed_buffer`
+warns once and falls back to `write_buffer` so raw accesses in word 0 still work without tripping
+Metal validation. 32-bit `SINT` views (`4`, `18`, `43`) map to `Uint` because `victory-shader`
+passes raw 32-bit lane bits through `TypedBuffer<float4>` (`bitcast i32 <-> float`) while Metal's
+texture unit unpacks/packs by the view's `MTLPixelFormat` with no sub-32-bit extension; 8- and
+16-bit `SINT` stay unmapped so `Uint` does not zero-extend signed channels. Tested on the GPU in
+`native::tests::heap_tests::formatted_buffer_stores_and_loads_through_structured_and_typed_uavs` and
+`victory-metal` `gfx::heap_set_tests::a_heaps_set_follows_its_entries`.
+
 #### A command buffer the GPU fails still pays its signals and value writes
 
 Observed: the GPU failed a command buffer (`kIOGPUCommandBufferCallbackErrorHang`), and the buffers

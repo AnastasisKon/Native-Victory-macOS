@@ -371,6 +371,7 @@ not needed to build:
 | Entry | gpuVA | textureViewID | metadata |
 |---|---|---|---|
 | raw buffer SRV/UAV | buffer GPU address (title address + delta) | 0 | size in bytes (low 32 bits) |
+| typed / 4–16 B structured buffer SRV/UAV | buffer GPU address (title address + delta) | `MTLTextureTypeTextureBuffer` `gpuResourceID` | size in bytes (low 32 bits) |
 | texture SRV/UAV | 0 | `MTLTexture.gpuResourceID` | `f32` bits of min LOD clamp (low 32 bits) |
 | sampler | `MTLSamplerState.gpuResourceID` | 0 | `f32` bits of LOD bias |
 
@@ -378,8 +379,7 @@ A root descriptor table is the **GPU address of its first entry** in the top-lev
 (`heap_address(heap, i)` pushed with `RootArgs::address`, like a root view); `DescriptorTable(SRV(t0),
 UAV(u0))` is two adjacent entries and a second `DescriptorTable(Sampler(s0))` points into the sampler
 heap. The heaps are also bound at slots 0 and 1 for shaders that index `ResourceDescriptorHeap[i]`, for
-every stage (`victory-gpu`'s `native::heap_tests` draw with vertex, mesh and pixel shaders that do). Typed buffer views (`IRBufferView.textureBufferView`, buffers read as
-`Buffer<T>`) are not written yet.
+every stage (`victory-gpu`'s `native::heap_tests` draw with vertex, mesh and pixel shaders that do). Typed buffer views and 4-, 8-, and 16-byte structured buffer views (`Metal::write_typed_buffer`) lazily populate `textureViewID` (`MTLTextureTypeTextureBuffer` over the pool `MTLBuffer`) alongside `gpuVA` only when a bound shader uses DXIL `TypedBuffer` operations, while keeping only the pool `MTLBuffer` in `alloc_counts` / `MTLResidencySet`.
 
 Proven by `srv_and_uav_through_a_descriptor_table` (a compute shader reads an SRV and writes a UAV, both
 zero-copy buffers, through a table at heap entry 5; then entry 5 is rewritten to point elsewhere and the

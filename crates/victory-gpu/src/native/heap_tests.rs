@@ -336,6 +336,57 @@ fn a_compute_shader_loads_a_texture_by_heap_index() {
     assert_eq!(f.get(0x2_0000, 2), [0x3F80_0000, super::addr_tests::CANARY]);
 }
 
+/// A compute program whose lane 0 subtracts 3 from the first dword of the raw UAV in its table
+/// (`buffer_atomic_sub` with `glc`) and stores the value it returns, the old one, in the second.
+const CS_ATOMIC_SUB: &[u32] = &[
+    0x7DA4_0080, // v_cmpx_eq_u32 0, v0
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0x7E04_0283, // v_mov_b32 v2, 3
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE0CC_4000, 0x8003_0200, // buffer_atomic_sub v2, off, s[12:15], 0 glc
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_0004, 0x8003_0200, // buffer_store_dword v2, off, s[12:15], 0 offset:4
+    0xBF81_0000, // s_endpgm
+];
+
+/// `buffer_atomic_sub` has no DXIL operation; it runs as an add of the negated data, which leaves
+/// the same dword and returns the same old value, wrapping below zero as the console does.
+#[test]
+fn a_buffer_atomic_sub_leaves_the_difference_and_returns_the_old_value() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_ATOMIC_SUB, &[uav], 7);
+    let cs = shaders::translate(&c).expect("buffer_atomic_sub translates");
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let heap = Heap::new(&t);
+    // Entry 2: a raw buffer UAV of 64 dwords at `VA_A` (pool offset 0x2_0000).
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    let slot = heap._records.as_ptr() as u64 + 64;
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
+    assert!(t.host.mirror(slot).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "atomic sub") else { panic!("{:?}", t.shaders) };
+    for (before, after) in [(10u32, 7u32), (1, u32::MAX - 1)] {
+        f.put(0x2_0000, &[before]);
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap.heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap.heap, 2);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+        assert_eq!(f.get(0x2_0000, 2), [after, before], "{before} - 3");
+    }
+}
+
 /// A compute program that takes its output buffer from the resource heap itself (entry 2, by
 /// the heap's base in s6): no table names that entry. It stores the green channel of entry 1's
 /// texel (1.0) at bytes 0 and 8.

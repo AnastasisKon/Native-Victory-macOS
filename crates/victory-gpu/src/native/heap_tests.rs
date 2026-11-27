@@ -907,3 +907,64 @@ fn world_heap_mirror_lazy_benchmark() {
     assert_eq!(heap.typed_pending.borrow().count(), TOTAL);
     drop(records);
 }
+
+/// #264 review (cost): what a resource heap as long as `HEAP_VIEWS` and its view-stride table add
+/// to the process footprint and to Metal's allocated size, beside a heap of 40,000 title entries
+/// plus the reserved pairs (its length before #264).
+#[test]
+#[ignore = "benchmark: cargo test -p victory-gpu long_resource_heap_cost_benchmark -- --ignored --nocapture"]
+fn long_resource_heap_cost_benchmark() {
+    use victory_backend::backend::ComputeBackend;
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let mb = |b: usize| b as f64 / (1 << 20) as f64;
+    let measure = |t: &Title<Metal>| (victory_platform::mem::footprint(), t.host.backend.allocated_bytes() as usize);
+    let report = |what: &str, a: (usize, usize), b: (usize, usize)| {
+        println!("{what}: footprint {:+.1} MiB, Metal allocated {:+.1} MiB", mb(b.0) - mb(a.0), mb(b.1) - mb(a.1));
+    };
+    let m0 = measure(&t);
+    let short = t.host.backend.create_heap(HeapKind::Resource, 40_000 + crate::native::addr::RESERVED).unwrap();
+    let m1 = measure(&t);
+    report("heap of 40,000 + reserved entries (before #264)", m0, m1);
+    let long = t.host.backend.create_heap(HeapKind::Resource, victory_shader::emit::HEAP_VIEWS as usize).unwrap();
+    let m2 = measure(&t);
+    report("heap of HEAP_VIEWS entries (#264)", m1, m2);
+    // A host heap (HEAP_VIEWS long) bound to a shader that reads the stride table: the table is
+    // made, the null views written and the heap made resident for the dispatch.
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_HEAP_BUFFER, &[uav], 7);
+    let cs = shaders::translate(&c).unwrap();
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "heap buffer") else { panic!("{:?}", t.shaders) };
+    let dispatch = |t: &Title<Metal>, heap: &Heap| {
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap.heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap.heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+    };
+    // The first dispatch also pays for the device's first command buffer and the fixture's pool
+    // becoming resident: measured apart, on a heap of its own.
+    let m3 = measure(&t);
+    let first = Heap::new(&t);
+    dispatch(&t, &first);
+    let m4 = measure(&t);
+    report("first host heap and first dispatch (device warm-up included)", m3, m4);
+    for round in 0..3 {
+        let a = measure(&t);
+        let heap = Heap::new(&t);
+        let b = measure(&t);
+        report(&format!("another host resource heap made (HEAP_VIEWS long), #{round}"), a, b);
+        dispatch(&t, &heap);
+        let c = measure(&t);
+        report(&format!("its first dispatch (stride table, null views, residency), #{round}"), b, c);
+        dispatch(&t, &heap);
+        report(&format!("its second dispatch, #{round}"), c, measure(&t));
+        std::mem::forget(heap);
+    }
+    drop((short, long, f));
+}

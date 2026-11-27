@@ -495,6 +495,13 @@ fn tracing_record_writers() -> bool {
     env_set!("VICTORY_TRACE_RECORD_WRITERS")
 }
 
+/// `VICTORY_TRACE_RECORD_WRITERS=<hash>[,<hash>...]`: the records watched are those of the
+/// indirect dispatches of these compute shaders, not the mesh records (`None`: the mesh records).
+fn record_writers_of() -> Option<&'static str> {
+    static OF: OnceLock<Option<String>> = OnceLock::new();
+    OF.get_or_init(|| std::env::var("VICTORY_TRACE_RECORD_WRITERS").ok().filter(|v| v.len() >= 16)).as_deref()
+}
+
 /// The records and zero records of the executions whose first record is inside one of `buffers`.
 fn records_in(buffers: &std::collections::BTreeSet<(u64, u64)>, executions: &std::collections::BTreeMap<u64, [u64; 2]>) -> [u64; 2] {
     executions
@@ -1902,7 +1909,7 @@ pub(crate) fn execute_indirect(
                 if pass_on() {
                     pass_note_op(l, &format!("mesh-records n={max} counted={}", count.is_some()), None, None);
                 }
-                if tracing_record_writers() {
+                if tracing_record_writers() && record_writers_of().is_none() {
                     let zero = (0..max)
                         .filter(|&i| super::textures::read_memory(at(i) as *const u8, 4).iter().all(|&b| b == 0))
                         .count() as u64;
@@ -1933,6 +1940,29 @@ pub(crate) fn execute_indirect(
                     }
                     l.list.set_compute_pipeline(&pso);
                     for i in 0..max {
+                        if let Some(of) = record_writers_of()
+                            && stage_hashes(l.pipeline).iter().any(|h| h.strip_prefix("compute ").is_some_and(|h| of.contains(h)))
+                        {
+                            let zero = super::textures::read_memory(at(i) as *const u8, 4).iter().all(|&b| b == 0);
+                            let mut trace = RECORD_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+                            let n = trace.get_or_insert_default().executions.entry(at(i)).or_default();
+                            n[0] += 1;
+                            n[1] += u64::from(zero);
+                        }
+                        if crate::list::trace_dispatch_flags() {
+                            static SEEN: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+                            let mut seen = SEEN.lock().unwrap();
+                            let key = (l.pipeline as usize, count.is_some());
+                            if seen.iter().filter(|k| **k == key).count() < 3 {
+                                seen.push(key);
+                                // What title memory holds now, not what the GPU will read.
+                                let now: Vec<u32> = super::textures::read_memory(at(i) as *const u8, 12)
+                                    .chunks_exact(4)
+                                    .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                                    .collect();
+                                tracing::warn!(shader = ?stage_hashes(l.pipeline), ?command, counted = count.is_some(), stride, record = format_args!("{:#x}", at(i)), ?now, "an indirect dispatch (the first three of each pipeline)");
+                            }
+                        }
                         let r = match count {
                             Some(c) => l.list.dispatch_indirect_counted(at(i), c, i),
                             None => l.list.dispatch_indirect(at(i)),

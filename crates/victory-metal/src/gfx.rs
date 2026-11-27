@@ -1259,6 +1259,7 @@ impl GraphicsBackend for Metal {
         if self.trace_fails {
             report_in_flight();
             self.trace_enc.borrow_mut().clear();
+            self.trace_args.borrow_mut().clear();
         }
         let mut cb = self.new_command_buffer(queue)?;
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1346,7 +1347,12 @@ impl GraphicsBackend for Metal {
                 let piece = ((n + 1) / per) as u64;
                 cb.encodeSignalEvent_value(ProtocolObject::from_ref(&**event), piece);
                 let owed = Owed::of(vec![(event.clone(), piece)], &work.passes[first..=n], 0);
-                self.commit_piece(queue, &cb, owed, piece);
+                // The trace names what this piece holds, not the whole submission.
+                let tinfo = self.trace_fails.then(|| {
+                    let enc = std::mem::take(&mut *self.trace_enc.borrow_mut()).join(" | ");
+                    (format!("{label} piece {piece} | {enc}"), std::mem::take(&mut *self.trace_args.borrow_mut()))
+                });
+                self.commit_piece(queue, &cb, owed, piece, tinfo);
                 first = n + 1;
                 cb = self.next_piece(queue, work.waits, &mut attached_heaps, Some((&**event, piece)))?;
                 if self.trace_fails {
@@ -1373,6 +1379,7 @@ impl GraphicsBackend for Metal {
         let tinfo = trace.then(|| (serial, label, self.trace_enc.borrow().join(" | ")));
         if let Some((s, l, enc)) = &tinfo {
             IN_FLIGHT.lock().unwrap().insert(*s, (std::time::Instant::now(), format!("{l} | {enc}")));
+            GATED.lock().unwrap().insert(*s, std::mem::take(&mut *self.trace_args.borrow_mut()));
         }
         let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1381,6 +1388,7 @@ impl GraphicsBackend for Metal {
             landed(serial, queue_id, done.error().is_some());
             if let Some((s, l, enc)) = &tinfo {
                 let started = IN_FLIGHT.lock().unwrap().remove(s).map(|(t, _)| t);
+                gated_args(*s, true);
                 if done.error().is_none()
                     && let Some(t) = started
                     && t.elapsed().as_secs_f64() > 1.0
@@ -1463,7 +1471,14 @@ impl Metal {
     /// piece waits for. One the GPU fails is logged as the last piece's failure is and pays that on
     /// the CPU, so the next piece runs. It is in flight as any command buffer is: one Metal never
     /// reports on is paid by [`recover_lost`].
-    fn commit_piece(&self, queue: &Queue, cb: &ProtocolObject<dyn MTLCommandBuffer>, owed: Owed, piece: u64) {
+    fn commit_piece(
+        &self,
+        queue: &Queue,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        owed: Owed,
+        piece: u64,
+        tinfo: Option<(String, Vec<(String, usize, usize)>)>,
+    ) {
         let owed = std::sync::Arc::new(owed);
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
@@ -1484,12 +1499,34 @@ impl Metal {
         };
         flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
         let trace = self.trace_fails;
+        let tinfo = tinfo.map(|(d, args)| {
+            IN_FLIGHT.lock().unwrap().insert(serial, (std::time::Instant::now(), d.clone()));
+            GATED.lock().unwrap().insert(serial, args);
+            d
+        });
         let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
             let error = done.error();
             landed(serial, queue_id, dropped || error.is_some());
+            // A piece is traced as a whole command buffer is: slow ones, and what a failed one held
+            // (a time-out carries no encoder states, so the label alone does not name the pass).
+            if let Some(d) = &tinfo {
+                let started = IN_FLIGHT.lock().unwrap().remove(&serial).map(|(t, _)| t);
+                let secs = started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+                let args = gated_args(serial, true);
+                if (error.is_some() || secs > 1.0)
+                    && TRACE_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100
+                {
+                    tracing::warn!(
+                        "metal: {} piece {d} took {secs:.3}s (gpu {:.3}s, kernel {:.3}s){args}",
+                        if error.is_some() { "failed" } else { "slow" },
+                        done.GPUEndTime() - done.GPUStartTime(),
+                        done.kernelEndTime() - done.kernelStartTime()
+                    );
+                }
+            }
             if let Some(e) = &error
                 && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < if trace { 200 } else { 20 }
             {
@@ -1898,6 +1935,37 @@ std::thread_local! {
 /// Tracing: command buffers committed and not yet completed, by serial: when, and what they carry.
 static IN_FLIGHT: std::sync::Mutex<std::collections::BTreeMap<u64, (std::time::Instant, String)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+/// Tracing: the gate buffers of a command buffer's indirect dispatches and draws (pipeline name or
+/// the draw's place in its pass, contents address, words), by serial. The command buffer keeps
+/// the buffers alive while it is in flight.
+static GATED: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<(String, usize, usize)>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The group counts the GPU gave command buffer `serial`'s indirect dispatches, as its gates
+/// wrote them (zeros for a gate that has not run); `forget` when the command buffer has landed.
+fn gated_args(serial: u64, forget: bool) -> String {
+    let mut gated = GATED.lock().unwrap();
+    let args = if forget { gated.remove(&serial) } else { gated.get(&serial).cloned() };
+    let mut out = String::new();
+    for (name, at, words) in args.unwrap_or_default() {
+        // SAFETY: a shared buffer of `words` words, alive while its command buffer is in flight; a
+        // landed one is read in its completion handler, before Metal releases it.
+        let w: Vec<u32> = (0..words).map(|k| unsafe { (at as *const u32).add(k).read_unaligned() }).collect();
+        // A dispatch's gate holds what it runs, then what the record asked for.
+        let asked = if words == 6 { &w[3..] } else { &w[..] };
+        out.push_str(&format!(" | gpu read {name} {asked:?}"));
+        // A record past the most groups the gate runs, which ran nothing: each pipeline's first few.
+        if words == 6 && asked.iter().map(|g| u128::from(*g)).product::<u128>() > 1 << 22 {
+            static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap();
+            if seen.iter().filter(|n| **n == name).count() < 4 {
+                seen.push(name.clone());
+                tracing::warn!("metal: an indirect dispatch past the most groups ran nothing: {name} {asked:?}");
+            }
+        }
+    }
+    out
+}
 static REPORTED: std::sync::Mutex<std::collections::BTreeSet<u64>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 /// Slow and in-flight lines printed so far (each capped at 100).
@@ -1922,7 +1990,7 @@ pub fn report_in_flight() -> usize {
         if REPORTED.lock().unwrap().insert(s)
             && FLIGHT_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100
         {
-            tracing::warn!("metal: command buffer in flight for {secs:.1}s: {d}");
+            tracing::warn!("metal: command buffer in flight for {secs:.1}s: {d}{}", gated_args(s, false));
         }
     }
     count
@@ -2262,8 +2330,16 @@ pub fn direct_copy(a: Format, b: Format) -> bool {
 /// vertices or instances), into a buffer of its own, which the indirect command then reads.
 /// A rectangle list's record (`DrawCall::Rects`) becomes the four-vertex strip instances a direct
 /// one draws: (4, vertices / 3, 0, first vertex / 3).
+/// A dispatch's record, or a mesh dispatch's, runs nothing if it asks for more than 2^22 groups in
+/// all: such a record is what its writer left unfinished in title memory, and Metal would run it
+/// (510 x 1,182,027,346 x 1,314,076,063 groups in GTA VI's world: that command buffer never
+/// ended, and every one behind it on the queue timed out). A guard of ours, not a console rule:
+/// the title's own records ask for far less (9,192 groups at most seen here), but for more than
+/// D3D12's 65,535 in one dimension on larger targets, so the limit is on the product.
 /// Bound at 20 and up, apart from the converter's slots. `at`: the record's index, its words,
-/// whether a count applies, whether it is a rectangle list's.
+/// whether a count applies, 1 for a rectangle list's record or 2 for a dispatch's or a mesh
+/// dispatch's (six words out: the three it runs, then the three the record asked for, for
+/// `VICTORY_TRACE_GPU_FAILS`).
 const GATE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2272,10 +2348,20 @@ kernel void gate(device const uint *count [[buffer(20)]],
                  device uint *out [[buffer(22)]],
                  constant uint4 &at [[buffer(23)]]) {
     bool run = at.z == 0u || at.x < count[0];
+    if (at.w == 2u) {
+        // Two steps: the product of three words does not fit 64 bits.
+        ulong plane = ulong(record[0]) * record[1];
+        run = run && plane <= 4194304ul && plane * record[2] <= 4194304ul;
+        for (uint w = 0; w < 3u; w++) {
+            out[w] = run ? record[w] : 0u;
+            out[3u + w] = record[w];
+        }
+        return;
+    }
     for (uint w = 0; w < at.y; w++) {
         out[w] = run ? record[w] : 0u;
     }
-    if (at.w != 0u) {
+    if (at.w == 1u) {
         // shortcut: an instanced rectangle list draws nothing (the rectangle translation takes the
         // instance for the rectangle); draw its instances when a title is seen to use them.
         out[0] = 4u;
@@ -2308,8 +2394,8 @@ impl Metal {
             .map_err(Clone::clone)
     }
 
-    /// Encodes the gate of one counted (`count`: buffer, address, index) or rectangle-list (`rect`)
-    /// record (`words` long at `record`) into `e`; returns the
+    /// Encodes the gate of one counted (`count`: buffer, address, index), rectangle-list (`kind` 1)
+    /// or dispatch or mesh dispatch (`kind` 2) record (`words` long at `record`) into `e`; returns the
     /// buffer the indirect command reads instead of the record. Tracked by Metal (unlike the
     /// title's pools), so whatever reads it later in the command buffer waits for the write.
     /// shortcut: one gate dispatch and one small buffer per record; gate all the records of one
@@ -2320,12 +2406,17 @@ impl Metal {
         count: Option<(&Buffer, *const u8, u32)>,
         (record, title): (&Buffer, *const u8),
         words: u32,
-        rect: bool,
+        kind: u32,
         set_on_queue: bool,
     ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, String> {
         let out = self
             .dev
-            .newBufferWithLength_options(words as usize * 4, MTLResourceOptions::StorageModePrivate)
+            .newBufferWithLength_options(
+                // A dispatch's gate also keeps what the record asked for.
+                if kind == 2 { 24 } else { words as usize * 4 },
+                // Tracing reads the record the GPU used back (`GATED`).
+                if self.trace_fails { MTLResourceOptions::StorageModeShared } else { MTLResourceOptions::StorageModePrivate },
+            )
             .ok_or("no buffer for a gated indirect record")?;
         let counted = u32::from(count.is_some());
         // Without a count, slot 20 is bound to the record (not read).
@@ -2338,7 +2429,7 @@ impl Metal {
         // What the work before wrote (the count, the record) is seen.
         e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
         e.setComputePipelineState(self.gate_pipeline()?);
-        let args = [index, words, counted, u32::from(rect)];
+        let args = [index, words, counted, kind];
         // SAFETY: both title ranges lie inside live buffers (the caller resolved them); the bytes
         // are copied before the call returns.
         unsafe {
@@ -2392,13 +2483,21 @@ impl Metal {
         }
         let mut named = Vec::new();
         for d in dispatches.iter().filter(|d| runs(d)) {
-            let gated = match (d.count, d.indirect) {
-                (Some(count), Some(record)) => {
-                    // An open encoder left behind makes Metal abort at the next pass's encoder.
-                    Some(self.encode_gate(&e, Some(count), record, 3, false, set_on_queue).inspect_err(|_| e.endEncoding())?)
-                }
-                _ => None,
+            // Every indirect record goes through the gate: the count buffer's limit, and the most
+            // groups a record may ask for.
+            let gated = match d.indirect {
+                // An open encoder left behind makes Metal abort at the next pass's encoder.
+                Some(record) => Some(
+                    self.encode_gate(&e, d.count, record, 3, 2, set_on_queue)
+                        .inspect_err(|_| e.endEncoding())?,
+                ),
+                None => None,
             };
+            if let (true, Some(g)) = (self.trace_fails, &gated) {
+                let k = Retained::as_ptr(&d.pipeline.0) as *const u8 as usize;
+                let name = self.pipe_names.borrow().get(&k).cloned().unwrap_or_else(|| format!("{k:#x}"));
+                self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, 6));
+            }
             e.setComputePipelineState(&d.pipeline.0);
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(h, attached_heaps, |set| cb.useResidencySet(set));
@@ -2410,25 +2509,15 @@ impl Metal {
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
             }
-            match d.indirect {
-                Some((b, title)) => {
-                    if self.names(b, set_on_queue) {
-                        e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
-                    }
-                    let (buf, at) = match &gated {
-                        Some(g) => (&**g, 0),
-                        None => (&*b.buf, title as usize - b.base as usize),
-                    };
-                    // SAFETY: the caller resolved three words at `title` inside the live buffer
-                    // (or the gate wrote them to its own).
-                    unsafe {
-                        e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
-                            buf,
-                            at,
-                            size(d.threads_per_group),
-                        )
-                    };
-                }
+            match &gated {
+                // SAFETY: the gate wrote three words to its own buffer.
+                Some(g) => unsafe {
+                    e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                        g,
+                        0,
+                        size(d.threads_per_group),
+                    )
+                },
                 None => e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group)),
             }
         }
@@ -2445,7 +2534,16 @@ impl Metal {
                     Some(n) => l.push_str(n),
                     None => l.push_str(&format!("{k:#x}")),
                 }
-                l.push_str(&format!(" {}x{}x{}; ", d.groups[0], d.groups[1], d.groups[2]));
+                match d.indirect {
+                    // The record as title memory holds it now: what earlier command buffers
+                    // left there, not what this one's earlier passes will write.
+                    Some((_, title)) => {
+                        // SAFETY: the caller resolved three words at `title` inside the live buffer.
+                        let w: [u32; 3] = unsafe { title.cast::<[u32; 3]>().read_unaligned() };
+                        l.push_str(&format!(" indirect{w:?}; "));
+                    }
+                    None => l.push_str(&format!(" {}x{}x{}; ", d.groups[0], d.groups[1], d.groups[2])),
+                }
             }
             e.setLabel(Some(&self.cap_label(l)));
         }
@@ -2595,9 +2693,13 @@ impl Metal {
                 None => a.setLoadAction(MTLLoadAction::Load),
             }
         }
-        // Counted indirect draws and indirect rectangle lists are gated first, in a compute pass
-        // of their own.
-        let gated = |d: &Draw<'_, Metal>| d.indirect.is_some() && (d.count.is_some() || matches!(d.call, DrawCall::Rects));
+        // Counted indirect draws, indirect rectangle lists and indirect mesh dispatches (for the
+        // most groups they may ask for) are gated first, in a compute pass of their own; when
+        // tracing, every indirect draw is, so what the GPU read is known.
+        let gated = |d: &Draw<'_, Metal>| {
+            d.indirect.is_some()
+                && (d.count.is_some() || matches!(d.call, DrawCall::Rects | DrawCall::Mesh { .. }) || self.trace_fails)
+        };
         let mut gates = Vec::new();
         if rp.draws.iter().any(gated) {
             let c = cb.computeCommandEncoder().ok_or("no compute encoder")?;
@@ -2612,11 +2714,20 @@ impl Metal {
                     DrawCall::Arrays { .. } | DrawCall::Rects => 4,
                     DrawCall::Mesh { .. } => 3,
                 };
+                let kind = match d.call {
+                    DrawCall::Rects => 1,
+                    DrawCall::Mesh { .. } => 2,
+                    _ => 0,
+                };
                 gates.push(match d.indirect {
-                    Some(record) if gated(d) => Some(
-                        self.encode_gate(&c, d.count, record, words, matches!(d.call, DrawCall::Rects), set_on_queue)
-                            .inspect_err(|_| c.endEncoding())?,
-                    ),
+                    Some(record) if gated(d) => {
+                        let g = self.encode_gate(&c, d.count, record, words, kind, set_on_queue).inspect_err(|_| c.endEncoding())?;
+                        if self.trace_fails {
+                            let name = format!("{} {}", if kind == 2 { "mesh draw" } else { "draw" }, gates.len());
+                            self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, if kind == 2 { 6 } else { words as usize }));
+                        }
+                        Some(g)
+                    }
                     _ => None,
                 });
             }

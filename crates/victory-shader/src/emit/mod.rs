@@ -486,6 +486,10 @@ pub struct Options {
     /// it stores nothing and a count of EXEC leaves it out.
     /// Guess: that is what the console's lanes past the count do (`docs/native-host.md`).
     pub thread_counts: bool,
+    /// A pixel program's colour targets of integer formats (bit n: `SV_Target` n): their outputs
+    /// are declared uint and store the exported dwords' bits as they are. D3D12 wants a target's
+    /// output type to match its format, and the console exports integer bits in float registers.
+    pub integer_targets: u8,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -582,6 +586,13 @@ fn emit_fast(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
+    if pixel {
+        for e in outputs.iter_mut().filter(|e| {
+            e.kind == 16 && e.comp == 9 && e.index < 8 && options.integer_targets >> e.index & 1 != 0
+        }) {
+            e.comp = 5;
+        }
+    }
     if !pixel && options.extra_params != 0 {
         let mut row = outputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
         for n in (0..32u32).filter(|n| options.extra_params >> n & 1 != 0) {

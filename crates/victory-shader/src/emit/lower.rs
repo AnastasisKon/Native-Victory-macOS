@@ -13075,6 +13075,10 @@ impl<'a> Lower<'a> {
         }
         if let (true, Target::Color(n)) = (e.compressed, e.target) {
             let id = outputs.iter().position(|o| o.kind == 16 && o.row == Some(u32::from(n)));
+            // The halves below are made floats; an integer target's halves are not.
+            if id.is_some_and(|id| outputs[id].comp != 9) {
+                return Err("a compressed export to an integer target");
+            }
             for ch in 0..4u8 {
                 if let (Some(id), Some(value)) = (id, e.values[usize::from(ch)]) {
                     stores.push((id, ch, value, Some(ch & 1 == 1)));

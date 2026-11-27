@@ -1337,10 +1337,27 @@ fn make_host_pipe(
         .map(|(stage, s)| format!("{stage} {}", s.hash))
         .collect::<Vec<_>>()
         .join(" ");
+    // A pixel shader drawing into integer targets is translated for them (Metal refuses a float
+    // output for an integer attachment).
+    let integer = graphics.as_ref().and_then(|g| g.color_formats()).map_or(0, |c| super::shaders::integer_targets(&c));
     let mut hosts = Vec::new();
     for (stage, shader) in &stages {
-        match shader.native() {
-            Ok(h) => hosts.push((*stage, h.clone())),
+        let made = shader.native().map(Arc::clone).map_err(str::to_owned);
+        let made = match made {
+            Ok(_) if *stage == "pixel" && integer != 0 => {
+                if frame_left().is_zero() && !shader.targets_cached(integer) {
+                    let s = shader.clone();
+                    put_off(format!("{} targets {integer}", s.hash), move || drop(s.translate_targets(integer)));
+                    // Counted as put off, so `pipe` does not keep the refusal.
+                    t.shaders.put_off += 1;
+                    return Pipe::Refused;
+                }
+                shader.translate_targets(integer).map_err(|e| format!("integer targets {integer:#b}: {e}"))
+            }
+            made => made,
+        };
+        match made {
+            Ok(h) => hosts.push((*stage, h)),
             Err(e) => {
                 t.refused_translation(&name, e.to_string());
                 return Pipe::Refused;

@@ -558,3 +558,60 @@ fn an_indirect_rectangle_list_draws_its_records_as_a_direct_one() {
         }
     }
 }
+
+/// The deferred-lighting shape: a pixel program writing a float colour to mrt0 and, in mrt1.x,
+/// the bits of a float it made (pi, 0x40490fdb) into an R32Uint target. Translated for the
+/// integer target (`Options::integer_targets`, the mask `glue::make_host_pipe` computes from the
+/// formats), Metal makes the pipeline and the target holds the bits, not 3 (a conversion).
+#[test]
+fn a_pixel_program_writes_exact_bits_to_an_r32uint_target() {
+    const BITS: &[u32] = &[
+        0x7E00_02F2, // v_mov_b32 v0, 1.0
+        0x7E02_02F0, // v_mov_b32 v1, 0.5
+        0x7E06_02FF, 0x4049_0FDB, // v_mov_b32 v3, pi
+        0x0604_0680, // v_add_f32 v2, 0, v3
+        0xF800_100F, 0x0001_0100, // exp mrt0 v0, v1, v1, v0 vm
+        0xF800_1811, 0x0000_0002, // exp mrt1 v2, off, off, off done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let formats = [Format::Rgba16Float, Format::R32Uint];
+    let integer = shaders::integer_targets(&formats);
+    assert_eq!(integer, 0b10);
+    let bytes: Vec<_> = BITS.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut meta = [0; 0x10];
+    meta[12] = 0x40;
+    let c = victory_shader::emit::graphics::container(HwStage::Ps, &bytes, &meta).unwrap();
+    let ms = translate(HwStage::Vs, TRIANGLE);
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(formats.to_vec(), None, vec![], &[], false);
+    // Translated as today (float outputs), Metal refuses it.
+    let float = shaders::translate(&c).unwrap();
+    assert!(matches!(t.render_pipe(&ms, Some(&float), &state, "float"), Pipe::Refused));
+    assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("color attachment")), "{:?}", t.shaders.refused);
+    let ps = shaders::translate_targets(&c, integer).unwrap();
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "integer") else {
+        panic!("{:?}", t.shaders);
+    };
+    let target = |f| {
+        let mut desc = TextureDesc::d2(f, 8, 8);
+        desc.render_target = true;
+        t.host.texture(&desc).unwrap()
+    };
+    let (color, ids) = (target(Format::Rgba16Float), target(Format::R32Uint));
+    let mut list = NativeList::default();
+    list.set_render_targets(&[color.clone(), ids.clone()], None);
+    list.clear_render_target(&color, [0.0; 4]);
+    list.clear_render_target(&ids, [0.0; 4]);
+    list.set_graphics_pipeline(&pso, Topology::Triangles);
+    list.set_graphics_binding(binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    let mut p = [0u8; 8 * 8 * 4];
+    t.host.backend.read_texture(&ids, 0, 0, &mut p, 8 * 4, 0);
+    let words: Vec<u32> = p.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    assert!(words.iter().all(|&w| w == 0x4049_0FDB), "{words:x?}");
+    let mut h = [0u8; 8 * 8 * 8];
+    t.host.backend.read_texture(&color, 0, 0, &mut h, 8 * 8, 0);
+    // 1.0, 0.5, 0.5, 1.0 as halves.
+    assert_eq!(&h[..8], &[0x00, 0x3c, 0x00, 0x38, 0x00, 0x38, 0x00, 0x3c]);
+}

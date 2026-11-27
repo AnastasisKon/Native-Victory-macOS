@@ -313,6 +313,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         extra_params: 0,
         // `DispatchX` runs thread counts as group counts here (`list::dispatch_x`).
         thread_counts: false,
+        // shortcut: this key has no options; integer targets are made on the native host only.
+        integer_targets: 0,
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
@@ -778,6 +780,11 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         let rect = format!("{:?}", victory_shader::emit::Options { rect_list: true, ..crate::native::shaders::options() });
         assert_ne!(native_key(&settings()), native_key(&rect));
+        // A pixel shader's integer-target variants are entries of their own.
+        let int = |n| format!("{:?}", victory_shader::emit::Options { integer_targets: n, ..crate::native::shaders::options() });
+        assert_eq!(int(0), format!("{:?}", crate::native::shaders::options()));
+        assert_ne!(native_key(&int(0b10)), native_key(&int(0)));
+        assert_ne!(native_key(&int(0b10)), native_key(&int(0b11)));
     }
 
     /// The current build and the two used last stay; older ones, by their stamp, go. Other

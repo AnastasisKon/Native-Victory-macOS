@@ -242,17 +242,37 @@ impl Shader {
         self.threads
             .get_or_init(|| {
                 self.native()?;
-                let mut container = vec![0; self.size];
-                let at = self.at.load(std::sync::atomic::Ordering::Relaxed);
-                if at == 0 || !crate::queue::read_bytes(at, &mut container) {
-                    return Err("its container is no longer in title memory".into());
-                }
-                if blake3::hash(&container).to_hex()[..16] != *self.hash {
-                    return Err("its container changed since the pipeline was made".into());
-                }
-                crate::native::shaders::translate_threads(&container).map(Arc::new)
+                crate::native::shaders::translate_threads(&self.container_again()?).map(Arc::new)
             })
             .clone()
+    }
+
+    /// The container read again from where the title held it (a pixel or compute shader's is
+    /// let go once translated).
+    fn container_again(&self) -> Result<Vec<u8>, String> {
+        let mut container = vec![0; self.size];
+        let at = self.at.load(std::sync::atomic::Ordering::Relaxed);
+        if at == 0 || !crate::queue::read_bytes(at, &mut container) {
+            return Err("its container is no longer in title memory".into());
+        }
+        if blake3::hash(&container).to_hex()[..16] != *self.hash {
+            return Err("its container changed since the pipeline was made".into());
+        }
+        Ok(container)
+    }
+
+    /// A pixel shader's translation for integer colour targets (`Options::integer_targets`);
+    /// not kept here (the disk cache and the pipeline caches keep it).
+    /// shortcut: the container is read again from title memory, so a pipeline made after the
+    /// title freed it is refused (keeping every pixel container costs ~110 MB); upgrade if the
+    /// "its container is no longer in title memory" refusals matter.
+    pub(crate) fn translate_targets(&self, integer: u8) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+        crate::native::shaders::translate_targets(&self.container_again()?, integer).map(Arc::new)
+    }
+
+    /// Whether [`Self::translate_targets`] would find its translation on disk.
+    pub(crate) fn targets_cached(&self, integer: u8) -> bool {
+        self.container_again().is_ok_and(|c| crate::native::shaders::targets_cached(&c, integer))
     }
 
     /// Whether [`Self::translate_extra`] would find its translation on disk.

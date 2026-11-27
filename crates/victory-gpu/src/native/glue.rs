@@ -59,9 +59,68 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Shared>> {
     TITLE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+use super::textures::{lock_traced, SYNC_PHASES};
+
+/// Adds one taking of `TITLE` at `at` (file, line) to the trace, and logs it once a second.
+fn note_lock(at: (&'static str, u32), wait: std::time::Duration, hold: std::time::Duration) {
+    type Stats = std::collections::HashMap<(&'static str, u32), [u64; 4]>;
+    static STATS: Mutex<Option<(std::time::Instant, Stats)>> = Mutex::new(None);
+    let mut stats = STATS.lock().unwrap_or_else(|e| e.into_inner());
+    let (since, by) = stats.get_or_insert_with(|| (std::time::Instant::now(), Default::default()));
+    let s = by.entry(at).or_default();
+    let (wait, hold) = (wait.as_micros() as u64, hold.as_micros() as u64);
+    *s = [s[0] + 1, s[1] + wait, s[2] + hold, s[3].max(hold)];
+    if since.elapsed().as_secs() < 1 {
+        return;
+    }
+    let secs = since.elapsed().as_secs_f32();
+    let mut rows: Vec<_> = by.drain().collect();
+    rows.sort_by_key(|(_, s)| std::cmp::Reverse(s[2]));
+    let held: u64 = rows.iter().map(|(_, s)| s[2]).sum();
+    let waited: u64 = rows.iter().map(|(_, s)| s[1]).sum();
+    let top: Vec<String> = rows
+        .iter()
+        .take(12)
+        .map(|((file, line), s)| {
+            let file = file.rsplit('/').next().unwrap_or(file);
+            format!("{file}:{line} n={} held={}ms waited={}ms longest={}ms", s[0], s[2] / 1000, s[1] / 1000, s[3] / 1000)
+        })
+        .collect();
+    let phase = |i: usize| SYNC_PHASES[i].swap(0, Ordering::Relaxed) / 1000;
+    tracing::info!(
+        "title lock in the last {secs:.1} s: held {} ms, waited {} ms; at submissions: keep_named {} ms, keep_to_budget {} ms, give_up_covered {} ms, probes {} ms; {}",
+        held / 1000,
+        waited / 1000,
+        phase(0),
+        phase(1),
+        phase(2),
+        phase(3),
+        top.join("; ")
+    );
+    *stats = None;
+}
+
 /// Runs `f` on the native host, made on first use; `None` if there is no Metal device (the call
 /// is then ignored, as when there is no host GPU on Windows).
+#[track_caller]
 pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
+    if !lock_traced() {
+        return with_title_untraced(f);
+    }
+    let at = std::panic::Location::caller();
+    let asked = std::time::Instant::now();
+    let mut got = None;
+    let r = with_title_untraced(|t| {
+        got = Some(std::time::Instant::now());
+        f(t)
+    });
+    if let Some(got) = got {
+        note_lock((at.file(), at.line()), got - asked, got.elapsed());
+    }
+    r
+}
+
+fn with_title_untraced<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
     let mut guard = lock();
     if guard.is_none() {
         if FAILED.load(Ordering::Relaxed) {
@@ -108,8 +167,15 @@ fn start_timer() {
         .spawn(|| {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                if let Some(t) = lock().as_mut() {
+                let asked = std::time::Instant::now();
+                let mut guard = lock();
+                let got = std::time::Instant::now();
+                if let Some(t) = guard.as_mut() {
                     refresh(&mut t.0);
+                }
+                drop(guard);
+                if lock_traced() {
+                    note_lock(("timer refresh", 0), got - asked, got.elapsed());
                 }
             }
         });
@@ -155,6 +221,7 @@ fn refresh(t: &mut MetalTitle) {
 }
 
 /// Runs `f` on the native host and a title list's recording.
+#[track_caller]
 pub(crate) fn with_list<R>(
     this: This,
     f: impl FnOnce(&mut MetalTitle, &mut MetalList) -> R,

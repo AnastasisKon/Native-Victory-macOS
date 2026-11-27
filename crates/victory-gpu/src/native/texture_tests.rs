@@ -2197,6 +2197,19 @@ fn a_texture_sharing_a_released_copy_takes_it_over() {
     assert_eq!(draw_sampling(&mut t, &pool, placed, 3), [0x66, 0, 0, 0x66]);
 }
 
+/// A sync checks a bounded share of the covered copies, round-robin: thousands of them are not
+/// all read again at every submission, and every one is checked within a sweep.
+#[test]
+fn a_sync_checks_covered_copies_a_share_at_a_time() {
+    let Some((mut t, _pool)) = budget_title() else { return };
+    // Keys with no copy any more: a check drops them from the set.
+    t.covered.extend(1..=1000);
+    t.give_up_covered();
+    assert_eq!(t.covered.len(), 1000 - crate::native::textures::COVERED_CHECKS, "one share checked");
+    t.give_up_covered();
+    assert!(t.covered.is_empty(), "the rest at the next sync");
+}
+
 /// Has the one entry of a host heap over `views` show title texture `key` (a mirrored view).
 fn show(t: &mut Title<victory_metal::metal::Metal>, views: &[u32], key: usize) {
     let at = views.as_ptr() as u64;

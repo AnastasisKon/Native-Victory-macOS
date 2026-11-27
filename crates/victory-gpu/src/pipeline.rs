@@ -263,6 +263,9 @@ impl Shader {
 
     /// A pixel shader's translation for integer colour targets (`Options::integer_targets`);
     /// not kept here (the disk cache and the pipeline caches keep it).
+    /// shortcut: the container is read again from title memory, so a pipeline made after the
+    /// title freed it is refused (keeping every pixel container costs ~110 MB); upgrade if the
+    /// "its container is no longer in title memory" refusals matter.
     pub(crate) fn translate_targets(&self, integer: u8) -> Result<Arc<victory_shader::emit::HostShader>, String> {
         crate::native::shaders::translate_targets(&self.container_again()?, integer).map(Arc::new)
     }

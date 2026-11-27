@@ -493,6 +493,9 @@ struct State<B: GraphicsBackend> {
 
 pub struct NativeList<B: GraphicsBackend> {
     pub(super) cmds: Vec<Cmd<B>>,
+    /// Pass-trace lines (`VICTORY_TRACE_PASSES`), each with the command count when it was recorded;
+    /// empty unless the trace's window is open.
+    pub(super) notes: Vec<(usize, String)>,
     state: State<B>,
 }
 
@@ -507,6 +510,7 @@ impl<B: GraphicsBackend> Default for NativeList<B> {
     fn default() -> Self {
         NativeList {
             cmds: Vec::new(),
+            notes: Vec::new(),
             state: State {
                 compute: None,
                 graphics: None,
@@ -553,6 +557,7 @@ impl<B: GraphicsBackend> NativeList<B> {
     pub fn cut(&mut self) -> NativeList<B> {
         NativeList {
             cmds: std::mem::take(&mut self.cmds),
+            notes: std::mem::take(&mut self.notes),
             ..NativeList::default()
         }
     }
@@ -561,6 +566,7 @@ impl<B: GraphicsBackend> NativeList<B> {
     pub fn snapshot(&self) -> NativeList<B> {
         NativeList {
             cmds: self.cmds.clone(),
+            notes: self.notes.clone(),
             ..NativeList::default()
         }
     }

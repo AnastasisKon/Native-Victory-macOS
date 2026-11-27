@@ -1195,6 +1195,45 @@ impl<B: GraphicsBackend> NativeHost<B> {
         out
     }
 
+    /// Pass trace: the textures `root`'s tables name: shader-resource ones, unordered-access ones, and
+    /// how many of the entries hold no view at all. `limits`: entries per table slot (else 24).
+    #[cfg(target_os = "macos")]
+    pub(super) fn pass_views(&self, root: &[Option<Root<B>>], limits: &[(u8, usize)]) -> (Vec<String>, Vec<String>, usize, Vec<usize>) {
+        use crate::descriptor::View;
+        let (mut reads, mut writes, mut none, mut keys) = (Vec::new(), Vec::new(), 0usize, Vec::new());
+        let d = |r: usize, i: Option<super::textures::TextureInfo>| match i {
+            Some(i) => format!("{r:#x}:f{}:{}x{}@{:#x}", i.format, i.width, i.height, i.memory as usize),
+            None => format!("{r:#x}:buf"),
+        };
+        for (slot, r) in root.iter().enumerate() {
+            let Some(Root::Table(h, at)) = r else { continue };
+            if h.kind != HeapKind::Resource {
+                continue;
+            }
+            let n = limits.iter().filter(|(s, _)| *s as usize == slot).map(|(_, n)| *n).max().unwrap_or(if limits.is_empty() { 24 } else { 0 });
+            // Not past the heap's end.
+            for k in 0..n.min(h.count.saturating_sub(*at)) as u64 {
+                match crate::descriptor::view(h.start + (*at as u64 + k) * Self::step(HeapKind::Resource)) {
+                    Some(View::Shader(r, _)) => {
+                        if texture_info_of(r).is_some() { keys.push(r); reads.push(format!("{slot}.{k}={}", d(r, texture_info_of(r)))); }
+                    }
+                    Some(View::Unordered(r, _, _)) => {
+                        if texture_info_of(r).is_some() { keys.push(r); }
+                        writes.push(format!("{slot}.{k}={}", d(r, texture_info_of(r))));
+                    }
+                    Some(View::Placed(u, res, v)) if res[0] > 1 => {
+                        let address = u64::from(v[10]) | u64::from(v[11]) << 32;
+                        let s = format!("{slot}.{k}=placed:{}", d(address as usize, placed_info_of(address, &res)));
+                        if u { writes.push(s) } else { reads.push(s) }
+                    }
+                    Some(_) => {}
+                    None => none += 1,
+                }
+            }
+        }
+        (reads, writes, none, keys)
+    }
+
     /// For `VICTORY_TRACE_RECORD_WRITERS`: what the first 64 entries from each of `root`'s tables
     /// name: the title memory (start, size) of buffers viewed for unordered access, the textures
     /// viewed as shader resources, and the textures viewed for unordered access. A table may be
@@ -1546,7 +1585,27 @@ impl<B: GraphicsBackend> NativeHost<B> {
         // the last kept one.
         let mut cut: Vec<bool> = Vec::new();
         let mut dropped: Vec<&Cmd<B>> = Vec::new();
-        for c in lists.iter().flat_map(|l| l.cmds.iter()) {
+        // The pass trace (`glue::pass_note`): its lines in queue order. Only lists recorded while
+        // its window was open hold notes.
+        let noted = lists.iter().any(|l| !l.notes.is_empty());
+        let exec = if noted {
+            static EXEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            EXEC.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        } else {
+            0
+        };
+        if noted {
+            for (li, l) in lists.iter().enumerate() {
+                for (ci, note) in &l.notes {
+                    eprintln!("PASS exec={exec} q={queue:p} li={li} ci={ci} {note}");
+                }
+            }
+        }
+        for (li, ci, c) in lists
+            .iter()
+            .enumerate()
+            .flat_map(|(li, l)| l.cmds.iter().enumerate().map(move |(ci, c)| (li, ci, c)))
+        {
             // A draw or clear left with no target (the title's targets have formats the host does
             // not represent, so none was realized) cannot open a render pass: Metal gives no
             // encoder for a pass without attachments, and that refused the whole piece.
@@ -1566,7 +1625,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 dropped.push(c);
                 continue;
             }
-            match self.prep(c) {
+            // Reported from this one preparation: preparing again for the trace would mirror tables
+            // and write view pairs twice.
+            let prepared = self.prep(c);
+            if noted && let Err(e) = &prepared {
+                eprintln!("PASSFAIL exec={exec} li={li} ci={ci} err={e}");
+            }
+            match prepared {
                 Ok(p) => {
                     cut.push(dropped.drain(..).any(|d| !same(d, c)));
                     cmds.push(c);

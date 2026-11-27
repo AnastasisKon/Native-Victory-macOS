@@ -35,8 +35,8 @@ pub struct Metal {
     pub(crate) compiling_render: Compiling<Result<(crate::gfx::RenderState, Option<MTLSize>), String>>,
     /// `VICTORY_TRACE_GPU_FAILS`: label command buffers and encoders, report failures with them.
     pub(crate) trace_fails: bool,
-    /// The most passes of a submission in one command buffer (`VICTORY_PASSES_PER_BUFFER`,
-    /// default 8; 0: no limit).
+    /// The most passes of a submission in one command buffer (`VICTORY_PASSES_PER_BUFFER`;
+    /// default 0: no limit).
     pub(crate) passes_per_buffer: usize,
     /// Command buffers `submit_passes` committed.
     pub(crate) committed: std::cell::Cell<u64>,
@@ -55,9 +55,10 @@ pub struct Metal {
 }
 
 /// The most passes of a submission in one command buffer unless `VICTORY_PASSES_PER_BUFFER` says
-/// otherwise. A guess from one machine (an M4 Pro): 8 kept the world's submissions under the
-/// GPU's time limit with the ray-traced passes on; see docs/native-host.md.
-const PASSES_PER_BUFFER: usize = 8;
+/// otherwise: no limit (0), the whole submission in one, until other Macs than the one it was
+/// measured on (an M4 Pro) have run the split. 1 is the safest value there; see
+/// docs/native-host.md.
+const PASSES_PER_BUFFER: usize = 0;
 
 type ComputeState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 /// Pipelines a `pipeline-compile` thread is making or has made, by what they are made of.

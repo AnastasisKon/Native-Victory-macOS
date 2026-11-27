@@ -574,17 +574,22 @@ impl Metal {
     /// and later read heap entries with nothing keeping them resident, and the GPU faulted
     /// (`kIOGPUCommandBufferCallbackErrorPageFault`). The submission's waits are encoded again too,
     /// so no piece starts before what the submission waits for (values already reached cost
-    /// nothing).
+    /// nothing), and the piece waits for the one before it (`after`: the submission's piece event
+    /// and the value that piece raises it to, by the GPU or, if the GPU fails it, by its recovery).
     fn next_piece(
         &self,
         queue: &Queue,
         waits: &[(&crate::metal::Fence, u64)],
         attached_heaps: &mut Vec<*const Heap>,
+        after: Option<(&ProtocolObject<dyn MTLSharedEvent>, u64)>,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
         let cb = self.new_command_buffer(queue)?;
         attached_heaps.clear();
         for (f, v) in waits {
             cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
+        }
+        if let Some((event, v)) = after {
+            cb.encodeWaitForEvent_value(ProtocolObject::from_ref(event), v);
         }
         Ok(cb)
     }
@@ -1183,13 +1188,23 @@ impl GraphicsBackend for Metal {
         // is dropped, the command buffer still commits, and the caller is told.
         let mut refused: Option<String> = None;
         let mut attached_heaps = Vec::new();
-        // A submission's passes go in command buffers of at most `passes_per_buffer` passes
-        // (`VICTORY_PASSES_PER_BUFFER`, default 8; 0: all in one). macOS stops a command buffer
-        // that runs too long on the GPU (`kIOGPUCommandBufferCallbackErrorTimeout`): a world
+        // A submission's passes can go in command buffers of at most `passes_per_buffer` passes
+        // (`VICTORY_PASSES_PER_BUFFER`; default 0: all in one). macOS stops a command buffer that
+        // runs too long on the GPU (`kIOGPUCommandBufferCallbackErrorTimeout`): a world
         // submission of 72 to 80 passes ran 6 to 21 s with the ray-traced passes on, while none of
-        // its passes alone took more than 1.4 s. The earlier pieces are committed as they fill;
-        // the last one carries the signals and what the submission owes if it fails.
+        // its passes alone took more than 1.4 s. The earlier pieces are committed as they fill.
+        // Each piece owes its own value writes, and raises the submission's piece event for the
+        // next piece, which waits for it; the last piece owes the fence signals and the order
+        // event. A piece the GPU fails pays its own share on the CPU, once ([`Owed`]), so the
+        // later pieces still run and nothing is paid twice.
         let per = self.passes_per_buffer;
+        let pieces = if per > 0 && work.passes.len() > per {
+            Some(self.dev.newSharedEvent().ok_or("newSharedEvent failed")?)
+        } else {
+            None
+        };
+        let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
+        let mut first = 0;
         for (n, pass) in work.passes.iter().enumerate() {
             let encoded = match pass {
                 Pass::Compute(dispatches) => {
@@ -1211,11 +1226,18 @@ impl GraphicsBackend for Metal {
                     refused = Some(e);
                 }
             }
-            if per > 0 && (n + 1) % per == 0 && n + 1 < work.passes.len() {
-                self.commit_piece(&cb);
-                cb = self.next_piece(queue, work.waits, &mut attached_heaps)?;
+            if let Some(event) = &pieces
+                && (n + 1) % per == 0
+                && n + 1 < work.passes.len()
+            {
+                let piece = ((n + 1) / per) as u64;
+                cb.encodeSignalEvent_value(ProtocolObject::from_ref(&**event), piece);
+                let owed = Owed::of(vec![(event.clone(), piece)], &work.passes[first..=n], 0);
+                self.commit_piece(queue, &cb, owed, piece);
+                first = n + 1;
+                cb = self.next_piece(queue, work.waits, &mut attached_heaps, Some((&**event, piece)))?;
                 if self.trace_fails {
-                    let piece = format!("{label} piece {}", (n + 1) / per);
+                    let piece = format!("{label} piece {}", piece + 1);
                     cb.setLabel(Some(&objc2_foundation::NSString::from_str(&piece)));
                 }
             }
@@ -1226,8 +1248,12 @@ impl GraphicsBackend for Metal {
         for (f, v) in work.signals {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
-        let owed = std::sync::Arc::new(Owed::new(queue, work, set_on_queue));
-        let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
+        let mut events = Vec::with_capacity(work.signals.len() + 1);
+        if set_on_queue {
+            events.push((queue.2.clone(), queue.3.get()));
+        }
+        events.extend(work.signals.iter().map(|(f, v)| (f.0.clone(), *v)));
+        let owed = std::sync::Arc::new(Owed::of(events, &work.passes[first..], work.signals.len()));
         flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
         // A command buffer the GPU fails is logged (the first few), not silently dropped.
         let trace = self.trace_fails;
@@ -1319,23 +1345,49 @@ fn color_attachments(arr: &MTLRenderPipelineColorAttachmentDescriptorArray, d: &
 }
 
 impl Metal {
-    /// Commits a piece of a submission that is not its last ([`GraphicsBackend::submit_passes`]):
-    /// one the GPU fails is logged as the last piece's failure is. What the submission owes is
-    /// paid by its last piece, which runs after this one.
-    fn commit_piece(&self, cb: &ProtocolObject<dyn MTLCommandBuffer>) {
+    /// Commits piece `piece` (from 1) of a submission, not its last ([`GraphicsBackend::submit_passes`]),
+    /// with what it owes: its value writes and the piece event raised to `piece`, which the next
+    /// piece waits for. One the GPU fails is logged as the last piece's failure is and pays that on
+    /// the CPU, so the next piece runs. It is in flight as any command buffer is: one Metal never
+    /// reports on is paid by [`recover_lost`].
+    fn commit_piece(&self, queue: &Queue, cb: &ProtocolObject<dyn MTLCommandBuffer>, owed: Owed, piece: u64) {
+        let owed = std::sync::Arc::new(owed);
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
+        // Tests: a piece the GPU drops, as one it fails (its passes and its event signal not run).
+        #[cfg(test)]
+        let dropped = DROP_PIECE.with(|d| d.get()) == Some(piece);
+        #[cfg(not(test))]
+        let dropped = {
+            let _ = piece;
+            false
+        };
+        let empty;
+        let cb = if dropped {
+            empty = self.new_command_buffer(queue).expect("a command buffer");
+            &*empty
+        } else {
+            cb
+        };
+        flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
         let trace = self.trace_fails;
         let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
-            if let Some(e) = done.error()
+            let error = done.error();
+            landed(serial, queue_id, dropped || error.is_some());
+            if let Some(e) = &error
                 && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < if trace { 200 } else { 20 }
             {
                 if trace {
-                    trace_failure(done, &e);
+                    trace_failure(done, e);
                 } else {
                     eprintln!("metal: command buffer failed: {e:?} ({})", e.localizedDescription());
                 }
+            }
+            if dropped || error.is_some() {
+                owed.recover();
             }
         });
         // SAFETY: the block is retained by Metal until it has run.
@@ -1574,8 +1626,19 @@ impl Owed {
             events.push((queue.2.clone(), queue.3.get()));
         }
         events.extend(work.signals.iter().map(|(f, v)| (f.0.clone(), *v)));
+        Owed::of(events, work.passes, work.signals.len())
+    }
+
+    /// What `passes` owe if they fail: their value writes, then `events` raised (`signals` of them
+    /// the submission's fence signals, for the log).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn of(
+        events: Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>,
+        passes: &[Pass<'_, Metal>],
+        signals: usize,
+    ) -> Owed {
         let mut fills = Vec::new();
-        for pass in work.passes {
+        for pass in passes {
             if let Pass::Blit(ops) = pass {
                 for op in ops {
                     // shortcut: copies are not replayed (one may have partly run and its source
@@ -1587,7 +1650,7 @@ impl Owed {
                 }
             }
         }
-        Owed { recovery: std::sync::Once::new(), events, fills, signals: work.signals.len() }
+        Owed { recovery: std::sync::Once::new(), events, fills, signals }
     }
 
     /// Writes each fill, in order, then raises each event (never lowers it): a waiter that sees
@@ -1713,6 +1776,12 @@ fn recover_lost_after(behind_a_failure: std::time::Duration, anyway: std::time::
 }
 
 static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+std::thread_local! {
+    /// Tests: the piece of this thread's split submissions that the GPU drops, as one it fails.
+    static DROP_PIECE: Cell<Option<u64>> = const { Cell::new(None) };
+}
 /// Tracing: command buffers committed and not yet completed, by serial: when, and what they carry.
 static IN_FLIGHT: std::sync::Mutex<std::collections::BTreeMap<u64, (std::time::Instant, String)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -3009,6 +3078,57 @@ mod owed_tests {
         assert!(m.wait(&fence, 2, 5000));
     }
 
+    /// A piece of a split submission that the GPU fails (here one the test drops: its passes and
+    /// its release of the next piece do not run, as when the GPU fails it) pays its own value
+    /// writes on the CPU and lets the next piece go; the later pieces still run on the GPU, and the
+    /// fence is signalled by the last one. Nothing is paid twice: a write made after the fence was
+    /// reached stays.
+    #[test]
+    fn a_failed_earlier_piece_pays_its_own_writes_and_the_later_pieces_still_run() {
+        let _shared = FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
+        let m = Metal::new().unwrap().with_passes_per_buffer(4);
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        // SAFETY: inside the region; the GPU is idle.
+        let at = |o: usize| unsafe { region.ptr.add(o) as *const u8 };
+        let q = m.create_queue().unwrap();
+        q.1.set(true); // as with the pool's residency set: the order event is in play
+        let fence = m.create_fence(0).unwrap();
+        // 12 passes, three pieces of 4: pass n fills its own 8 bytes with n + 1.
+        let passes: Vec<_> = (0..12u8)
+            .map(|n| Pass::Blit(vec![BlitOp::Fill { dst: (&buf, at(usize::from(n) * 8)), len: 8, value: n + 1 }]))
+            .collect();
+        let check = |first: u8, signal: u64| {
+            DROP_PIECE.with(|d| d.set(Some(1)));
+            let before = m.command_buffers();
+            let signals = [(&fence, signal)];
+            m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }).unwrap();
+            DROP_PIECE.with(|d| d.set(None));
+            assert_eq!(m.command_buffers() - before, 3);
+            assert!(m.wait(&fence, signal, 5000), "the later pieces did not run");
+            // SAFETY: inside the region; the GPU is done with it.
+            let bytes = unsafe { std::slice::from_raw_parts(region.ptr, 12 * 8) };
+            for n in 0..12 {
+                assert_eq!(&bytes[n * 8..][..8], &[n as u8 + first; 8], "pass {n}");
+            }
+        };
+        check(1, 1);
+        // The title writes over the first piece's words once it has seen the fence: a second
+        // payment of the failed piece would undo that.
+        // SAFETY: inside the region; the GPU is done with it.
+        unsafe { std::ptr::write_bytes(region.ptr, 0xCD, 8) };
+        let after = [(&fence, 2)];
+        m.submit_passes(&q, &PassSubmission { waits: &[], passes: &[], signals: &after }).unwrap();
+        assert!(m.wait(&fence, 2, 5000));
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, [0xCD; 8], "paid twice");
+        assert_eq!(q.2.signaledValue(), 2, "the order event went past what the submissions owe");
+        // Again from zeros: the failed piece's words come from the CPU, the rest from the GPU.
+        // SAFETY: inside the region; the GPU is idle.
+        unsafe { std::ptr::write_bytes(region.ptr, 0, 12 * 8) };
+        check(1, 3);
+    }
+
     #[test]
     fn a_failed_command_buffer_is_paid_on_the_cpu() {
         let m = Metal::new().unwrap();
@@ -3352,7 +3472,7 @@ mod heap_set_tests {
         let mut attached = Vec::new();
         assert!(attaches(&mut attached), "the first piece");
         assert!(!attaches(&mut attached), "once per command buffer");
-        let _next = m.next_piece(&q, &[], &mut attached).unwrap();
+        let _next = m.next_piece(&q, &[], &mut attached, None).unwrap();
         assert!(attaches(&mut attached), "the next piece is given the heap's set too");
     }
 

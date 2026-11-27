@@ -11186,7 +11186,9 @@ impl<'a> Lower<'a> {
         }
         // With a16, two 16-bit components per VGPR, low half first, after
         // the offset, bias and compare value, which keep a VGPR each (an f16
-        // bias in its low half).
+        // bias in its low half), and after explicit gradients, which stay
+        // 32-bit (only the `_g16` opcodes, not translated, pack them; LLVM
+        // sizes `image_sample_d` with a16 so on gfx1010 to gfx1030, #320).
         let extra = name
             .strip_prefix("image_sample")
             .or_else(|| name.strip_prefix("image_gather4"))
@@ -11195,10 +11197,20 @@ impl<'a> Lower<'a> {
                     .filter(|t| matches!(*t, "o" | "b" | "c"))
                     .count()
             });
+        let gradients = name.strip_prefix("image_sample").map_or(0, |rest| {
+            let mut tokens = rest.split('_');
+            if !tokens.clone().any(|t| t == "g16") && tokens.any(|t| t == "d" || t == "cd") {
+                // Two per direction on a cube's face, else one per spatial coordinate.
+                if kind == 5 { 4 } else { 2 * (coords - usize::from(kind == 6 || kind == 7)) }
+            } else {
+                0
+            }
+        });
+        let whole = extra + gradients;
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
-            let packed = *a16 && k >= extra;
+            let packed = *a16 && k >= whole;
             let r = *regs
-                .get(if packed { extra + (k - extra) / 2 } else { k })
+                .get(if packed { whole + (k - whole) / 2 } else { k })
                 .ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
             let x = l.i32_of(v)?;
@@ -11206,7 +11218,7 @@ impl<'a> Lower<'a> {
                 return Ok(x);
             }
             let c = l.cur;
-            let half = (k - extra) as u32 % 2;
+            let half = (k - whole) as u32 % 2;
             let (sh, mask) = (l.s.m.i32(16 * half), l.s.m.i32(0xFFFF));
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
@@ -11731,16 +11743,13 @@ impl<'a> Lower<'a> {
                     )
                 }
                 63 => {
-                    // With a16 each direction's gradients start a VGPR.
-                    if *a16 && spatial % 2 == 1 {
-                        return Err("16-bit gradients of a 1D or 3D image");
-                    }
+                    // The gradients are 32-bit, with a16 too.
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
                         let x = addr_val(self, first + k)?;
-                        g[k] = to_float(self, x);
+                        g[k] = self.as_float(x);
                         let y = addr_val(self, first + spatial + k)?;
-                        g[3 + k] = to_float(self, y);
+                        g[3 + k] = self.as_float(y);
                     }
                     args.extend(&os);
                     args.extend(g);

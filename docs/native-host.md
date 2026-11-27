@@ -1243,21 +1243,61 @@ Title memory is mapped at its own addresses in this process. A view whose range 
 without a gap, but not as one run of a pool, now wraps those addresses (`NativeHost::title_alias`:
 the backend's `wrap_title_memory` over whole 16 KiB host pages, the alignment the no-copy wrap
 needs). The wrap is an allocation the heap entry names, so it is resident as the pool buffers are,
-with residency sets or by per-encoder naming (`heap_entry`). It aliases title memory, so it adds no
-memory. A wrap is reused while the mappings under it are the same (`PoolTable::signature`, a hash of
-the mappings the range crosses), made again when they change; the last 64 are kept, and all are
-dropped when a pool is released (the heap entries that show one keep it alive themselves). A view
-with a real gap (part of its range not mapped) stays the null view, logged at info level (`a buffer
-view over title memory with a gap stays the null view`, first 64). Test: `tests::a_buffer_view_across_title_pages_out_of_pool_order_reads_the_title_mapping`. Two title
-pages, mapped for real at a title address from pool pages 2 then 1, hold 64 words across the page
-boundary. A compute shader reads them through a heap view: it now gets them, and was refused the
-view before. shortcut: the wrap is made when the entry is mirrored. A later remap of those title
-pages to other pool pages is seen only when the entry is mirrored again; drop the aliases that a
-pool-table change touches if a title is found to remap a viewed range in place.
+with residency sets or by per-encoder naming (`heap_entry`). A wrap is reused while the mappings
+under it are the same (`PoolTable::signature`, a hash of the mappings the range crosses), made
+again when they change. Every wrap a heap entry shows stays in that cache, with 64 others at most,
+and the wraps over a released pool's pages are dropped from it (the heap entries that show one keep
+it alive themselves). Dropping the whole cache at each pool release, as the first version did, made
+a new wrap of the same range each time the entry was mirrored again, while the old ones stayed
+alive in heap entries and work in flight: in the 80 s after the world loaded, the 174 MiB view was
+wrapped 5 times with the same signature, the 50 MiB one 10 times and a 24 MiB one 17 times (the
+log stops at 32), and that run ended in GPU timeouts and an out-of-memory error. A view with a real gap (part of its range not
+mapped) stays the null view, logged at info level (`a buffer view over title memory with a gap
+stays the null view`, first 64). Test: `tests::a_buffer_view_across_title_pages_out_of_pool_order_reads_the_title_mapping`.
+Two title pages, mapped for real at a title address from pool pages 2 then 1, hold 64 words across
+the page boundary. A compute shader reads them through a heap view: it now gets them, and was
+refused the view before.
 
-In game, the 174 MB view is wrapped (logged once, `a buffer view not linear in its pool reads the
-title's own mapping`), with no GPU errors. The G-buffer's mesh records still stay zero after the GPU
-has run the frame, so this was one input the cullers lacked, not the last one.
+What a wrap costs: it shows the title's own physical pages, so it adds no memory to the process
+and takes no process address space (Metal gives it a GPU address range of its size). Measured on a
+174 MiB view of title pages mapped in descending pool order (a local test): the process footprint
+(`phys_footprint`) stayed at 241 MiB through the wrap and two dispatches that read through it.
+Metal's `currentAllocatedSize` counts the wrap once more (+174 MiB), as it counts each pool buffer
+over the same pages. In game (M5 Pro, Series S), each large wrap is logged with both numbers
+before and after (`a large buffer view wraps the title's own pages`, views from 16 MiB, first 32):
+the 174 MiB view (entry 17) at +4 s, footprint 769,473,040 bytes before and after, Metal's count
++182,452,224; the 50 MiB view (entry 9936) at +29 s, footprint 4,156,533,456 before and after,
+Metal's count +52,428,800.
+
+What a wrap reads once the title changes its pages: the no-copy wrap keeps the physical pages it
+was made over. After the title maps other pool pages at those addresses, or unmaps them, the GPU
+still reads and writes the old pages through it, with no fault and no zeros (M5 Pro, macOS 27).
+So the host follows the title's pages (`NativeHost::follow_title_pages`): at each submission, if the
+pool table changed since it last looked (one comparison otherwise), every heap entry that shows a
+wrap, or that was left null for a gap, is mirrored again when the signature of the mappings under
+it has changed (`NativeHeap::title_views` keeps each one's range and signature). A remapped range
+gets a new wrap, a range with a page unmapped becomes the null view, and a gap the title maps later
+is wrapped then (logged: `a heap buffer view's title pages changed: mirrored again`, the first 64
+of views from 16 MiB and of smaller ones each). An entry the title has since filled with another
+record (plain stores) is dropped from the list. It
+matters for entries a shader loads from the heap itself, which no bound table brings back to
+`remirror_tables` (the cullers' entry 17), and for an entry the title writes once while it keeps
+mapping pages into the range (Ketan-Kapse's fork saw that, #258). Here the title does not remap
+entry 17: in a 300 s world run its signature was the same at the 1st, 10th, 100th and 1,000th look
+(`following the title's pages under heap buffer views`, logged at those looks with the views from
+16 MiB; pool-table generation 6,742 to 321,276), and each of the three large views was wrapped once.
+The pool table changed about 2,600 times a second in that run, so a look runs at most once per
+submission. Test:
+`tests::a_wrapped_view_follows_title_pages_remapped_or_unmapped_under_it` maps a view's second
+page to another pool page, then unmaps it: the view reads the new page, then zeros. Without the
+step it read the old page both times. Limits: work submitted before the change still reads the old
+pages; a range partly unmapped reads zeros as a whole, where a reserved resource reads zeros only
+at its unmapped tiles (marked shortcut in `title_alias`).
+
+In game, the G-buffer's mesh records stayed zero after the GPU ran the frame with this change
+alone, as read from the CPU (a read the reset pass makes meaningless, #258). With #253 and the
+view-stride table (#264) as well, the G-buffer's targets are 11 to 15 % covered in a warm world
+run, against 0 to 8 % before.
 
 ## Descriptor dwords read as data
 

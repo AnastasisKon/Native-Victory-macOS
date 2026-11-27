@@ -200,11 +200,45 @@ fn sym<T: Copy>(h: *mut c_void, name: &str) -> T {
 /// Where Apple's installer puts the converter (universal binary); `VICTORY_MSC_DYLIB` overrides.
 pub const DEFAULT_DYLIB: &str = "/usr/local/lib/libmetalirconverter.dylib";
 
+/// The converter to load, and whether `VICTORY_MSC_DYLIB` named it (an empty value counts as
+/// unset, as in `native-setup.sh`).
+fn dylib_path(var: Option<String>) -> (String, bool) {
+    match var.filter(|v| !v.is_empty()) {
+        Some(v) => (v, true),
+        None => (DEFAULT_DYLIB.into(), false),
+    }
+}
+
+/// The start-up line naming the loaded converter (`id`: its path, size and modification time),
+/// and a warning when it is not the installed default. The library exposes no version to log:
+/// its Mach-O current version is 0.0.0 and the C API has no version call.
+fn load_note(path: &str, from_var: bool, id: &str) -> (String, Option<String>) {
+    let source = if from_var { "VICTORY_MSC_DYLIB" } else { "the installed default" };
+    let note = format!("metal: shader converter {id} (from {source})");
+    let warn = (path != DEFAULT_DYLIB).then(|| {
+        format!(
+            "metal: the shader converter is not {DEFAULT_DYLIB}; a copy other than Apple's package \
+             may convert shaders differently (a non-Apple copy drew no loading-screen art, #295)"
+        )
+    });
+    (note, warn)
+}
+
 impl Msc {
     /// Opens `VICTORY_MSC_DYLIB` if set, else the installed default.
+    /// Logs, once per run, which converter it loaded (#295: a non-Apple copy drew no loading art).
     pub fn try_open_default() -> Result<Msc, String> {
-        let path = std::env::var("VICTORY_MSC_DYLIB").unwrap_or_else(|_| DEFAULT_DYLIB.into());
-        Msc::open(&path).map_err(|e| format!("dlopen {path}: {e}"))
+        let (path, from_var) = dylib_path(std::env::var("VICTORY_MSC_DYLIB").ok());
+        let msc = Msc::open(&path).map_err(|e| format!("dlopen {path}: {e}"))?;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let (note, warn) = load_note(&path, from_var, &msc.id);
+            tracing::info!("{note}");
+            if let Some(w) = warn {
+                tracing::warn!("{w}");
+            }
+        });
+        Ok(msc)
     }
 
     /// Opens `VICTORY_MSC_DYLIB` if set, else the installed default, panicking on failure.
@@ -459,5 +493,30 @@ impl Msc {
             }
             res
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_converter_path_is_the_override_if_set_else_the_default() {
+        assert_eq!(dylib_path(None), (DEFAULT_DYLIB.into(), false));
+        assert_eq!(dylib_path(Some(String::new())), (DEFAULT_DYLIB.into(), false));
+        assert_eq!(dylib_path(Some("/x/libmetalirconverter.dylib".into())), ("/x/libmetalirconverter.dylib".into(), true));
+    }
+
+    #[test]
+    fn the_load_note_names_its_source_and_warns_only_off_the_default_path() {
+        let (note, warn) = load_note(DEFAULT_DYLIB, false, "id");
+        assert!(note.contains("id (from the installed default)"), "{note}");
+        assert!(warn.is_none());
+        // The variable naming the default path itself is not warned about.
+        let (note, warn) = load_note(DEFAULT_DYLIB, true, "id");
+        assert!(note.contains("from VICTORY_MSC_DYLIB"), "{note}");
+        assert!(warn.is_none());
+        let (_, warn) = load_note("/ue/libmetalirconverter.dylib", true, "id");
+        assert!(warn.unwrap().contains(DEFAULT_DYLIB));
     }
 }

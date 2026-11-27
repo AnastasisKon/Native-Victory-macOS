@@ -658,6 +658,7 @@ pub(crate) fn present(queue: This, resource: This) {
     if tracing_targets() {
         trace_present(resource);
     }
+    pass_present(resource);
     let shown = with_title(|t| {
         let _ = t.ensure_queue(queue as usize);
         t.present(queue as usize, resource as usize)
@@ -762,6 +763,9 @@ pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4], rects: &[crate
             && let Some((texture, _)) = t.target_of(record)
         {
             trace_bump(record.resource as usize, 1);
+            if pass_on() {
+                pass_note_op(l, &format!("clear-rtv {color:?} rects={}", rects.len()), None, Some(record.resource as usize));
+            }
             if rects.is_empty() {
                 l.list.clear_render_target(&texture, color);
             } else {
@@ -799,6 +803,9 @@ pub(crate) fn clear_dsv(this: This, handle: u64, flags: u32, depth: f32, stencil
     with_list(this, |t, l| {
         if let Some(tex) = t.texture_of(record.resource as usize) {
             trace_bump(record.resource as usize, 1);
+            if pass_on() {
+                pass_note_op(l, &format!("clear-dsv flags={flags} depth={depth}"), None, Some(record.resource as usize));
+            }
             l.list.clear_depth_stencil(
                 &tex,
                 (flags & 1 != 0).then_some(depth),
@@ -996,6 +1003,177 @@ fn put_off(what: String, translate: impl FnOnce() + Send + 'static) {
     });
 }
 
+// Pass trace (`VICTORY_TRACE_PASSES=<dir>,<skip>,<presents>`, docs/native-host.md): every draw,
+// dispatch, clear and copy of a few world frames in queue order (`PASS`), the commands the host
+// could not prepare (`PASSFAIL`), and at the window's last present each texture they named
+// (`PASSTEX`, with a .ppm in <dir>). Off unless the variable is set: callers test `pass_on()`
+// before building a line, so with it unset no line is formatted and nothing is kept.
+use super::pass_on;
+static PASS_KEYS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+// Why the last draw on this thread was dropped, for its `PASS` line.
+thread_local! { static LAST_WHY: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") }; }
+
+/// `VICTORY_TRACE_PASSES`' value: the folder for images, how many world presents to let pass
+/// first, and how many presents the window lasts after the one that opens it.
+fn pass_config(v: &str) -> (String, u64, i64) {
+    let mut parts = v.split(',');
+    let dir = parts.next().filter(|d| !d.is_empty()).unwrap_or(".").to_owned();
+    let skip = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(100);
+    let presents = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(4);
+    (dir, skip, presents)
+}
+
+#[cfg(test)]
+#[test]
+fn pass_trace_reads_its_switch_and_stays_off_without_it() {
+    assert_eq!(pass_config("/tmp/p,8,5"), ("/tmp/p".into(), 8, 5));
+    assert_eq!(pass_config("/tmp/p"), ("/tmp/p".into(), 100, 4));
+    assert_eq!(pass_config(",x,"), (".".into(), 100, 4));
+    // No test sets `VICTORY_TRACE_PASSES`, so the window never opens and nothing is noted.
+    assert!(!pass_on());
+}
+
+fn pass_tex(k: usize) -> String {
+    match crate::resource::texture_info(k as This) {
+        Some(i) => format!("{k:#x}:f{}:{}x{}@{:#x}", i.format, i.width, i.height, i.memory as usize),
+        None => format!("{k:#x}:?"),
+    }
+}
+
+/// One piece of work, as it is recorded: its shaders, targets and the textures its tables name.
+fn pass_note(t: &MetalTitle, l: &mut MetalList, kind: &str, outcome: &str, compute: bool, n: u32) {
+    let sh = stage_hashes(l.pipeline);
+    let (reads, writes, none, keys) = if compute {
+        t.host.pass_views(l.list.compute_args(), &[])
+    } else {
+        let (root, binding) = l.list.graphics_args();
+        let mut limits: Vec<(u8, usize)> = Vec::new();
+        if let Some(b) = binding.filter(|_| outcome.starts_with("ran")) {
+            limits.extend(b.table_entries.iter().copied());
+            if let Some(ps) = &b.ps {
+                limits.extend(ps.table_entries.iter().copied());
+            }
+            if limits.is_empty() { limits.push((255, 0)); }
+        }
+        t.host.pass_views(root, &limits)
+    };
+    let tg: Vec<String> = if compute { Vec::new() } else { l.target_keys.iter().map(|&k| pass_tex(k)).collect() };
+    {
+        let mut ks = PASS_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+        for k in keys.iter().chain(if compute { [].iter() } else { l.target_keys.iter() }) {
+            if !ks.contains(k) { ks.push(*k); }
+        }
+    }
+    let at = l.list.cmds.len();
+    l.list.notes.push((at, format!("kind={kind} n={n} out={outcome:?} sh={sh:?} tg={tg:?} rd={reads:?} wr={writes:?} none={none} topo={}", l.topology)));
+}
+
+fn pass_note_op(l: &mut MetalList, what: &str, src: Option<usize>, dst: Option<usize>) {
+    {
+        let mut ks = PASS_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+        for k in src.iter().chain(dst.iter()) {
+            if !ks.contains(k) { ks.push(*k); }
+        }
+    }
+    let at = l.list.cmds.len();
+    l.list.notes.push((at, format!("kind={what} src={:?} dst={:?}", src.map(pass_tex), dst.map(pass_tex))));
+}
+
+/// At each present: switch the window on and off, and while on write every texture the window's
+/// work named: its range, how much is non-zero and not finite, and (colour formats) an image.
+fn pass_present(resource: This) {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static LEFT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+    static NUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static CONFIG: OnceLock<Option<(String, u64, i64)>> = OnceLock::new();
+    let Some((dir, skip, presents)) =
+        CONFIG.get_or_init(|| std::env::var("VICTORY_TRACE_PASSES").ok().map(|v| pass_config(&v)))
+    else {
+        return;
+    };
+    let (skip, presents) = (*skip, *presents);
+    let num = NUM.fetch_add(1, Ordering::Relaxed);
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+    let left = LEFT.load(Ordering::Relaxed);
+    // `skip` counts world presents (500 draws or more recorded since the last present).
+    static LASTREC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let rec = RECORDED.load(Ordering::Relaxed);
+    if rec - LASTREC.swap(rec, Ordering::Relaxed) >= 500 {
+        WORLD.fetch_add(1, Ordering::Relaxed);
+    }
+    if left == i64::MIN {
+        if WORLD.load(Ordering::Relaxed) >= skip {
+            LEFT.store(presents, Ordering::Relaxed);
+            super::PASS_ON.store(true, Ordering::Relaxed);
+            eprintln!("PASSWINDOW start present={num} t={now}");
+        }
+        return;
+    }
+    if left < 0 {
+        return;
+    }
+    eprintln!("PASSPRESENT present={num} left={left} resource={}", pass_tex(resource as usize));
+    let dump = left == 0 || std::env::var("VICTORY_TRACE_PASSES_DUMP_EACH").is_ok();
+    if left == 0 {
+        super::PASS_ON.store(false, Ordering::Relaxed);
+    }
+    LEFT.store(left - 1, Ordering::Relaxed);
+    if !dump {
+        return;
+    }
+    let mut keys = PASS_KEYS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if !keys.contains(&(resource as usize)) { keys.push(resource as usize); }
+    with_title(|t| {
+        for key in keys {
+            let Some(info) = crate::resource::texture_info(key as This) else { continue };
+            let (w, h) = (info.width as usize, info.height as usize);
+            let bpp = match info.format { 2 => 16, 10 | 11 | 16 => 8, 24 | 26 | 28 | 29 | 34 | 41 | 42 | 67 | 87 | 91 => 4, 49 | 54 | 56 | 57 => 2, 61 | 62 | 65 => 1, _ => 0 };
+            if bpp == 0 || w * h == 0 || w * h > 3840 * 2160 || info.depth_or_layers > 1 && info.format != 28 {
+                eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} layers={} skipped", info.format, info.depth_or_layers);
+                continue;
+            }
+            let Some(tex) = t.texture_of(key) else {
+                eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} no host texture", info.format);
+                continue;
+            };
+            let mut raw = vec![0u8; w * h * bpp];
+            victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut raw, w * bpp, w * h * bpp);
+            let nonzero = raw.chunks_exact(bpp).filter(|p| p.iter().any(|&b| b != 0)).count() as f64 / (w * h) as f64;
+            let name = format!("p{num}_{key:x}_f{}_{w}x{h}.ppm", info.format);
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            let mut extra = String::new();
+            match info.format {
+                2 | 10 | 24 | 26 => {
+                    let rgb: Vec<[f32; 3]> = raw.chunks_exact(bpp).map(|p| decode_hdr(info.format, p)).collect();
+                    let (mut max, mut min, mut sum, mut bad, mut neg) = (f32::MIN, f32::MAX, 0f64, 0usize, 0usize);
+                    for v in rgb.iter().flatten() {
+                        if !v.is_finite() { bad += 1; continue; }
+                        max = max.max(*v); min = min.min(*v); sum += f64::from(*v); neg += usize::from(*v < 0.0);
+                    }
+                    // format 10: count infinities and NaNs by their bits (decode_hdr folds inf).
+                    let mut nan16 = 0usize;
+                    if info.format == 10 {
+                        nan16 = raw.chunks_exact(2).filter(|p| u16::from_le_bytes([p[0], p[1]]) & 0x7c00 == 0x7c00).count();
+                    }
+                    extra = format!(" max={max} min={min} mean={} notfinite={bad} infnan16={nan16} negative={neg}", sum / (rgb.len() * 3).max(1) as f64);
+                    out.extend(rgb.iter().flat_map(|c| c.map(|v| if v.is_finite() && v > 0.0 { ((v / (1.0 + v)).sqrt() * 255.0) as u8 } else { 0 })));
+                }
+                28 | 29 | 87 | 91 => {
+                    let bgra = matches!(info.format, 87 | 91);
+                    out.extend(raw.chunks_exact(4).flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
+                }
+                _ => {
+                    // Any other: the low byte of up to three channels, as grey or colour.
+                    out.extend(raw.chunks_exact(bpp).flat_map(|p| [p[0], p[bpp / 2], p[bpp - 1]]));
+                }
+            }
+            let _ = std::fs::write(std::path::Path::new(dir).join(&name), out);
+            eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} at={:#x} nonzero={nonzero:.4}{extra} file={name}", info.format, info.memory as usize);
+        }
+    });
+}
+
 /// Work dropped because its pipeline has no host pipeline.
 static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1027,6 +1205,9 @@ pub(crate) fn trace_reason(why: &'static str) {
 /// Counts a draw or dispatch the host drops, and warns the first time for each `why`.
 fn dropped(why: &'static str) {
     DROPPED.fetch_add(1, Ordering::Relaxed);
+    if pass_on() {
+        LAST_WHY.with(|w| w.set(why));
+    }
     warn_once(why);
     trace_reason(why);
 }
@@ -1223,6 +1404,9 @@ pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
     with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
         Pipe::Compute(pso) => {
             trace_record_dispatch(t, l, "ran");
+            if pass_on() {
+                pass_note(t, l, &format!("dispatch[{x},{y},{z}]"), "ran", true, 1);
+            }
             l.list.set_compute_pipeline(&pso);
             if let Err(e) = l.list.dispatch(x, y, z) {
                 tracing::warn!(error = %e, "dispatch");
@@ -1235,8 +1419,11 @@ pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
 /// A dispatch dropped for want of a host compute pipeline; with `VICTORY_TRACE_TARGETS`, counted
 /// by its shader, `how` (group counts, or indirect) and the textures its tables hold as
 /// unordered-access views (what it may have written) for the frame line.
-fn dropped_dispatch(t: &MetalTitle, l: &MetalList, how: &str) {
+fn dropped_dispatch(t: &MetalTitle, l: &mut MetalList, how: &str) {
     dropped("a dispatch without a host compute pipeline");
+    if pass_on() {
+        pass_note(t, l, &format!("dispatch {how}"), "a dispatch without a host compute pipeline", true, 1);
+    }
     trace_record_dispatch(t, l, "dropped");
     if tracing_targets() {
         let uavs: Vec<String> = t
@@ -1266,12 +1453,20 @@ fn stage_hashes(pipeline: usize) -> Vec<String> {
 pub(crate) fn dispatch_threads(this: This, threads: [u32; 3]) {
     with_list(this, |t, l| match thread_pipe(t, l.pipeline) {
         Pipe::Compute(pso) => {
+            if pass_on() {
+                pass_note(t, l, &format!("dispatch-threads{threads:?}"), "ran", true, 1);
+            }
             l.list.set_compute_pipeline(&pso);
             if let Err(e) = l.list.dispatch_threads(threads) {
                 tracing::warn!(error = %e, "dispatch of thread counts");
             }
         }
-        _ => dropped("a dispatch of thread counts without a host compute pipeline"),
+        _ => {
+            dropped("a dispatch of thread counts without a host compute pipeline");
+            if pass_on() {
+                pass_note(t, l, &format!("dispatch-threads{threads:?}"), "a dispatch of thread counts without a host compute pipeline", true, 1);
+            }
+        }
     });
 }
 
@@ -1422,6 +1617,23 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
 /// `mesh`: the call is a mesh dispatch, which only a mesh pipeline runs (and a draw only a vertex
 /// pipeline).
 fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
+    if !pass_on() {
+        return graphics_inner(t, l, mesh);
+    }
+    LAST_WHY.with(|w| w.set(""));
+    let r = graphics_inner(t, l, mesh);
+    let why = LAST_WHY.with(|w| w.get());
+    let out = match r {
+        Some(true) => "ran-rect",
+        Some(false) => "ran",
+        None if why.is_empty() => "dropped: a mesh pipeline without a vertex stage",
+        None => why,
+    };
+    pass_note(t, l, if mesh { "mesh" } else { "draw" }, out, false, 1);
+    r
+}
+
+fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
     if !l.targets_ready {
         dropped("a draw of a pass whose render targets the host cannot make");
         trace_drop(l);
@@ -1545,6 +1757,9 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
             if rect {
                 // shortcut: indexed rectangle lists are not drawn.
                 dropped("an indexed rectangle-list draw");
+                if pass_on() {
+                    pass_note_op(l, "DROPPED-indexed-rect-list", None, None);
+                }
                 trace_drop(l);
                 return;
             }
@@ -1582,6 +1797,9 @@ pub(crate) fn execute_indirect(
                 if graphics(t, l, true).is_none() {
                     return;
                 }
+                if pass_on() {
+                    pass_note_op(l, &format!("mesh-records n={max} counted={}", count.is_some()), None, None);
+                }
                 if tracing_record_writers() {
                     let zero = (0..max)
                         .filter(|&i| super::textures::read_memory(at(i) as *const u8, 4).iter().all(|&b| b == 0))
@@ -1608,6 +1826,9 @@ pub(crate) fn execute_indirect(
             with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
                 Pipe::Compute(pso) => {
                     trace_record_dispatch(t, l, "ran");
+                    if pass_on() {
+                        pass_note(t, l, "dispatch-indirect", "ran", true, max);
+                    }
                     l.list.set_compute_pipeline(&pso);
                     for i in 0..max {
                         let r = match count {
@@ -1629,6 +1850,9 @@ pub(crate) fn execute_indirect(
                 // shortcut: an indexed rectangle list is not drawn, as directly.
                 Some(true) if command == Command::DrawIndexed => {
                     dropped("an indirect rectangle-list draw");
+                    if pass_on() {
+                        pass_note_op(l, &format!("DROPPED-indirect-rect-list n={max}"), None, None);
+                    }
                     trace_drop(l);
                     true
                 }
@@ -1919,6 +2143,9 @@ pub(crate) fn copy_texture_resource(this: This, dst: This, src: This) -> bool {
             }
         }
         copied(t, "CopyResource", src, Some(dst));
+        if pass_on() {
+            pass_note_op(l, "copy-resource", Some(src as usize), Some(dst as usize));
+        }
         true
     })
     .unwrap_or(false)
@@ -1984,6 +2211,9 @@ pub(crate) fn copy_texture_region(
                     dst_origin,
                 );
                 copied(t, "CopyTextureRegion", src.resource, Some(dst.resource));
+                if pass_on() {
+                    pass_note_op(l, "copy-region", Some(src.resource as usize), Some(dst.resource as usize));
+                }
                 true
             })
             .unwrap_or(false)
@@ -2034,6 +2264,9 @@ pub(crate) fn copy_texture_region(
                     dst_origin,
                 );
                 copied(t, "CopyTextureRegion", src.resource, Some(dst.resource));
+                if pass_on() {
+                    pass_note_op(l, "copy-region", Some(src.resource as usize), Some(dst.resource as usize));
+                }
                 true
             })
             .unwrap_or(false)
@@ -2073,6 +2306,9 @@ pub(crate) fn copy_texture_region(
                     slice_pitch,
                 );
                 copied(t, "CopyTextureRegion", src.resource, None);
+                if pass_on() {
+                    pass_note_op(l, "copy-to-buffer", Some(src.resource as usize), None);
+                }
                 true
             })
             .unwrap_or(false)

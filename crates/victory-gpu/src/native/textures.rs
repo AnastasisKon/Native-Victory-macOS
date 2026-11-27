@@ -1184,6 +1184,10 @@ impl<B: PresentBackend> Title<B> {
                 }
                 t.blank = r.blank;
             }
+            // Pass trace: uploads from title memory into textures the GPU writes (targets, UAVs).
+            if super::pass_on() && (t.info.render_target() || t.info.flags & UNORDERED_ACCESS != 0) {
+                eprintln!("PASSUPLOAD key={key:#x} fmt={} {}x{} at={:#x} rt={} uav={} uploads={} blank={} unreadable={}", t.info.format, t.info.width, t.info.height, t.info.memory as usize, t.info.render_target(), t.info.flags & UNORDERED_ACCESS != 0, t.uploads, r.blank, r.unreadable);
+            }
             upload_levels(&host.backend, &t.texture, &levels);
             t.last = Some(r.hash);
             match detiled {

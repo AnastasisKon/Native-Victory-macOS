@@ -537,6 +537,11 @@ difference `S0 - S1`, wrapping, negated when negative as a signed number, and SC
 result is not 0. `addr_tests::absdiff_is_the_magnitude_of_the_signed_difference_on_the_gpu`
 (`victory-gpu`) runs it on Metal, wrapping cases included.
 
+The VOP3 carry-out forms of the same (`v_add_co_u32`/`v_sub_co_u32`/`v_subrev_co_u32`, the only
+ones of the family whose encoding carries the clamp bit) saturate the same way now, in their own
+lowering arm; their carry-in (`_ci_`) forms and `omod` stay refused. Test:
+`gfx_refusal_tests::an_integer_add_or_sub_with_clamp_saturates`.
+
 ## 16-bit reads of inputs not marked 16-bit
 
 A pixel shader that interpolates an attribute with `v_interp_p1ll_f16`/`v_interp_p2_f16`, or

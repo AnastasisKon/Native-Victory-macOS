@@ -3159,3 +3159,37 @@ fn a_wave64_relay_skip_on_exec_lo_alone_does_not_make_an_edge_unneeded() {
     let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err.contains("lane-mask join") && err.contains("0x48"), "{err:?}");
 }
+/// An integer add/sub with the clamp bit saturates (RDNA2 ISA 6.5: an integer result with
+/// clamp saturates to the type's range, the form LLVM's uaddsat/usubsat select to), so
+/// `v_add_co_u32` / `v_sub_co_u32` with clamp lower instead of being refused as
+/// "integer output modifiers" (3 compute shaders in the #265/#280/#313 logs). omod on an
+/// integer op, and clamp on a multiply, stay refused under the same name.
+#[test]
+fn an_integer_add_or_sub_with_clamp_saturates() {
+    // VOP3 `op vdst, src0, src1, src2`, clamp in w0 bit 15, omod in w1 bits 27-28.
+    let vop3 = |op: u32, vdst: u8, s0: u32, s1: u32, clamp: bool, omod: u32| {
+        [
+            0x35 << 26 | op << 16 | vdst as u32 | u32::from(clamp) << 15,
+            s0 | s1 << 9 | 0x100 << 18 | omod << 27,
+        ]
+    };
+    const MRT0: [u32; 2] = [0xF800_180F, 0x0101_0101]; // exp mrt0 v1, v1, v1, v1 done vm
+    const END: u32 = 0xBF81_0000; // s_endpgm
+    let vgpr = |n: u8| 256 + n as u32;
+    let ps = |body: &[u32]| {
+        lower_ps(&[body, &MRT0[..], &[END]].concat(), false, vec![], vec![], 0, 0, vec![], false)
+    };
+    // v_add_co_u32 (VOP3 0x30f), v_sub_co_u32 (0x310), v_subrev_co_u32 (0x319): clamp lowers.
+    for op in [0x30F, 0x310, 0x319] {
+        ps(&vop3(op, 1, vgpr(1), vgpr(2), true, 0))
+            .unwrap_or_else(|e| panic!("op {op:#x} with clamp: {e}"));
+    }
+    // omod on an integer add, and clamp on a multiply (v_mul_lo_u32, 0x169), stay refused.
+    for words in [
+        vop3(0x30F, 1, vgpr(1), vgpr(2), false, 1),
+        vop3(0x169, 1, vgpr(1), vgpr(2), true, 0),
+    ] {
+        let err = ps(&words).err().expect("refused").to_string();
+        assert!(err.contains("integer output modifiers"), "{err}");
+    }
+}

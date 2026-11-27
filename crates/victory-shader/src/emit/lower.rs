@@ -649,7 +649,15 @@ fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
 const ATOMIC_SUB: u32 = u32::MAX - 1;
 
 /// Integer operations whose clamp bit `Lower::integer` follows (unsigned saturation).
-const SATURATING: [&str; 3] = ["v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32"];
+const SATURATING: [&str; 6] = [
+    "v_add_nc_u32",
+    "v_sub_nc_u32",
+    "v_subrev_nc_u32",
+    // The VOP3 carry-out forms, the only ones of the family whose encoding carries the clamp bit.
+    "v_add_co_u32",
+    "v_sub_co_u32",
+    "v_subrev_co_u32",
+];
 
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
@@ -4637,7 +4645,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        // `integer` saturates the results of `SATURATING` itself.
+        // `integer` and the carry-out add/sub arm saturate the results of `SATURATING` themselves.
         if (v.clamp && !SATURATING.contains(&inst.name())) || v.omod != 0 {
             return Err("integer output modifiers");
         }
@@ -9484,6 +9492,21 @@ impl<'a> Lower<'a> {
                     None
                 };
                 let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
+                // The clamp bit saturates the sum or difference (uaddsat/usubsat), as in
+                // `integer` for the `SATURATING` names; the carry-in forms stay refused.
+                let r = if v.clamp && cin.is_none() && SATURATING.contains(&inst.name()) {
+                    if name.starts_with("v_add") {
+                        let wrapped = self.s.m.cmp(c, pred::IULT, r, a);
+                        let max = self.s.m.i32(u32::MAX);
+                        self.s.m.select(c, wrapped, max, r)
+                    } else {
+                        let below = self.s.m.cmp(c, pred::IULT, a, bb);
+                        let zero = self.s.m.i32(0);
+                        self.s.m.select(c, below, zero, r)
+                    }
+                } else {
+                    r
+                };
                 int(self, r)?;
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))

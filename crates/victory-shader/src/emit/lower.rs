@@ -10852,7 +10852,9 @@ impl<'a> Lower<'a> {
                                 && taken == b
                                 && let [.., cmp, branch] = &insts[..]
                                 && branch.name() == "s_cbranch_scc1"
-                                && matches!(cmp.name(), "s_cmp_eq_u64" | "s_cmp_eq_u32")
+                                // In a wave64 program `s_cmp_eq_u32 exec_lo, 0` sees only the low
+                                // half: the high lanes may still be in EXEC there.
+                                && matches!((cmp.name(), p.wave64), ("s_cmp_eq_u64", _) | ("s_cmp_eq_u32", false))
                                 && cmp.write(Reg::Scc).is_some()
                                 && branch.read(Reg::Scc) == cmp.write(Reg::Scc)
                                 && cmp.read(Reg::S(EXEC)) == Some(exec)

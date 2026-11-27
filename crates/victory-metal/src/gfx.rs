@@ -841,7 +841,7 @@ impl ResourceBackend for Metal {
                 .map_err(|e| e.localizedDescription().to_string())?;
             s.addAllocation(ProtocolObject::from_ref(&*buf));
             s.commit();
-            Some(s)
+            Some(track_residency_set(s))
         } else {
             None
         };
@@ -1313,7 +1313,7 @@ impl GraphicsBackend for Metal {
         // later pieces still run and nothing is paid twice.
         let per = self.passes_per_buffer;
         let pieces = if per > 0 && work.passes.len() > per {
-            Some(self.dev.newSharedEvent().ok_or("newSharedEvent failed")?)
+            Some(track_event(self.dev.newSharedEvent().ok_or("newSharedEvent failed")?))
         } else {
             None
         };
@@ -1923,6 +1923,114 @@ fn recover_lost_after(behind_a_failure: std::time::Duration, anyway: std::time::
         });
     }
     lost.len()
+}
+
+/// The process's shared events (queue order events, title fences, piece events), weakly, so a
+/// stop can wake every command buffer waiting on one ([`stop_gpu`]).
+struct TrackedEvents(Vec<objc2::rc::Weak<ProtocolObject<dyn MTLSharedEvent>>>);
+// SAFETY: shared events may be used from any thread; the list is only touched under its lock.
+unsafe impl Send for TrackedEvents {}
+static EVENTS: std::sync::Mutex<TrackedEvents> = std::sync::Mutex::new(TrackedEvents(Vec::new()));
+
+/// Remembers `event` for [`stop_gpu`] and returns it.
+pub(crate) fn track_event(
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+) -> Retained<ProtocolObject<dyn MTLSharedEvent>> {
+    let mut events = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if events.0.len() % 1024 == 1023 {
+        events.0.retain(|w| w.load().is_some());
+    }
+    events.0.push(objc2::rc::Weak::from_retained(&event));
+    event
+}
+
+/// The process's residency sets (each heap's and the pool's), weakly, so a stop can give back what
+/// they hold before the process exits ([`stop_gpu`]).
+struct TrackedSets(Vec<objc2::rc::Weak<ProtocolObject<dyn MTLResidencySet>>>);
+// SAFETY: residency sets may be used from any thread; the list is only touched under its lock.
+unsafe impl Send for TrackedSets {}
+static SETS: std::sync::Mutex<TrackedSets> = std::sync::Mutex::new(TrackedSets(Vec::new()));
+
+/// Remembers `set` for [`stop_gpu`] and returns it.
+pub(crate) fn track_residency_set(
+    set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+) -> Retained<ProtocolObject<dyn MTLResidencySet>> {
+    let mut sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
+    if sets.0.len() % 256 == 255 {
+        sets.0.retain(|w| w.load().is_some());
+    }
+    sets.0.push(objc2::rc::Weak::from_retained(&set));
+    set
+}
+
+/// Empties and commits `sets`: what they held is no longer kept resident. Returns the bytes they
+/// held.
+fn release_sets(sets: &[Retained<ProtocolObject<dyn MTLResidencySet>>]) -> u64 {
+    let mut bytes = 0;
+    for set in sets {
+        bytes += set.allocatedSize();
+        set.removeAllAllocations();
+        set.commit();
+    }
+    bytes
+}
+
+/// A value above any a command buffer waits for: an event raised to it lets every wait on it pass.
+const STOP_VALUE: u64 = 1 << 62;
+
+/// Stops the process's GPU work cleanly before it exits: raises every shared event a command
+/// buffer may wait on ([`track_event`]), waits up to `wait` for the command buffers in flight to
+/// complete, and pays what the ones that did not still owe on the CPU. Returns how many were in
+/// flight and how many of them did not complete.
+///
+/// A process killed while its command buffers sleep in the kernel on events it never signals can
+/// leave the GPU memory they hold allocated after it exits: on macOS 26.5 an M5 Max kept about
+/// 20 GB "in use" by the GPU driver, owned by no process, until a reboot (#357). Woken first, they
+/// finish and the process exits with nothing pending.
+pub fn stop_gpu(wait: std::time::Duration) -> (usize, usize) {
+    let events: Vec<_> = EVENTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+        .iter()
+        .filter_map(objc2::rc::Weak::load)
+        .collect();
+    let drained = wake_and_drain(&events, wait);
+    // Then what the residency sets keep resident is given back before the process goes, not left
+    // to the driver's teardown: a run that hung the GPU at world entry with ~16 GB in its heaps'
+    // sets left 19.7 GB "in use" after it exited (#357). Process exit skips `Heap`'s `Drop`.
+    let sets: Vec<_> = SETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+        .iter()
+        .filter_map(objc2::rc::Weak::load)
+        .collect();
+    let bytes = release_sets(&sets);
+    tracing::warn!(sets = sets.len(), mb = bytes >> 20, "stop: residency sets emptied");
+    drained
+}
+
+/// [`stop_gpu`] for `events` (the tests wake only their own).
+fn wake_and_drain(
+    events: &[Retained<ProtocolObject<dyn MTLSharedEvent>>],
+    wait: std::time::Duration,
+) -> (usize, usize) {
+    let in_flight = flights().len();
+    for e in events {
+        if e.signaledValue() < STOP_VALUE {
+            e.setSignaledValue(STOP_VALUE);
+        }
+    }
+    let deadline = std::time::Instant::now() + wait;
+    while !flights().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let left: Vec<Flight> = flights().drain(..).collect();
+    for f in &left {
+        f.owed.recover();
+    }
+    (in_flight, left.len())
 }
 
 static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3458,6 +3566,48 @@ mod owed_tests {
         let after = [(&fence, 4)];
         m.submit_passes(&q, &PassSubmission { waits: &[], passes: &[], signals: &after }).unwrap();
         assert!(m.wait(&fence, 4, 5000), "the queue runs on behind the recovered command buffer");
+    }
+
+    /// A stop wakes a command buffer asleep on an event nobody signals, as a title's queues are
+    /// when the process is told to stop: it completes on the GPU (its fence is reached by the GPU,
+    /// not paid), and nothing is left in flight.
+    #[test]
+    fn a_stop_wakes_command_buffers_waiting_on_events_nobody_signals() {
+        let _alone = FLIGHTS_IN_TESTS.write().unwrap_or_else(|e| e.into_inner());
+        let m = Metal::new().unwrap();
+        let q = m.create_queue().unwrap();
+        let (never, fence) = (m.create_fence(0).unwrap(), m.create_fence(0).unwrap());
+        let (waits, signals) = ([(&never, 1)], [(&fence, 3)]);
+        m.submit_passes(&q, &PassSubmission { waits: &waits, passes: &[], signals: &signals }).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(m.completed(&fence), 0, "the command buffer sleeps on its wait");
+        let (in_flight, left) = wake_and_drain(&[never.0.clone(), q.2.clone()], std::time::Duration::from_secs(5));
+        assert!(in_flight >= 1);
+        assert_eq!(left, 0, "every command buffer completed on the GPU");
+        assert_eq!(m.completed(&fence), 3);
+        // The events a stop wakes are tracked as they are made, and let go with them.
+        let tracked = |e: &Retained<ProtocolObject<dyn MTLSharedEvent>>| {
+            EVENTS.lock().unwrap().0.iter().any(|w| w.load().is_some_and(|t| Retained::as_ptr(&t) == Retained::as_ptr(e)))
+        };
+        assert!(tracked(&never.0) && tracked(&q.2));
+    }
+
+    /// A stop empties the residency sets it tracks, so nothing it made stays resident.
+    #[test]
+    fn a_stop_empties_the_residency_sets() {
+        use objc2_foundation::NSObjectProtocol;
+        let m = Metal::new().unwrap();
+        if !m.dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:)) {
+            return;
+        }
+        let set = track_residency_set(m.dev.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).unwrap());
+        let buf = m.dev.newBufferWithLength_options(1 << 20, MTLResourceOptions::StorageModePrivate).unwrap();
+        set.addAllocation(ProtocolObject::from_ref(&*buf));
+        set.commit();
+        assert_eq!(set.allocationCount(), 1);
+        assert!(SETS.lock().unwrap().0.iter().any(|w| w.load().is_some_and(|t| Retained::as_ptr(&t) == Retained::as_ptr(&set))));
+        assert!(release_sets(std::slice::from_ref(&set)) >= 1 << 20);
+        assert_eq!(set.allocationCount(), 0);
     }
 
     #[test]

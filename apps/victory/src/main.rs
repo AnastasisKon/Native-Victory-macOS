@@ -149,6 +149,38 @@ enum Console {
     SeriesS,
 }
 
+/// SIGTERM, SIGINT and SIGHUP stop the process after its GPU work is woken and drained
+/// (`victory_gpu::stop_gpu`), not in the middle of it: a process killed while its command buffers
+/// sleep on events can leave the GPU memory they hold allocated until a reboot. The signals are
+/// blocked here, before any other thread starts (threads inherit the mask), and taken by a thread
+/// of their own with `sigwait`, so the stop runs as ordinary code, not in a signal handler.
+#[cfg(target_os = "macos")]
+fn stop_gpu_on_signals() {
+    unsafe extern "C" {
+        fn pthread_sigmask(how: i32, set: *const u32, old: *mut u32) -> i32;
+        fn sigwait(set: *const u32, sig: *mut i32) -> i32;
+    }
+    const SIG_BLOCK: i32 = 1;
+    let set: u32 = [1u32 /* SIGHUP */, 2 /* SIGINT */, 15 /* SIGTERM */]
+        .iter()
+        .fold(0, |set, sig| set | 1 << (sig - 1));
+    // SAFETY: libSystem's documented calls with a valid set (`sigset_t` is 32 bits on macOS).
+    if unsafe { pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut()) } != 0 {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("stop-on-signal".into()).spawn(move || {
+        let mut sig = 0;
+        // SAFETY: as above; `sig` receives the signal taken.
+        if unsafe { sigwait(&set, &mut sig) } != 0 {
+            return;
+        }
+        tracing::warn!(signal = sig, "stopping: waking and draining the GPU's queued work first");
+        let (in_flight, left) = victory_gpu::stop_gpu(std::time::Duration::from_secs(3));
+        tracing::warn!(in_flight, left, "stopped the GPU's work; exiting");
+        std::process::exit(128 + sig);
+    });
+}
+
 /// Diagnostics: the heap bytes Rust code holds, for the statistics.
 #[cfg(all(windows, feature = "diagnostics"))]
 #[global_allocator]
@@ -156,6 +188,8 @@ static ALLOC: victory_gpu::CountingAlloc = victory_gpu::CountingAlloc;
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    #[cfg(target_os = "macos")]
+    stop_gpu_on_signals();
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {

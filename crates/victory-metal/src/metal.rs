@@ -428,7 +428,7 @@ impl ComputeBackend for Metal {
 
     fn create_queue(&self) -> Result<Queue, String> {
         let q = self.dev.newCommandQueue().ok_or("newCommandQueue failed")?;
-        let order = self.dev.newSharedEvent().ok_or("newSharedEvent failed")?;
+        let order = crate::gfx::track_event(self.dev.newSharedEvent().ok_or("newSharedEvent failed")?);
         // With the heaps' sets alone the host orders the queue's work from the start; with the
         // pool's set too, from when that set joins the queue (`make_resident`).
         let ordered = self.residency_sets && !self.pool_sets;
@@ -436,7 +436,7 @@ impl ComputeBackend for Metal {
     }
 
     fn create_fence(&self, initial: u64) -> Result<Fence, String> {
-        let e = self.dev.newSharedEvent().ok_or("newSharedEvent failed")?;
+        let e = crate::gfx::track_event(self.dev.newSharedEvent().ok_or("newSharedEvent failed")?);
         e.setSignaledValue(initial);
         Ok(Fence(e))
     }
@@ -488,10 +488,11 @@ impl ComputeBackend for Metal {
             match &*slot {
                 Some(s) => s.clone(),
                 None => {
-                    let s = self
-                        .dev
-                        .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
-                        .map_err(|e| e.localizedDescription().to_string())?;
+                    let s = crate::gfx::track_residency_set(
+                        self.dev
+                            .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
+                            .map_err(|e| e.localizedDescription().to_string())?,
+                    );
                     *slot = Some(s.clone());
                     s
                 }

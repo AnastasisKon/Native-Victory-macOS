@@ -8,12 +8,12 @@ No Wine, no CrossOver, no Game Porting Toolkit: the game's code runs in our own 
 <p align="center">
 <img alt="Apple Silicon M1 or newer" src="https://img.shields.io/badge/Apple%20Silicon-M1%2B-555555">
 <img alt="macOS 15 or newer" src="https://img.shields.io/badge/macOS-15%2B-blue">
-<img alt="Status: boot movie and menus on screen" src="https://img.shields.io/badge/status-menus%20on%20screen-orange">
+<img alt="Status: the prologue runs, the world is still dark and slow" src="https://img.shields.io/badge/status-prologue%20runs%2C%20dark%20and%20slow-orange">
 <img alt="GPL-3.0 licence" src="https://img.shields.io/badge/licence-GPL--3.0-lightgrey">
 </p>
 
 > [!IMPORTANT]
-> **Not playable yet, but you can see it run.** The game boots natively on a Mac, plays its boot movie and shows its menus in the window: the start screen, FINISH SETUP and LEGAL NOTICES, rendered on Metal at about 30 fps. Text and blending are now correct on the screens we have checked, and you can hear its sound. You can move through the menus with the keyboard. We know where to look, and we need help. **No game files are included here, ever.** You need your own legally obtained copy of the game.
+> **Not playable yet, but it gets as far as the story.** The game boots natively on a Mac, plays its boot movie, and shows the start screen and every setup screen on Metal at about 30 fps, with sound, keyboard and controllers. Then it loads story mode and runs into the prologue's world: the prologue crash is fixed, and on our test Mac the game keeps running with the dialogue playing. The world is not watchable yet: it draws, but the lighting pass is still refused, so the picture is mostly black, and it runs at about 0.5 fps. Lighting and speed are what everyone is working on now: see [#15](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/15). **No game files are included here, ever.** You need your own legally obtained copy of the game.
 
 📸 **[See the latest screenshots](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/5)** (the game's start screen and setup menus, rendered natively on Metal).
 
@@ -39,11 +39,17 @@ Fewer layers means fewer places for things to break, and much better speed: boot
 | Sound | 🟡 Plays through CoreAudio (the game's Windows Spatial Audio stream, mixed to stereo); reverb is still silent |
 | Loading: DirectStorage reads about 9,500 requests at about 79 MB/s | ✅ Works |
 | GPU: every draw gets a Metal pipeline, built from the console's own pipeline descriptions | ✅ Works (some parts are inferred, see [docs/native-host.md](docs/native-host.md)) |
-| Shaders: GFX10 → DXIL → Metal | 🟡 Most translate; 7 known shapes still refused |
-| Boot movie and menus in the window | 🟡 The boot movie plays and the start screen, FINISH SETUP and LEGAL NOTICES show in the window with correct text and blending ([#6](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/6) fixed); other screens not checked yet |
-| Start screen ("press A") and input | ✅ Passed; the keyboard drives the gamepad in the window (real controllers not yet) |
-| Running past ~50 s | 🔴 A Metal GPU command times out and frames stop |
-| Apple Silicon recompilation (no Rosetta) | 🟡 The whole game (440,000 functions) recompiles to arm64 and presents its first frame; fixing translation bugs one by one |
+| Shaders: GFX10 → DXIL → Metal | 🟡 Most translate, including the world's mesh shaders. A few hundred are still refused once the world loads (most are 64-lane console waves the Mac's 32-lane GPU has to split), and a refused shader's work is skipped. A general fix for that class is being built. Shaders are cached on disk between runs |
+| Boot movie and menus in the window | ✅ The boot movie plays smoothly, and the start screen and setup screens show with correct text and blending. The black window on M1/M2 is fixed ([#91](https://github.com/LakshanSivakumar/Native-Victory-macOS/pull/91)) |
+| Start screen ("press A") and input | ✅ Passed; the keyboard and Game Controller pads (Xbox, DualShock 4, DualSense) drive the gamepad in the window |
+| Running past ~50 s | ✅ Fixed: the old Metal GPU timeout is gone ([#2](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/2)) |
+| Story mode load | ✅ Loads, and reaches the prologue |
+| Prologue | 🟡 Runs into the world without crashing; the dialogue plays. The crash (GPU work that overwrote the game's memory) is fixed. With a cold shader cache, the first world frame can still take more than 30 s and trip the game's own watchdog; a second run is usually past it ([#15](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/15)) |
+| World picture | 🔴 The surfaces are drawn (the G-buffer has content), but the compute pass that lights them is still refused, so the screen is mostly black. Being worked on now |
+| World frame rate | 🔴 About 0.5 fps on an M5 Pro with 48 GB (was 0.07). Most of a frame goes to copying the textures the world streams in, one by one; that fix is in progress |
+| macOS 15 | 🟡 Boots and loads, but Apple's Metal compiler crashes on a few world pipelines, which holds the first world frame. Some macOS 27 Macs also report this failure ([#181](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/181)) |
+| Memory on 16 to 24 GB Macs | 🟡 Use the Series S profile (the default there); Series X can run out of GPU memory at the world load. Macs with 32 GB or more keep GPU memory resident in one set by default, which is much faster; on smaller Macs you can try it with `VICTORY_METAL_RESIDENCY_SETS=heap` and tell us how it goes ([#8](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/8), [#79](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/79)) |
+| Apple Silicon recompilation (no Rosetta) | 🟡 The whole game (440,000 functions) recompiles to arm64, and a contributor's branch boots it to the intro at 30 fps ([#115](https://github.com/LakshanSivakumar/Native-Victory-macOS/pull/115)); not on main yet |
 | Gameplay | 🔴 Not yet |
 
 The live list of open problems, with everything we already know about each one, is in **[docs/ROADMAP.md](docs/ROADMAP.md)**.
@@ -88,7 +94,9 @@ Point it at the folder that holds `game_scarlett_master.exe`. A window opens; af
 | Q, E | left, right shoulder |
 | Z, C | left, right trigger |
 
-Real controllers aren't supported yet. Add `--headless` to run without a window, or `--seconds 60` to stop after a minute.
+**Controllers.** An Xbox pad, a PS4 DualShock 4 or a PS5 DualSense connected to the Mac (USB, or Bluetooth through System Settings → Bluetooth; on a DualShock 4 hold Share and PS until the light bar flashes to pair) drives the gamepad while the window is in front. The keyboard still works alongside it. On a PlayStation pad Cross, Circle, Square and Triangle are A, B, X and Y, Options is Menu, and Share or a touchpad click is View. With several controllers connected, the one you used last wins. The run log names the controller it picked (`controller: drives the pad`); if it says none, check that macOS sees the controller in System Settings → Game Controllers.
+
+Add `--headless` to run without a window, or `--seconds 60` to stop after a minute.
 
 **3. Tell us what happened.** Open a [Tester report](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/new?template=tester-report.yml) and attach the log. Reports from different Macs (M1 to M5, 8 GB to 128 GB) are very useful.
 
@@ -97,8 +105,8 @@ Real controllers aren't supported yet. Add `--headless` to run without a window,
 Whatever your background, there is something to do:
 
 - **Testers:** run the game on your Mac and file a tester report. No coding needed.
-- **Graphics and Metal:** the still-guessed pipeline state (culling, depth, stencil, write mask), shader refusals, the GPU timeout at about 53 s.
-- **Debugging:** the Metal GPU timeout at about 50 s, and real controllers through the Game Controller framework.
+- **Graphics and Metal:** the shader refusals that keep the world unlit ([#4](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/4)), frame rate in the world, and GPU memory use on 16 to 24 GB Macs.
+- **Debugging:** runs that reach the prologue's world ([#15](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/15)). Logs from your own Mac help a lot, especially on macOS 15 and on 16 to 24 GB.
 - **Compilers:** the arm64 recompiler (jump tables, SSE, exceptions).
 - **Rust and systems:** missing Windows and Xbox system calls, speed, tests.
 

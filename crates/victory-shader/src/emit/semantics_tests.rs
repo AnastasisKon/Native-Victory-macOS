@@ -1071,6 +1071,7 @@ const DENORMAL: &str = "denormal operands of min, max and float selects are the 
 const F16_ROUND: &str = "f16 results round toward zero";
 const F16_TWICE: &str = "f16 arithmetic rounds in f32 first, as the host chooses";
 const SCC_MIN_MAX: &str = "s_min and s_max set SCC from the result";
+const SCC_LSHL_ADD: &str = "s_lshl<n>_add_u32 set SCC from the result";
 const FLOOR_CVT: &str = "v_cvt_flr and v_cvt_rpi: NaN and the half";
 const MED3_ZERO: &str = "v_med3_f32 orders -0 and +0 as the host does";
 const CONSTANT_CMP: &str = "a constant compare removes the WARP device";
@@ -1810,7 +1811,7 @@ fn integer_probes() -> Vec<Probe> {
             move |i| vec![f(i[1], i[0])],
         )
     };
-    vec![
+    let mut p = vec![
         vop3_int(
             0x143,
             |a, b, c| (a & 0xFF_FFFF).wrapping_mul(b & 0xFF_FFFF).wrapping_add(c),
@@ -1911,7 +1912,25 @@ fn integer_probes() -> Vec<Probe> {
         vop2_int(0x25, |a, b| a.wrapping_add(b)),
         vop2_int(0x26, |a, b| a.wrapping_sub(b)),
         vop2_int(0x27, |a, b| b.wrapping_sub(a)),
-    ]
+    ];
+    // v_mad_u32_u16: op_sel bits 0 and 1 pick the high halves of src0 and
+    // src1; the addend is 32 bits and the sum wraps.
+    for opsel in 0..4u8 {
+        let half = move |x: u32, k: u8| {
+            if opsel >> k & 1 != 0 {
+                x >> 16
+            } else {
+                x & 0xFFFF
+            }
+        };
+        p.push(probe(
+            vop3(0x373, 5, [v(1), v(2), v(3)], M { opsel, ..NONE }),
+            abc.clone(),
+            INT,
+            move |i| vec![(half(i[0], 0) * half(i[1], 1)).wrapping_add(i[2])],
+        ));
+    }
+    p
 }
 
 #[test]
@@ -2556,6 +2575,18 @@ fn sop1_probe(op: u16, inputs: Vec<[u32; 4]>, f: fn(u32) -> (u32, Option<bool>))
 fn scalar_probes() -> Vec<Probe> {
     let ab = pairs(&U32_EDGES[..24], &U32_EDGES[..24]);
     let shifts = pairs(&U32_EDGES[..24], &[0, 1, 16, 31, 32, 33, 63, 0xFFFF_FFE1]);
+    let mut signed = ab.clone();
+    signed.extend(
+        [
+            (0x7FFF_FFFF, 1),
+            (0x8000_0000, 0xFFFF_FFFF),
+            (0xFFFF_FFFF, 1),
+            (0x8000_0000, 1),
+            (0, 0x8000_0000),
+            (0, 1),
+        ]
+        .map(|(a, b)| [a, b, 0, OLD]),
+    );
     let fields: Vec<[u32; 4]> = [0u32, 0x8000_0000, 0xFFFF_FFFF, 0x1234_5678, 0xD2F9_0159]
         .iter()
         .flat_map(|&a| {
@@ -2584,9 +2615,51 @@ fn scalar_probes() -> Vec<Probe> {
             f
         }
     };
+    // s_lshl<n>_add_u32 (SOP2 46-49): SCC is whether (S0 << n) + S1, in
+    // 64 bits, reaches 2^32, bits shifted out included (RDNA2 ISA).
+    let mut shift_adds = ab.clone();
+    shift_adds.extend(
+        [
+            (1, 2),
+            (0x8000_0000, 0),
+            (0x7FFF_FFFF, 2),
+            (0x3FFF_FFFF, 0),
+            (0x1000_0000, 0),
+            (0x0FFF_FFFF, 0x10),
+            (0xFFFF_FFFF, 0xFFFF_FFFF),
+        ]
+        .map(|(a, b)| [a, b, 0, OLD]),
+    );
+    let shift_add = |n: u16| {
+        let wide = move |i: [u32; 4]| (u64::from(i[0]) << n) + u64::from(i[1]);
+        scalar_out(
+            sop2(0x2D + n, 20, s(16), s(17)),
+            shift_adds.clone(),
+            move |i| {
+                let w = wide(i);
+                (w as u32, Some(w >> 32 != 0))
+            },
+        )
+        .shows(SCC_LSHL_ADD, move |i| {
+            let w = wide(i);
+            (w >> 32 != 0) != (w as u32 != 0)
+        })
+    };
     let mut p = vec![
-        // (SCC of the adds, their carry or overflow, the lowering refuses.)
-        sop2_probe(0x02, ab.clone(), |a, b| (a.wrapping_add(b), None)),
+        // SCC of s_add_i32 and s_sub_i32: the signed overflow (RDNA2 ISA).
+        sop2_probe(0x02, signed.clone(), |a, b| {
+            (
+                a.wrapping_add(b),
+                Some((a as i32).overflowing_add(b as i32).1),
+            )
+        }),
+        sop2_probe(0x03, signed.clone(), |a, b| {
+            (
+                a.wrapping_sub(b),
+                Some((a as i32).overflowing_sub(b as i32).1),
+            )
+        }),
+        // (SCC of s_add_u32, its carry, is not checked here.)
         sop2_probe(0x00, ab.clone(), |a, b| (a.wrapping_add(b), None)),
         sop2_probe(0x0E, ab.clone(), |a, b| (a & b, Some(a & b != 0))),
         sop2_probe(0x10, ab.clone(), |a, b| (a | b, Some(a | b != 0))),
@@ -2617,6 +2690,10 @@ fn scalar_probes() -> Vec<Probe> {
         .shows(SCC_MIN_MAX, |i| {
             ((i[0] as i32) > (i[1] as i32)) != ((i[0] as i32).max(i[1] as i32) != 0)
         }),
+        shift_add(1),
+        shift_add(2),
+        shift_add(3),
+        shift_add(4),
         sop2_probe(0x1E, shifts.clone(), |a, n| {
             (a << (n & 31), Some(a << (n & 31) != 0))
         }),
@@ -2643,6 +2720,12 @@ fn scalar_probes() -> Vec<Probe> {
         sop1_probe(0x15, unary(U32_EDGES), |a| (ffbh(a), None)),
         sop1_probe(0x0F, unary(U32_EDGES), |a| (a.count_ones(), Some(a != 0))),
         sop1_probe(0x0B, unary(U32_EDGES), |a| (a.reverse_bits(), None)),
+        // s_pack_{ll,lh,hh}_b32_b16: {S1 half, S0 half}; no SCC.
+        sop2_probe(0x32, ab.clone(), |a, b| (b << 16 | a & 0xFFFF, None)),
+        sop2_probe(0x33, ab.clone(), |a, b| {
+            (b & 0xFFFF_0000 | a & 0xFFFF, None)
+        }),
+        sop2_probe(0x34, ab.clone(), |a, b| (b & 0xFFFF_0000 | a >> 16, None)),
         sop1_probe(0x34, unary(U32_EDGES), |a| {
             let r = (a as i32).wrapping_abs() as u32;
             (r, Some(r != 0))
@@ -2666,6 +2749,28 @@ fn scalar_probes() -> Vec<Probe> {
         fields,
         move |i| vec![sbfe(i[0], i[1], true)],
     ));
+    // 64-bit results out as v5 = s20, v6 = s21.
+    let wide = |word: u32, inputs: Vec<[u32; 4]>, f: fn(u32, u32) -> u64| {
+        scalar(
+            [word, vop1(0x01, 5, s(20)), vop1(0x01, 6, s(21))],
+            inputs,
+            move |i| {
+                let r = f(i[0], i[1]);
+                vec![r as u32, (r >> 32) as u32]
+            },
+        )
+    };
+    // s_bfm_b64: both counts read six bits.
+    let counts = [0u32, 1, 16, 31, 32, 33, 63, 64, 65, 0xFFFF_FFFF];
+    p.push(wide(
+        sop2(0x25, 20, s(16), s(17)),
+        pairs(&counts, &counts),
+        |w, o| ((1u64 << (w & 63)) - 1) << (o & 63),
+    ));
+    // s_bitreplicate_b64_b32: bit k of S0 to bits 2k and 2k + 1.
+    p.push(wide(sop1(0x3B, 20, s(16)), unary(U32_EDGES), |a, _| {
+        (0..32).fold(0, |r, k| r | (u64::from(a >> k & 1) * (3 << (2 * k))))
+    }));
     // Compares into SCC, read by s_cselect.
     for (op, f) in [
         (0x06u16, (|a: u32, b: u32| a == b) as fn(u32, u32) -> bool),
@@ -2685,6 +2790,24 @@ fn scalar_probes() -> Vec<Probe> {
             move |i| vec![if f(i[0], i[1]) { i[2] } else { i[3] }],
         ));
     }
+    // s_addk_i32 s20, k on s20 = s16: SCC is the signed overflow, the
+    // constant sign-extended (RDNA2 ISA, SOPK 15).
+    for k in [0u16, 1, 0x7FFF, 0x8000, 0xFFFF] {
+        p.push(scalar(
+            [
+                sop1(0x03, 20, s(16)),
+                0xB794_0000 | u32::from(k),
+                sop2(0x0A, 21, int(1), int(0)),
+                vop1(0x01, 6, s(21)),
+                vop1(0x01, 5, s(20)),
+            ],
+            unary(U32_EDGES),
+            move |i| {
+                let (r, o) = (i[0] as i32).overflowing_add(i32::from(k as i16));
+                vec![r as u32, u32::from(o)]
+            },
+        ));
+    }
     // SCC as a vector operand (`src_scc`).
     p.push(scalar(
         [sopc(0x0A, s(16), s(17)), vop1(0x01, 5, SRC_SCC)],
@@ -2692,6 +2815,34 @@ fn scalar_probes() -> Vec<Probe> {
         |i| vec![u32::from(i[0] < i[1])],
     ));
     p
+}
+
+#[test]
+fn signed_flbit_i64_counts_from_the_msb_and_preserves_scc() {
+    let cases = [
+        (0u64, u32::MAX),
+        (u64::MAX, u32::MAX),
+        (0x8000_0000_0000_0000, 1),
+        (0x0000_0000_0000_0001, 63),
+        (0xFFFF_FFFF_FFFF_FFFE, 63),
+        (0x0000_0001_0000_0000, 31),
+        (0xFFFF_FFFF_7FFF_FFFF, 32),
+    ];
+    let inputs = cases
+        .into_iter()
+        .flat_map(|(src, want)| [0, 1].map(|seed| [src as u32, (src >> 32) as u32, want, seed]))
+        .collect();
+    let probe = scalar(
+        [
+            sopc(0x06, s(19), int(0)), // s_cmp_eq_u32: seed SCC
+            sop1(0x18, 20, s(16)),     // s_flbit_i32_i64 s20, s[16:17]
+            vop1(0x01, 5, s(20)),
+            vop1(0x01, 6, SRC_SCC),
+        ],
+        inputs,
+        |i| vec![i[2], u32::from(i[3] == 0)],
+    );
+    assert_clean(check(&[probe]));
 }
 
 #[test]
@@ -2818,6 +2969,15 @@ fn f16_arithmetic_rounds_once() {
 #[test]
 fn scalar_min_max_set_scc_from_the_compare() {
     defect(scalar_probes(), SCC_MIN_MAX);
+}
+
+/// `s_lshl<n>_add_u32` set SCC to whether `(S0 << n) + S1` reaches 2^32 in
+/// 64 bits (RDNA2 ISA): `s_lshl1_add_u32 1, 2` gives 4 and SCC 0,
+/// `s_lshl4_add_u32 0x10000000, 0` gives 0 and SCC 1. Was a defect: SCC
+/// was `result != 0`.
+#[test]
+fn scalar_shift_adds_set_scc_from_the_overflow() {
+    defect(scalar_probes(), SCC_LSHL_ADD);
 }
 
 /// `v_cvt_flr_i32_f32`/`v_cvt_rpi_i32_f32` saturate a NaN by its sign and
@@ -3059,6 +3219,38 @@ fn else_lanes_keep_their_registers() {
         let on = i[0] > i[1];
         vec![if on { 1 } else { OLD }, if on { OLD } else { 2 }]
     })]));
+}
+
+/// Swap lanes 0 and 1 in each quad, with only lane 1 disabled. Each
+/// destination starts at 99 and lane 1's source VGPR still holds 7.
+#[test]
+fn dpp_fetch_inactive_and_bounds_choose_the_value_written() {
+    let body = [
+        sop1(0x03, 20, EXEC_LO),
+        vopc(0xD5, int(1), 1), // v_cmpx_ne_u32 exec_lo, 1, v1
+        vop1(1, 5, 0xE9), 0xDE_54_C1_02, // DPP8 [1,0,3,2,5,4,7,6], fi:0
+        vop1(1, 6, 0xEA), 0xDE_54_C1_02, // DPP8, fi:1
+        vop1(1, 7, 0xFA), 0xFF00_B102, // quad_perm [1,0,3,2], BC clear
+        vop1(1, 8, 0xFA), 0xFF08_B102, // quad_perm [1,0,3,2], BC set
+        sop1(0x03, 126, s(20)),
+    ];
+    let shader = lower_program(&program(&body, false)).expect("lower DPP probe");
+    let inputs: Vec<_> = (0..64).map(|lane| [lane % 4, lane + 6, 0, 99]).collect();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no hardware adapter for a wave of 32; skipped");
+        return;
+    };
+    let out = run(&host, &shader, &inputs, false).expect("dispatch DPP probe");
+    for (lane, result) in out.into_iter().enumerate() {
+        let neighbour = (lane as u32 ^ 1) + 6;
+        let want = match lane % 4 {
+            0 => [0, neighbour, 99, 0],
+            1 => [99; 4],
+            _ => [neighbour; 4],
+        };
+        assert_eq!(result, want, "lane {lane}");
+    }
 }
 
 /// DS `op` at `addr + offset`: data from `data`, result to `vdst`.

@@ -15,13 +15,49 @@ type Dev = Retained<ProtocolObject<dyn MTLDevice>>;
 
 pub struct Metal {
     pub(crate) dev: Dev,
-    pub(crate) msc: Msc,
+    /// Opened at creation when installed; shader compilation reports the error if absent.
+    pub(crate) msc: Result<std::sync::Arc<Msc>, String>,
     /// Heap residency by `MTLResidencySet` (macOS 15+); off = `useResource` per encoder.
     pub(crate) residency_sets: bool,
+    /// The title's pool buffers in one set on every queue too (`VICTORY_METAL_RESIDENCY_SETS=1`);
+    /// off = named by the encoders that use them.
+    pub(crate) pool_sets: bool,
     /// The set of the title's pool buffers, made when the first one is.
     pool_set: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLResidencySet>>>>,
     /// What the encoders did to make buffers resident, for the tests and the frame line.
     pub(crate) counts: std::cell::Cell<ResidencyCounts>,
+    /// Compiled pipelines kept across runs, opened at the first pipeline (when the cache folder is set).
+    pub(crate) archive: std::cell::OnceCell<Option<std::sync::Arc<crate::archive::Archive>>>,
+    /// Compute pipelines being made on threads of their own (`create_compute_pipeline_within`),
+    /// by their DXIL and layout.
+    compiling: Compiling<Result<ComputeState, String>>,
+    /// As `compiling`, the render and mesh pipelines (`create_render_pipeline_within`).
+    pub(crate) compiling_render: Compiling<Result<(crate::gfx::RenderState, Option<MTLSize>), String>>,
+    /// `VICTORY_TRACE_GPU_FAILS`: label command buffers and encoders, report failures with them.
+    pub(crate) trace_fails: bool,
+    /// Pipeline state pointer to name, kept only when tracing.
+    pub(crate) trace_enc: std::cell::RefCell<Vec<String>>,
+    pub(crate) pipe_names: std::cell::RefCell<std::collections::HashMap<usize, String>>,
+    /// The kernel that gates `ExecuteIndirect` records by a count (`gfx.rs`), made at first use.
+    pub(crate) gate:
+        std::cell::OnceCell<Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String>>,
+    /// Every sampler made, by descriptor: a heap entry holds only the sampler's ID, which Metal
+    /// hands to a new sampler once the old one is freed. Few distinct descriptors exist.
+    #[allow(clippy::type_complexity)]
+    pub(crate) samplers: std::cell::RefCell<
+        Vec<(crate::resources::SamplerDesc, Retained<ProtocolObject<dyn MTLSamplerState>>)>,
+    >,
+}
+
+type ComputeState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+/// Pipelines a `pipeline-compile` thread is making or has made, by what they are made of.
+pub(crate) type Compiling<T> =
+    std::cell::RefCell<std::collections::HashMap<[u8; 32], std::sync::mpsc::Receiver<crate::archive::Sendable<T>>>>;
+
+/// Seconds since the first `Metal::new` (about process start), for the failure trace.
+pub(crate) fn since_start() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
 }
 
 /// Counters of residency work.
@@ -29,6 +65,15 @@ pub struct Metal {
 pub struct ResidencyCounts {
     /// `useResource` calls on title buffers (compute, render and blit encoders).
     pub use_resource: u64,
+    /// Resources named to encoders for descriptor heaps without sets.
+    pub heap_resources: u64,
+    /// The most entries naming a resource, and the most distinct allocations they name, seen in
+    /// one heap named to an encoder.
+    pub heap_entries: u64,
+    pub heap_allocations: u64,
+    /// The most bytes one heap's set held when it was committed (the heap buffer and everything
+    /// its entries name: resident while a command buffer that uses the heap runs).
+    pub heap_set_bytes: u64,
     /// Buffers added to the pool set.
     pub added: u64,
     /// Queues the pool set was added to.
@@ -57,16 +102,22 @@ static LIBRARIES: AtomicU64 = AtomicU64::new(0);
 
 pub struct Queue(
     pub(crate) Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    /// Whether the pool residency set was added to it.
+    /// Whether the host orders its work: residency sets are in use (the heaps' own, and the
+    /// pool's once it was added to the queue).
     pub(crate) std::cell::Cell<bool>,
-    /// With the set, encoders no longer name the buffers they reach by address, and Metal's hazard
-    /// tracking cannot see those accesses: command buffers wait for the one before through this
-    /// event (and encoders within one through a fence), counted by `.3`.
-    pub(crate) Retained<ProtocolObject<dyn MTLEvent>>,
+    /// With sets, encoders no longer name what they reach through a heap or by address, and
+    /// Metal's hazard tracking cannot see those accesses: command buffers wait for the one before
+    /// through this event (and encoders within one through a fence), counted by `.3`.
+    /// A shared event, so that a command buffer the GPU fails can still be paid on the CPU.
+    pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>,
     pub(crate) std::cell::Cell<u64>,
 );
 pub struct Fence(pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>);
-pub struct Pipeline(pub(crate) Retained<ProtocolObject<dyn MTLComputePipelineState>>);
+pub struct Pipeline(
+    pub(crate) Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// The shader's static samplers, which its argument buffer points at.
+    pub(crate) Option<crate::gfx::StaticSamplers>,
+);
 
 /// A wrapped range of title memory.
 pub struct Buffer {
@@ -91,61 +142,250 @@ impl Buffer {
     }
 }
 
+/// `MTLResidencySet` exists (macOS 15 and later).
+fn sets_supported(dev: &Dev) -> bool {
+    dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:))
+}
+
+/// The Mac's memory in bytes (`hw.memsize`), 0 if it cannot be read.
+fn physical_memory() -> u64 {
+    let (mut bytes, mut len) = (0u64, size_of::<u64>());
+    // SAFETY: `hw.memsize` is a 64-bit value, written into `bytes`.
+    let read = unsafe {
+        libc::sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut bytes).cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if read == 0 { bytes } else { 0 }
+}
+
+/// `(the heaps' residency sets, the pool's set on the queues)` for `VICTORY_METAL_RESIDENCY_SETS`
+/// (`asked`) on a Mac with `memory` bytes.
+///
+/// What a descriptor heap names is resident through the heap's own set, given to each command
+/// buffer that uses the heap, so residency follows the frame. Naming it to every encoder with
+/// `useResource` instead (`0`) cost the kernel about 155 ms per drawing render pass in GTA VI's
+/// world, whose heap names 37,000 allocations. The title's pool buffers stay named by the
+/// encoders that use them: in a set on the queue (`1`) all of title memory (about 6.7 GB) is
+/// resident for the whole process, which on an 18 GB Mac preceded
+/// `kIOGPUCommandBufferCallbackErrorTimeout` and `...OutOfMemory`.
+///
+/// Guess: the heaps' sets are safe from 32 GiB. The world's heap set holds 17 to 18 GB, more
+/// than a 16 or 18 GB Mac has, and none has run it: until one has, a smaller Mac keeps
+/// `useResource` unless `heap` asks for the sets.
+fn residency_mode(asked: Option<&str>, supported: bool, memory: u64) -> (bool, bool) {
+    match asked {
+        Some("0") => (false, false),
+        Some("heap") => (supported, false),
+        Some(_) => (supported, supported),
+        None => (supported && memory >= 32 << 30, false),
+    }
+}
+
+impl Queue {
+    /// The value the queue's order event has reached and the number of command buffers encoded
+    /// with it: equal when every one of them has finished (0 and 0 when the host does not order).
+    pub fn order_state(&self) -> (u64, u64) {
+        (self.2.signaledValue(), self.3.get())
+    }
+}
+
 impl Metal {
     /// The system GPU and the installed converter (`VICTORY_MSC_DYLIB` overrides its path).
+    /// Succeeds even if the converter is not installed so non-shader Metal operations still work;
+    /// shader pipeline creation returns the load error instead of panicking.
     pub fn new() -> Result<Metal, String> {
         let dev = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
-        let residency_sets = std::env::var_os("VICTORY_METAL_NO_RESIDENCY_SETS").is_none()
-            && dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:));
+        let asked = std::env::var("VICTORY_METAL_RESIDENCY_SETS").ok();
+        let memory = physical_memory();
+        let (residency_sets, pool_sets) = residency_mode(asked.as_deref(), sets_supported(&dev), memory);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let mode = match (residency_sets, pool_sets) {
+                (false, _) => "useResource per encoder",
+                (true, false) => "a set per heap",
+                (true, true) => "a set per heap and the pool's on the queues",
+            };
+            tracing::info!(
+                mode,
+                memory_gb = memory >> 30,
+                switch = asked.as_deref().unwrap_or("unset"),
+                "metal: residency of what descriptor heaps name (VICTORY_METAL_RESIDENCY_SETS: 0, heap or 1)"
+            );
+        });
+        // Pipelines put off past a frame's budget compile side by side (`within`); Metal's
+        // default is two at a time. macOS 13.3.
+        if dev.respondsToSelector(objc2::sel!(setShouldMaximizeConcurrentCompilation:)) {
+            dev.setShouldMaximizeConcurrentCompilation(true);
+        }
         Ok(Metal {
             dev,
-            msc: Msc::open_default(),
+            msc: Msc::try_open_default().map(std::sync::Arc::new),
             residency_sets,
+            pool_sets,
             pool_set: Default::default(),
             counts: Default::default(),
+            archive: Default::default(),
+            compiling: Default::default(),
+            compiling_render: Default::default(),
+            trace_fails: {
+                since_start();
+                std::env::var_os("VICTORY_TRACE_GPU_FAILS").is_some()
+            },
+            pipe_names: Default::default(),
+            trace_enc: Default::default(),
+            gate: Default::default(),
+            samplers: Default::default(),
         })
     }
 
-    fn compute_from(
-        &self,
-        converted: Result<(i32, Vec<u8>), crate::msc::ConvError>,
-    ) -> Result<Pipeline, String> {
-        let (_, lib) = converted.map_err(|e| e.to_string())?;
-        let l = self.load_library(&lib)?;
+    pub(crate) fn msc(&self) -> Result<&Msc, String> {
+        self.msc.as_deref().map_err(Clone::clone)
+    }
+
+    /// What makes compute pipeline states: all of it may go to another thread.
+    pub(crate) fn compiler(&self) -> Result<Compiler, String> {
+        Ok(Compiler { dev: self.dev.clone(), msc: self.msc.clone()?, archive: self.archive().cloned() })
+    }
+
+    /// The pipeline archive, if the cache is on.
+    pub(crate) fn archive(&self) -> Option<&std::sync::Arc<crate::archive::Archive>> {
+        self.archive.get_or_init(|| crate::archive::Archive::open(&self.dev)).as_ref()
+    }
+
+    /// All residency through `MTLResidencySet` (`true`: the heaps' sets and the pool's on the
+    /// queues, where the system has sets) or `useResource` in every encoder (`false`).
+    pub fn with_residency_sets(mut self, on: bool) -> Metal {
+        self.residency_sets = on && sets_supported(&self.dev);
+        self.pool_sets = self.residency_sets;
+        self
+    }
+
+    /// The heaps' sets alone, whatever the Mac's memory: what [`Metal::new`] chooses on a large one.
+    pub fn with_heap_sets(mut self) -> Metal {
+        self.residency_sets = sets_supported(&self.dev);
+        self.pool_sets = false;
+        self
+    }
+
+    /// Metal's own estimate of how much GPU memory this device can keep
+    /// resident at once, in bytes (`recommendedMaxWorkingSetSize`).
+    pub fn recommended_working_set(&self) -> u64 {
+        self.dev.recommendedMaxWorkingSetSize()
+    }
+}
+
+/// A metallib image to a library. shortcut: it goes through a file (no dispatch_data here); one
+/// name per library, because Metal keeps libraries by URL. Use `newLibraryWithData` once dispatch2
+/// is a dependency.
+pub(crate) fn load_library(dev: &Dev, lib: &[u8]) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
+    {
+        let n = LIBRARIES.fetch_add(1, Ordering::Relaxed);
+        let file =
+            std::env::temp_dir().join(format!("victory-metal-{}-{n}.metallib", std::process::id()));
+        std::fs::write(&file, lib).map_err(|e| e.to_string())?;
+        let url = NSURL::fileURLWithPath(&NSString::from_str(file.to_str().unwrap()));
+        let l = dev.newLibraryWithURL_error(&url);
+        let _ = std::fs::remove_file(&file);
+        l.map_err(|e| e.localizedDescription().to_string())
+    }
+}
+
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Pipelines waiting for a `pipeline-compile` thread. The one asked for last goes first: it is
+/// the one a frame may be waiting for, behind those earlier frames put off.
+static JOBS: (std::sync::Mutex<Vec<Job>>, std::sync::Condvar) = (std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new());
+
+/// Runs `job` on one of the `pipeline-compile` threads (as many as cores, started at the first).
+fn compile_later(job: Job) {
+    static THREADS: std::sync::Once = std::sync::Once::new();
+    THREADS.call_once(|| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+            let _ = std::thread::Builder::new().name("pipeline-compile".into()).spawn(|| {
+                loop {
+                    let mut jobs = JOBS.0.lock().unwrap_or_else(|e| e.into_inner());
+                    let job = loop {
+                        match jobs.pop() {
+                            Some(job) => break job,
+                            None => jobs = JOBS.1.wait(jobs).unwrap_or_else(|e| e.into_inner()),
+                        }
+                    };
+                    drop(jobs);
+                    objc2::rc::autoreleasepool(|_| job());
+                }
+            });
+        }
+    });
+    JOBS.0.lock().unwrap_or_else(|e| e.into_inner()).push(job);
+    JOBS.1.notify_one();
+}
+
+/// What the job `start` gives makes, on a `pipeline-compile` thread, if it comes within `wait`.
+/// `None` while it is still being made: the same `key` later picks it up, without waiting again
+/// (its draws come many times a frame, and frames after the first would stall on it in turn).
+pub(crate) fn within<T: 'static, J: FnOnce() -> T + Send + 'static>(
+    compiling: &Compiling<T>,
+    key: [u8; 32],
+    wait: std::time::Duration,
+    start: impl FnOnce() -> Result<J, String>,
+) -> Result<Option<T>, String> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let started = compiling.borrow_mut().remove(&key);
+    let (rx, wait) = match started {
+        Some(rx) => (rx, std::time::Duration::ZERO),
+        None => {
+            let job = start()?;
+            let (tx, rx) = std::sync::mpsc::channel();
+            compile_later(Box::new(move || {
+                let _ = tx.send(crate::archive::Sendable(job()));
+            }));
+            (rx, wait)
+        }
+    };
+    match rx.recv_timeout(wait) {
+        Ok(made) => Ok(Some(made.0)),
+        Err(RecvTimeoutError::Timeout) => {
+            compiling.borrow_mut().insert(key, rx);
+            Ok(None)
+        }
+        Err(RecvTimeoutError::Disconnected) => Err("the pipeline's compile thread ended without a result".into()),
+    }
+}
+
+fn compile_key(dxil: &[u8], layout: Option<&RootLayout>) -> [u8; 32] {
+    *blake3::Hasher::new().update(dxil).update(format!("{layout:?}").as_bytes()).finalize().as_bytes()
+}
+
+pub(crate) struct Compiler {
+    pub(crate) dev: Dev,
+    pub(crate) msc: std::sync::Arc<Msc>,
+    pub(crate) archive: Option<std::sync::Arc<crate::archive::Archive>>,
+}
+
+// SAFETY: Metal's devices may be used from any thread; the converter and the archive are `Sync`.
+unsafe impl Send for Compiler {}
+
+impl Compiler {
+    /// DXIL to a compute pipeline state: converted, loaded, then from the archive or compiled.
+    fn compute(&self, dxil: &[u8], layout: Option<&RootLayout>) -> Result<ComputeState, String> {
+        // A pipeline that crashed Metal's compiler on an earlier run would only crash it again.
+        let crash_key = crate::disk::key(&[dxil]);
+        if crate::disk::crashed(crash_key.as_bytes()) {
+            return Err("Metal's compiler crashed on it on an earlier run".into());
+        }
+        let (_, lib) = self.msc.convert_with(dxil, None, layout, false).map_err(|e| e.to_string())?;
+        let l = load_library(&self.dev, &lib)?;
         let name = l
             .functionNames()
             .iter()
             .next()
             .ok_or("converted library is empty")?;
         let f = l.newFunctionWithName(&name).ok_or("no function")?;
-        let p = self
-            .dev
-            .newComputePipelineStateWithFunction_error(&f)
-            .map_err(|e| e.localizedDescription().to_string())?;
-        Ok(Pipeline(p))
-    }
-
-    /// Heap residency through `MTLResidencySet` (`true`) or `useResource` in every encoder (`false`).
-    pub fn with_residency_sets(mut self, on: bool) -> Metal {
-        self.residency_sets = on;
-        self
-    }
-
-    /// A metallib image to a library. shortcut: it goes through a file (no dispatch_data here); one
-    /// name per library, because Metal keeps libraries by URL. Use `newLibraryWithData` once dispatch2
-    /// is a dependency.
-    pub(crate) fn load_library(
-        &self,
-        lib: &[u8],
-    ) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
-        let n = LIBRARIES.fetch_add(1, Ordering::Relaxed);
-        let file =
-            std::env::temp_dir().join(format!("victory-metal-{}-{n}.metallib", std::process::id()));
-        std::fs::write(&file, lib).map_err(|e| e.to_string())?;
-        let url = NSURL::fileURLWithPath(&NSString::from_str(file.to_str().unwrap()));
-        let l = self.dev.newLibraryWithURL_error(&url);
-        let _ = std::fs::remove_file(&file);
-        l.map_err(|e| e.localizedDescription().to_string())
+        let d = MTLComputePipelineDescriptor::new();
+        d.setComputeFunction(Some(&f));
+        match &self.archive {
+            Some(a) => a.compute(&self.dev, &d, &crash_key),
+            None => crate::archive::compile_compute(&self.dev, &d, &crash_key),
+        }
     }
 }
 
@@ -158,8 +398,11 @@ impl ComputeBackend for Metal {
 
     fn create_queue(&self) -> Result<Queue, String> {
         let q = self.dev.newCommandQueue().ok_or("newCommandQueue failed")?;
-        let order = self.dev.newEvent().ok_or("newEvent failed")?;
-        Ok(Queue(q, std::cell::Cell::new(false), order, std::cell::Cell::new(0)))
+        let order = self.dev.newSharedEvent().ok_or("newSharedEvent failed")?;
+        // With the heaps' sets alone the host orders the queue's work from the start; with the
+        // pool's set too, from when that set joins the queue (`make_resident`).
+        let ordered = self.residency_sets && !self.pool_sets;
+        Ok(Queue(q, std::cell::Cell::new(ordered), order, std::cell::Cell::new(0)))
     }
 
     fn create_fence(&self, initial: u64) -> Result<Fence, String> {
@@ -188,8 +431,22 @@ impl ComputeBackend for Metal {
         })
     }
 
+    fn host_buffer(&self, len: usize) -> Result<(Buffer, *mut u8), String> {
+        let buf = self
+            .dev
+            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+            .ok_or("no host buffer")?;
+        let base = buf.contents().as_ptr().cast::<u8>();
+        let buffer = Buffer {
+            buf,
+            base,
+            resident: Default::default(),
+        };
+        Ok((buffer, base))
+    }
+
     fn make_resident(&self, queue: &Queue, buffers: &[&Buffer]) -> Result<(), String> {
-        if !self.residency_sets {
+        if !self.pool_sets {
             return Ok(());
         }
         let set = {
@@ -227,8 +484,15 @@ impl ComputeBackend for Metal {
         b.buf.gpuAddress() + (title as usize - b.base as usize) as u64
     }
 
+    fn name_pipeline(&self, p: &Pipeline, name: &str) {
+        if self.trace_fails {
+            let key = Retained::as_ptr(&p.0) as *const u8 as usize;
+            self.pipe_names.borrow_mut().insert(key, name.to_string());
+        }
+    }
+
     fn create_compute_pipeline(&self, dxil: &[u8]) -> Result<Pipeline, String> {
-        self.compute_from(self.msc.convert(dxil, None))
+        Ok(Pipeline(self.compiler()?.compute(dxil, None)?, self.static_samplers(None)?))
     }
 
     fn create_compute_pipeline_with(
@@ -236,7 +500,22 @@ impl ComputeBackend for Metal {
         dxil: &[u8],
         layout: &RootLayout,
     ) -> Result<Pipeline, String> {
-        self.compute_from(self.msc.convert_with(dxil, None, Some(layout)))
+        Ok(Pipeline(self.compiler()?.compute(dxil, Some(layout))?, self.static_samplers(Some(layout))?))
+    }
+
+    /// Converted and compiled on a `pipeline-compile` thread, so pipelines put off past `wait`
+    /// are made side by side while the frame goes on.
+    fn create_compute_pipeline_within(
+        &self,
+        dxil: &[u8],
+        layout: Option<&RootLayout>,
+        wait: std::time::Duration,
+    ) -> Result<Option<Pipeline>, String> {
+        let made = within(&self.compiling, compile_key(dxil, layout), wait, || {
+            let (compiler, dxil, layout) = (self.compiler()?, dxil.to_vec(), layout.cloned());
+            Ok(move || compiler.compute(&dxil, layout.as_ref()))
+        })?;
+        made.map(|state| Ok(Pipeline(state?, self.static_samplers(layout)?))).transpose()
     }
 
     fn submit(&self, queue: &Queue, work: &Submission<'_, Self>) -> Result<(), String> {
@@ -335,6 +614,8 @@ mod tests {
             heaps: Default::default(),
             groups: [N / 64, 1, 1],
             threads_per_group: [64, 1, 1],
+            indirect: None,
+            count: None,
         }
     }
 
@@ -344,6 +625,7 @@ mod tests {
     #[test]
     fn queue_b_waits_for_queue_a_over_the_same_buffer() {
         let Some(m) = backend() else { return };
+        let _flight = crate::gfx::FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
         let (qa, qb) = (m.create_queue().unwrap(), m.create_queue().unwrap());
         let fence = m.create_fence(0).unwrap();
         let done = m.create_fence(0).unwrap();
@@ -386,6 +668,7 @@ mod tests {
     #[test]
     fn cpu_signal_releases_a_waiting_queue() {
         let Some(m) = backend() else { return };
+        let _flight = crate::gfx::FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
         let q = m.create_queue().unwrap();
         let (gate, done) = (m.create_fence(0).unwrap(), m.create_fence(0).unwrap());
         let p = m.create_compute_pipeline(AFFINE).unwrap();
@@ -412,6 +695,7 @@ mod tests {
     #[test]
     fn many_submissions_in_flight_one_wait() {
         let Some(m) = backend() else { return };
+        let _flight = crate::gfx::FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
         const SUBS: u64 = 64;
         let queues: Vec<_> = (0..4).map(|_| m.create_queue().unwrap()).collect();
         let chain = m.create_fence(0).unwrap();
@@ -452,5 +736,62 @@ mod tests {
         );
         // SUBS is even: the last write is array 0.
         assert!((0..N).all(|i| mem.get(0, i) == SUBS as u32));
+    }
+
+    /// The heaps' sets are the default only from 32 GiB (the world's set holds 17 to 18 GB), `heap`
+    /// forces them on any Mac, `0` names everything per encoder and `1` adds the pool's queue set.
+    #[test]
+    fn the_default_residency_mode_follows_the_macs_memory() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(residency_mode(None, true, 18 * GIB), (false, false));
+        assert_eq!(residency_mode(None, true, 32 * GIB), (true, false));
+        assert_eq!(residency_mode(None, false, 64 * GIB), (false, false));
+        assert_eq!(residency_mode(Some("heap"), true, 16 * GIB), (true, false));
+        assert_eq!(residency_mode(Some("heap"), false, 16 * GIB), (false, false));
+        assert_eq!(residency_mode(Some("0"), true, 64 * GIB), (false, false));
+        assert_eq!(residency_mode(Some("1"), true, 16 * GIB), (true, true));
+        assert!(physical_memory() >= GIB);
+    }
+
+    #[test]
+    fn missing_msc_returns_error_instead_of_panicking() {
+        let mut m = Metal::new().expect("Metal device available on macOS");
+        m.msc = crate::msc::Msc::open("/nonexistent/libmetalirconverter.dylib").map(std::sync::Arc::new);
+        // Non-shader operations still succeed without MSC.
+        let q = m.create_queue().unwrap();
+        let f = m.create_fence(0).unwrap();
+        m.signal(&f, 1);
+        assert_eq!(m.completed(&f), 1);
+        drop(q);
+        // Shader conversion returns an Err instead of panicking.
+        assert!(m.create_compute_pipeline(AFFINE).is_err());
+    }
+
+    #[test]
+    fn recommended_working_set_is_nonzero_on_real_hardware() {
+        let m = Metal::new().expect("Metal device available on macOS");
+        assert!(m.recommended_working_set() > 0);
+    }
+
+    /// A pipeline still compiling when the wait ends is not an error: the same call later picks
+    /// it up, and nothing is compiled twice.
+    #[test]
+    fn a_pipeline_still_compiling_is_picked_up_later() {
+        let Some(m) = backend() else { return };
+        let none = std::time::Duration::ZERO;
+        let (tx, rx) = std::sync::mpsc::channel();
+        m.compiling.borrow_mut().insert(compile_key(AFFINE, None), rx);
+        assert!(m.create_compute_pipeline_within(AFFINE, None, none).unwrap().is_none());
+        // Not waited for again, whatever the frame has left.
+        let asked = std::time::Instant::now();
+        assert!(m.create_compute_pipeline_within(AFFINE, None, std::time::Duration::from_secs(30)).unwrap().is_none());
+        assert!(asked.elapsed() < std::time::Duration::from_secs(10));
+        tx.send(crate::archive::Sendable(m.compiler().unwrap().compute(AFFINE, None))).unwrap();
+        assert!(m.create_compute_pipeline_within(AFFINE, None, none).unwrap().is_some());
+        assert!(m.compiling.borrow().is_empty());
+        // One nothing has started is compiled on its own thread and waited for.
+        let other = include_bytes!("../tests/fixtures/heap_rw.dxil");
+        assert!(m.create_compute_pipeline_within(other, None, std::time::Duration::MAX).unwrap().is_some());
+        assert!(m.compiling.borrow().is_empty());
     }
 }

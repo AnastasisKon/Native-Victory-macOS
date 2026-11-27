@@ -135,7 +135,15 @@ pub struct Resources {
     /// the root signature's memory, [`USER_DATA`]), layout index, dword
     /// within the parameter.
     pub params: Vec<(Value, usize, u32)>,
+    /// Live-in SGPRs an address was taken in that no root parameter fills
+    /// (each pairs with the next); their addresses track as title memory
+    /// ([`MEMORY`]).
+    pub memory_inputs: Vec<u8>,
     pub waterfall: Waterfall,
+    /// Buffer accesses through a loaded descriptor whose stride the program cleared
+    /// (`Tracer::stride_cleared`): the index adds nothing to the address (index × stride, RDNA2
+    /// ISA 8.1.5).
+    pub unstrided: Vec<Site>,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -172,6 +180,12 @@ pub fn track(
     track_graphics(p, layout, stage, lanes, false)
 }
 
+fn collect_memory_inputs(t: &Tracer) -> Vec<u8> {
+    let mut v: Vec<u8> = t.memory_inputs.borrow().iter().copied().collect();
+    v.sort_unstable();
+    v
+}
+
 pub(crate) fn track_graphics(
     p: &Program,
     layout: &[RootParam],
@@ -180,7 +194,8 @@ pub(crate) fn track_graphics(
     computed_buffers: bool,
 ) -> Result<Resources, ShaderError> {
     let mut t = Tracer::new(p, layout, stage, lanes)?;
-    t.computed_buffers = computed_buffers && stage == HwStage::Ps;
+    t.computed_buffers =
+        computed_buffers && matches!(stage, HwStage::Vs | HwStage::Ps | HwStage::Cs);
     let mut out = Resources {
         params: p
             .inputs
@@ -243,7 +258,10 @@ pub(crate) fn track_graphics(
                 // descriptor. Lowering one is a no-op on the host, so there
                 // is no descriptor to keep alive for it.
                 Fields::Buffer { rsrc, .. } if !inst.name().ends_with("_inv") => {
-                    descriptor(rsrc, Role::Resource)?
+                    descriptor(rsrc, Role::Resource)?;
+                    if t.stride_cleared(inst, rsrc).is_some() {
+                        out.unstrided.push(site);
+                    }
                 }
                 Fields::Buffer { .. } => {}
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
@@ -289,6 +307,7 @@ pub(crate) fn track_graphics(
     // The proof needs the per-lane form. Without it nothing is emitted, and
     // its failure is the one to report, so the reads stay unproven here.
     if t.lanes.is_none() {
+        out.memory_inputs = collect_memory_inputs(&t);
         return Ok(out);
     }
     for (block, (accesses, mut reads)) in first_lane_at {
@@ -314,6 +333,7 @@ pub(crate) fn track_graphics(
             out.waterfall.loads.extend(loads);
         }
     }
+    out.memory_inputs = collect_memory_inputs(&t);
     Ok(out)
 }
 
@@ -357,6 +377,9 @@ struct Tracer<'a> {
     /// The loads from that memory by code offset, with their user-data byte
     /// offset.
     spill_at: std::collections::HashMap<usize, Result<u32, &'static str>>,
+    /// Live-in SGPRs whose pair an address was taken in with no root
+    /// parameter filling them (tracked as title memory).
+    memory_inputs: std::cell::RefCell<std::collections::BTreeSet<u8>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -455,6 +478,7 @@ impl<'a> Tracer<'a> {
             spilled: Default::default(),
             first_spilled: Default::default(),
             spill_at: Default::default(),
+            memory_inputs: Default::default(),
         };
         t.origin = t.propagate_copies(n)?;
         // Loads from the root signature's memory are found by their address,
@@ -614,7 +638,7 @@ impl<'a> Tracer<'a> {
                         {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
-                            None => Some(Term::Value(v)),
+                            None => self.xor_undone(inst, k, &o).or(Some(Term::Value(v))),
                         };
                         if new.is_some() && new != o[v.0 as usize] {
                             o[v.0 as usize] = new;
@@ -884,9 +908,10 @@ impl<'a> Tracer<'a> {
 
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register); title memory ([`MEMORY`]) when the
-    /// program computes it from data. Addresses into descriptor heaps, the
-    /// code or an SGPR the root signature does not fill are traced or
-    /// refused.
+    /// program computes it from data, including from a live-in SGPR the
+    /// root signature does not fill (the console's user data carries raw
+    /// addresses; guessed: such a pair is always a title-memory address).
+    /// Addresses into descriptor heaps or the code are traced or refused.
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
         const DATA: &[&str] = &[
             "an address not from a root parameter",
@@ -895,6 +920,7 @@ impl<'a> Tracer<'a> {
             "an address with two computed terms",
             "an address with an untracked high half",
             "an address from a root parameter that is no address",
+            "an address in an SGPR that is no root parameter",
             "a constant address",
         ];
         match self.traced_address(lo, hi, extra) {
@@ -1025,6 +1051,16 @@ impl<'a> Tracer<'a> {
 
     /// `hi` is `high` (0 for a table), possibly plus a carry.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
+        // The compiler can mask the carry to the address width. Strip the AND only
+        // if it keeps every possible bit of its input (0 + 0 + SCC is at most 1).
+        let hi = match hi {
+            Term::Value(v) => match self.sop2(v, &["s_and_b32"]) {
+                Some((_, [t, Term::Const(mask)] | [Term::Const(mask), t]))
+                    if self.possible_bits(t, 1) & !mask == 0 => t,
+                _ => hi,
+            },
+            _ => hi,
+        };
         let want = high.map_or(Term::Const(0), Term::Value);
         hi == want
             // The high half cut to a 40-bit address (`s_bfe_u32 hi, hi, 8 bits from 0`).
@@ -1083,7 +1119,10 @@ impl<'a> Tracer<'a> {
         if self.param_value(v).is_some() {
             return "an address from a root parameter that is no address";
         }
-        if self.inputs[v.0 as usize].is_some() {
+        if let Some(reg) = self.inputs[v.0 as usize] {
+            if let Reg::S(n) = reg {
+                self.memory_inputs.borrow_mut().insert(n);
+            }
             return "an address in an SGPR that is no root parameter";
         }
         if self
@@ -1152,11 +1191,18 @@ impl<'a> Tracer<'a> {
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
         // A byte access through a buffer descriptor made raw reads what the
-        // descriptor's view does with a raw host view.
-        if !inst.name().contains("format")
+        // descriptor's view does with a raw host view. So does a typed load
+        // that names its own format (`tbuffer_load_format_*`), which reads
+        // the raw view by bytes; `buffer_load_format_*` reads the view's
+        // elements, which the cleared stride would change.
+        let own_format = matches!(inst.fields, Fields::Buffer { format: Some(_), .. });
+        if (own_format || !inst.name().contains("format"))
             && let Some(raw) = self.made_raw(&words)
         {
             words = raw.to_vec();
+        }
+        if let Some(loaded) = self.stride_cleared(inst, op) {
+            words = loaded;
         }
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
@@ -1237,13 +1283,106 @@ impl<'a> Tracer<'a> {
                 if self.def(v).is_some_and(|i| i.name().starts_with("s_load_")))
         };
         Err(if words.iter().any(loaded) {
-            "a descriptor changed after loading"
+            self.changed(words)
         } else {
             "a descriptor neither loaded nor built"
         })
     }
 
-    /// Bits that may be set in a built buffer descriptor's high dword.
+    /// Why a descriptor with a loaded dword is no load's: the first dword that is not the load's
+    /// next one, and what made it, so a refusal log says which form a title uses.
+    fn changed(&self, words: &[Term]) -> &'static str {
+        // The load of the first loaded dword, and where in it the descriptor would start.
+        let reference = words.iter().enumerate().find_map(|(k, w)| {
+            let Term::Value(v) = *w else { return None };
+            let inst = self.def(v).filter(|i| i.name().starts_with("s_load_"))?;
+            let at = inst.writes.iter().position(|x| x.1 == v)?;
+            Some((inst, at.checked_sub(k)))
+        });
+        let Some((load, Some(start))) = reference else {
+            return changed_why(0, Change::OtherLoad);
+        };
+        let Some((k, word)) = words
+            .iter()
+            .enumerate()
+            .find(|&(k, w)| load.writes.get(start + k).is_none_or(|x| *w != Term::Value(x.1)))
+        else {
+            return changed_why(0, Change::OtherLoad);
+        };
+        let kind = match *word {
+            Term::Const(_) => Change::Constant,
+            Term::Value(v) if self.phis[v.0 as usize].is_some() => Change::Selected,
+            Term::Value(v) => match self.def(v).map(Inst::name) {
+                None => Change::Input,
+                Some(n) if n.starts_with("s_load_") => Change::OtherLoad,
+                Some(n) if n.starts_with("s_cselect") || n.starts_with("s_cmov") => {
+                    Change::Selected
+                }
+                Some(n)
+                    if ["s_and", "s_or", "s_xor", "s_nand", "s_nor", "s_xnor", "s_bfi", "s_bfm"]
+                        .iter()
+                        .any(|p| n.starts_with(p))
+                        || n.starts_with("s_bitset") =>
+                {
+                    Change::Masked
+                }
+                Some(n) if ["s_add", "s_sub"].iter().any(|p| n.starts_with(p)) => Change::Offset,
+                Some(n)
+                    if ["s_mul", "s_lshl", "s_lshr", "s_ashr", "s_bfe"]
+                        .iter()
+                        .any(|p| n.starts_with(p)) =>
+                {
+                    Change::Scaled
+                }
+                Some(_) => Change::Computed,
+            },
+        };
+        if let (Change::Masked, Term::Value(v)) = (kind, *word)
+            && let Some(inst) = self.def(v)
+        {
+            return self.masked_why(k, inst, v);
+        }
+        changed_why(k, kind)
+    }
+
+    /// The refusal of dword `k` masked or merged by `inst` (writing `v`): the operation and its
+    /// constant operands, the half of a 64-bit one that `v` is, so a log tells the exact form.
+    fn masked_why(&self, k: usize, inst: &Inst, v: Value) -> &'static str {
+        let Fields::Sop { dst, src, .. } = &inst.fields else {
+            return changed_why(k, Change::Masked);
+        };
+        // Which dword of a 64-bit result `v` is.
+        let half = match (dst, inst.writes.iter().find(|w| w.1 == v)) {
+            (Some(Operand::Scalar { code, .. }), Some(&(Reg::S(r), _))) => r.wrapping_sub(*code),
+            _ => 0,
+        };
+        let constants: Vec<String> = src
+            .iter()
+            .filter_map(|op| match *op {
+                Operand::Scalar { code, .. } if code != NULL => {
+                    match self.origin(inst.read(Reg::S(code + half))?) {
+                        Term::Const(c) => Some(format!("{c:#x}")),
+                        Term::Value(_) => None,
+                    }
+                }
+                _ => match self.term(inst, op)? {
+                    Term::Const(c) => Some(format!("{c:#x}")),
+                    Term::Value(_) => None,
+                },
+            })
+            .collect();
+        let with = if constants.is_empty() {
+            "computed values".to_string()
+        } else {
+            constants.join(" and ")
+        };
+        interned(format!(
+            "a descriptor changed after loading: dword {k} masked or merged ({} with {with})",
+            inst.name()
+        ))
+    }
+
+    /// Bits that may be set in a scalar term.
     // shortcut: prove bounds through short scalar ALU chains, extend the analysis if
     // a buffer descriptor's swizzle bits are cleared through other instructions.
     fn possible_bits(&self, term: Term, depth: u8) -> u32 {
@@ -1573,6 +1712,44 @@ impl<'a> Tracer<'a> {
             return None;
         };
         (x == d1).then_some([w0, d1, d2, d3])
+    }
+
+    /// The loaded words of a buffer descriptor whose dword 1 is the load's ANDed with a constant
+    /// that clears the whole stride and nothing else (bits 16-29 cleared; the base address bits
+    /// 0-15 and the swizzle bits 30-31 kept), for a buffer access that is not typed. With
+    /// stride 0 the address is base + offsets (the index times the stride adds nothing, RDNA2
+    /// ISA 8.1.5), which the loaded view's raw access gives once the index is dropped
+    /// (`Resources::unstrided`).
+    // Guess: the bounds stay the host view's size. That is the console's when the title's V#
+    // checks raw bounds in bytes (OOB_SELECT 3, no swizzle: offset + payload > num_records, in
+    // bytes with stride 0, ISA tables 33 and 35); select 0 would put every access out of range,
+    // and select 1 would check the dropped index against num_records.
+    fn stride_cleared(&self, inst: &Inst, op: &Operand) -> Option<Vec<Term>> {
+        let Fields::Buffer { format: None, .. } = inst.fields else {
+            return None;
+        };
+        if inst.name().contains("format") {
+            return None;
+        }
+        let Operand::Scalar { code, dwords: 4 } = *op else {
+            return None;
+        };
+        let mut words = (0..4)
+            .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
+            .collect::<Option<Vec<_>>>()?;
+        let Term::Value(w1) = words[1] else {
+            return None;
+        };
+        const STRIDE: u32 = 0x3FFF_0000;
+        let loaded = match self.sop2(w1, &["s_and_b32"])?.1 {
+            // The whole stride cleared (a part could leave a stride, and the index would count),
+            // nothing else.
+            [x, Term::Const(c)] | [Term::Const(c), x] if c & STRIDE == 0 && !c & !STRIDE == 0 => x,
+            _ => return None,
+        };
+        words[1] = loaded;
+        self.loaded(&words)?;
+        Some(words)
     }
 
     /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
@@ -2167,6 +2344,71 @@ impl<'a> Tracer<'a> {
     }
 }
 
+/// `text` as a refusal reason, which is `&'static str` throughout the tracer: each distinct text
+/// is kept once for the program's life.
+// shortcut: formatted reasons are leaked, one per distinct text (a handful per title); give
+// refusals an owned reason if that ever grows.
+fn interned(text: String) -> &'static str {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&s) = seen.get(text.as_str()) {
+        return s;
+    }
+    let s: &'static str = Box::leak(text.into_boxed_str());
+    seen.insert(s);
+    s
+}
+
+/// What a dword of a descriptor that is no load's is instead (see `Tracer::changed`).
+#[derive(Clone, Copy)]
+enum Change {
+    Constant,
+    OtherLoad,
+    Masked,
+    Offset,
+    Scaled,
+    Selected,
+    Input,
+    Computed,
+}
+
+/// "a descriptor changed after loading", then which dword and how.
+fn changed_why(dword: usize, kind: Change) -> &'static str {
+    macro_rules! how {
+        ($d:literal) => {
+            match kind {
+                Change::Constant => concat!("a descriptor changed after loading: dword ", $d,
+                    " is a constant"),
+                Change::OtherLoad => concat!("a descriptor changed after loading: dword ", $d,
+                    " comes from another load or place in it"),
+                Change::Masked => concat!("a descriptor changed after loading: dword ", $d,
+                    " masked or merged (s_and, s_or, s_bfi...)"),
+                Change::Offset => concat!("a descriptor changed after loading: dword ", $d,
+                    " added to (s_add, s_sub...)"),
+                Change::Scaled => concat!("a descriptor changed after loading: dword ", $d,
+                    " shifted, multiplied or extracted (s_lshl, s_mul, s_bfe...)"),
+                Change::Selected => concat!("a descriptor changed after loading: dword ", $d,
+                    " chosen by a select or a join"),
+                Change::Input => concat!("a descriptor changed after loading: dword ", $d,
+                    " is a program input"),
+                Change::Computed => concat!("a descriptor changed after loading: dword ", $d,
+                    " computed otherwise"),
+            }
+        };
+    }
+    match dword {
+        0 => how!("0"),
+        1 => how!("1"),
+        2 => how!("2"),
+        3 => how!("3"),
+        4 => how!("4"),
+        5 => how!("5"),
+        6 => how!("6"),
+        _ => how!("7"),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Moved {
     Const(u32),
@@ -2368,9 +2610,13 @@ pub(crate) fn vertex_roots_match_rebased(
                 (Ok(Some(a)), after) if a.param < absolute.len() && after != Ok(Some(a)) => {
                     return Ok(false);
                 }
-                (Err("an address in an SGPR that is no root parameter"), Ok(Some(a)))
-                    if relative.get(a.param).is_some_and(|r|
-                        matches!(r.root, RootType::Table | RootType::Descriptor)) =>
+                // The old layout leaves the pair undeclared, so its address
+                // is title memory; the rebased one binds it to a table or
+                // descriptor parameter.
+                (Ok(Some(old_a)), Ok(Some(new_a)))
+                    if old_a.param == MEMORY
+                        && relative.get(new_a.param).is_some_and(|r|
+                            matches!(r.root, RootType::Table | RootType::Descriptor)) =>
                 {
                     found = true;
                 }
@@ -2513,6 +2759,41 @@ impl Tracer<'_> {
 
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
     /// lane, found by following the VGPR's `v_writelane_b32` writes.
+    /// What dword `k` of `s_xor_b32/b64 d, x, y` leaves when `x` is `a ^ b` and `y` holds what `b`
+    /// (or `a`) does: the other one. The title's compiler swaps descriptor dwords between SGPRs in
+    /// three XORs.
+    fn xor_undone(&self, inst: &Inst, k: usize, o: &[Option<Term>]) -> Option<Term> {
+        let xor = |inst: &Inst, k: usize| -> Option<[Value; 2]> {
+            let pair = match inst.name() {
+                "s_xor_b32" => false,
+                "s_xor_b64" => true,
+                _ => return None,
+            };
+            let Fields::Sop { src, .. } = &inst.fields else { return None };
+            let [Operand::Scalar { code: a, .. }, Operand::Scalar { code: b, .. }] = src[..] else {
+                return None;
+            };
+            if k > usize::from(pair) || a == NULL || b == NULL {
+                return None;
+            }
+            Some([inst.read(Reg::S(a + k as u8))?, inst.read(Reg::S(b + k as u8))?])
+        };
+        let [x, y] = xor(inst, k)?;
+        for (x, y) in [(x, y), (y, x)] {
+            let Some(def) = self.def(x) else { continue };
+            let Some(j) = def.writes.iter().position(|w| w.1 == x) else { continue };
+            let Some([a, b]) = xor(def, j) else { continue };
+            let (a, b, y) = (o[a.0 as usize], o[b.0 as usize], o[y.0 as usize]);
+            if y.is_some() && y == b {
+                return a;
+            }
+            if y.is_some() && y == a {
+                return b;
+            }
+        }
+        None
+    }
+
     fn restored(&self, inst: &Inst) -> Option<Moved> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
@@ -2595,6 +2876,11 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
         let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
         return Some(Moved::Const(((1u32 << w) - 1) << at));
+    }
+    // The same in 64 bits (a sampler's first two words, from the title's compiler).
+    if let ("s_bfm_b64", [Operand::Const(w), Operand::Const(at)]) = (inst.name(), &src[..]) {
+        let (w, at) = (inline(*w)? & 63, inline(*at)? & 63);
+        return Some(Moved::Const((((1u64 << w) - 1) << at >> (32 * k)) as u32));
     }
     let src = src.first()?;
     match (inst.name(), *src) {
@@ -2680,6 +2966,33 @@ pub(crate) mod tests {
             offset,
             dynamic: None,
         }
+    }
+
+    #[test]
+    fn a_mask_that_preserves_a_heap_address_carry_keeps_the_table_offset() {
+        let run = |hi: u32, mask: u32| {
+            let words = [
+                0x8004_A004, // s_add_u32 s4, s4, 32
+                hi,
+                0x8705_FF05, mask, // s_and_b32 s5, s5, mask
+                0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xE070_0000, 0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+                S_ENDPGM,
+            ];
+            let code = words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            track(&p, &[param(Table, 4, 1)], HwStage::Cs, lanes(&p).as_ref())
+        };
+        let carried = 0x8205_8080; // s_addc_u32 s5, 0, 0
+        assert_eq!(run(carried, 0xff).unwrap().scalar, [((0, 3), at(0, 32))]);
+        // Clearing the carry changes the address.
+        assert!(run(carried, 0xfe).is_err());
+        // A masked arbitrary input can still name memory outside the heap.
+        assert!(matches!(run(0xBE85_0300, 0xff), // s_mov_b32 s5, s0
+            Err(ShaderError::Unsupported {
+                what: "an address into a descriptor heap with an untracked high half", ..
+            })
+        ));
     }
 
     #[test]
@@ -2886,6 +3199,53 @@ pub(crate) mod tests {
         assert_eq!(r.scalar, [((0, 2), at(0, 0)), ((0, 3), at(0, 0x10))]);
     }
 
+    /// A loaded buffer descriptor changed before use is refused naming the first dword that is
+    /// no longer the load's and how it was made: here records replaced by a constant, then the
+    /// base address offset.
+    #[test]
+    fn a_descriptor_changed_after_loading_says_which_dword_and_how() {
+        let run = |change: &[u32]| {
+            let mut words = vec![
+                0xBE88_0304, // s_mov_b32 s8, s4
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF408_0204,
+                0xFA00_0160, // s_load_dwordx4 s[8:11], s[8:9], 0x160
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            ];
+            words.extend_from_slice(change);
+            words.extend([
+                0xE078_1000,
+                0x8002_0007, // buffer_store_dwordx4 v[0:3], v7, s[8:11], 0 offen
+                S_ENDPGM,
+            ]);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            match track(&p, &[param(Table, 4, 1)], HwStage::Cs, lanes(&p).as_ref()) {
+                Err(ShaderError::Unsupported { what, .. }) => what,
+                r => panic!("{:?}", r.err()),
+            }
+        };
+        assert_eq!(
+            run(&[0xBE8A_03C0]), // s_mov_b32 s10, 64
+            "a descriptor changed after loading: dword 2 is a constant"
+        );
+        assert_eq!(
+            run(&[0x8008_9008, 0x8209_8009]), // s_add_u32 s8, s8, 16; s_addc_u32 s9, s9, 0
+            "a descriptor changed after loading: dword 0 added to (s_add, s_sub...)"
+        );
+        // A mask or merge names the operation and its constant operands, if any.
+        assert_eq!(
+            run(&[0x8709_FF09, 0x3FFF_FFFF]), // s_and_b32 s9, s9, 0x3fffffff
+            "a descriptor changed after loading: dword 1 masked or merged (s_and_b32 with \
+             0x3fffffff)"
+        );
+        assert_eq!(
+            run(&[0x8809_0409]), // s_or_b32 s9, s9, s4 (a program input)
+            "a descriptor changed after loading: dword 1 masked or merged (s_or_b32 with \
+             computed values)"
+        );
+    }
+
     /// The FidelityFX upscaler's byte accesses make a loaded buffer
     /// descriptor raw first (stride cleared, records times stride, bounds
     /// in bytes): the access reads the loaded descriptor. Any other change
@@ -2926,13 +3286,53 @@ pub(crate) mod tests {
             run(0xC000_FFFE).unwrap_err(),
             ShaderError::Unsupported {
                 offset: 0x3c,
-                what: "a descriptor changed after loading"
+                what: "a descriptor changed after loading: dword 1 masked or merged (s_and_b32 \
+                       with 0xc000fffe)"
             }
         );
     }
 
-    /// Immediate sampler words the upscaler's compiler makes with a bit
-    /// mask and a 64-bit move of a literal.
+    /// The title's compiler swaps descriptor dwords between SGPRs in three XORs (32 and 64 bits):
+    /// swapped there and back, the descriptor is the loaded one.
+    #[test]
+    fn descriptors_swapped_by_xors_are_the_loaded_ones() {
+        let swap32 = [0x8909_0D09, 0x890D_0D09, 0x8909_0D09]; // s9 <-> s13
+        let swap64 = [0x898A_0E0A, 0x898E_0E0A, 0x898A_0E0A]; // s[10:11] <-> s[14:15]
+        let words = |swaps: &[u32]| -> Vec<u8> {
+            [
+                &[
+                    0xBE88_0304, // s_mov_b32 s8, s4
+                    0xBE89_0380, // s_mov_b32 s9, 0
+                    0xF408_0204,
+                    0xFA00_0160, // s_load_dwordx4 s[8:11], s[8:9], 0x160
+                    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                    0xBE8D_0380, // s_mov_b32 s13, 0
+                    0xBE8E_0480, // s_mov_b64 s[14:15], 0
+                ][..],
+                swaps,
+                &[
+                    0xE078_1000,
+                    0x8002_0007, // buffer_store_dwordx4 v[0:3], v7, s[8:11], 0 offen
+                    S_ENDPGM,
+                ],
+            ]
+            .concat()
+            .iter()
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect()
+        };
+        let run = |swaps: &[u32]| {
+            let p = crate::ir::build(&words(swaps), false, 256).unwrap();
+            track(&p, &[param(Table, 4, 1)], HwStage::Cs, lanes(&p).as_ref())
+        };
+        let there_and_back = [swap32, swap32, swap64, swap64].concat();
+        run(&there_and_back).unwrap();
+        // Swapped once, its second dword is the zero.
+        assert!(run(&swap32).is_err());
+    }
+
+    /// Immediate sampler words the compilers make with bit masks (32 and
+    /// 64 bits) and a 64-bit move of a literal.
     #[test]
     fn sampler_words_from_bit_masks_and_wide_literals_are_constants() {
         let code: Vec<u8> = [
@@ -2940,6 +3340,7 @@ pub(crate) mod tests {
             0x9211_8C8C, // s_bfm_b32 s17, 12, 12
             0xBE92_04FF,
             0x1850_0000, // s_mov_b64 s[18:19], 0x18500000
+            0x9294_B682, // s_bfm_b64 s[20:21], 2, 54
             S_ENDPGM,
         ]
         .iter()
@@ -2953,6 +3354,9 @@ pub(crate) mod tests {
         assert_eq!(value(1, 0), Term::Const(0x00FF_F000));
         assert_eq!(value(2, 0), Term::Const(0x1850_0000));
         assert_eq!(value(2, 1), Term::Const(0));
+        // The title's samplers: bits 54 and 55, "a sampler built from computed words" before.
+        assert_eq!(value(3, 0), Term::Const(0));
+        assert_eq!(value(3, 1), Term::Const(0x00C0_0000));
     }
 
     /// A register kept in a second one across an inner loop that restores
@@ -3029,7 +3433,8 @@ pub(crate) mod tests {
             err,
             ShaderError::Unsupported {
                 offset: 36,
-                what: "a descriptor changed after loading"
+                what: "a descriptor changed after loading: dword 2 comes from another load or \
+                       place in it"
             }
         );
     }
@@ -3088,21 +3493,19 @@ pub(crate) mod tests {
         assert_eq!(r.scalar, [((0, 0), at(MEMORY, 0)), ((0, 1), at(MEMORY, 0))]);
     }
 
+    /// A live-in SGPR pair the layout does not declare holds a title-memory
+    /// address (guessed: the console's user data carries raw addresses), so
+    /// the load tracks to [`MEMORY`] and lowers through the memory space.
     #[test]
-    fn untraceable_addresses_fail_with_a_reason() {
+    fn an_address_in_an_sgpr_no_root_parameter_fills_is_title_memory() {
         let code: Vec<u8> = [0xF408_0001, 0xFA00_0000, S_ENDPGM] // s_load_dwordx4 s[0:3], s[2:3]
             .iter()
             .flat_map(|w: &u32| w.to_le_bytes())
             .collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
-        let err = track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap_err();
-        assert_eq!(
-            err,
-            ShaderError::Unsupported {
-                offset: 0,
-                what: "an address in an SGPR that is no root parameter"
-            }
-        );
+        let r = track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap();
+        assert_eq!(r.scalar, [((0, 0), at(MEMORY, 0))]);
+        assert_eq!(r.memory_inputs, [2]);
     }
 
     /// A waterfall loop over an image descriptor each lane loads from the

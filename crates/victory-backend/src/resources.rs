@@ -30,6 +30,7 @@ pub enum Format {
     Bc3,
     Bc4,
     Bc5,
+    /// BC6H of unsigned half floats (DXGI `BC6H_UF16`).
     Bc6h,
     Bc7,
     R8Unorm,
@@ -65,6 +66,8 @@ pub enum Format {
     Bgr5a1Unorm,
     /// Metal's `ABGR4Unorm`.
     Abgr4Unorm,
+    /// BC6H of signed half floats (DXGI `BC6H_SF16`).
+    Bc6hSigned,
 }
 
 impl Format {
@@ -78,7 +81,7 @@ impl Format {
             D32FloatS8 => (1, 8),
             Rgba16Float | Rg32Float | Rgba16Unorm | Rgba16Snorm | Rg32Uint => (1, 8),
             Bc1 | Bc1Srgb | Bc4 => (4, 8),
-            Bc2 | Bc3 | Bc3Srgb | Bc5 | Bc6h | Bc7 | Bc7Srgb => (4, 16),
+            Bc2 | Bc3 | Bc3Srgb | Bc5 | Bc6h | Bc6hSigned | Bc7 | Bc7Srgb => (4, 16),
             R8Unorm | A8Unorm | R8Uint => (1, 1),
             R16Unorm | R16Float | R16Uint | D16Unorm | Rg8Unorm | Rg8Uint | Rg8Snorm | Bgr5a1Unorm | Abgr4Unorm => (1, 2),
             Rgba32Float | Rgba32Uint => (1, 16),
@@ -89,6 +92,12 @@ impl Format {
     pub fn is_integer(self) -> bool {
         use Format::*;
         matches!(self, Rgba8Uint | R32Uint | R8Uint | Rgba32Uint | Rg32Uint | Rg16Uint | Rg8Uint | R16Uint)
+    }
+
+    /// A depth or depth-stencil format.
+    pub fn is_depth(self) -> bool {
+        use Format::*;
+        matches!(self, D32Float | D32FloatS8 | D16Unorm)
     }
 
     /// Bytes of one row of `width` texels (of blocks, for BC).
@@ -136,7 +145,7 @@ impl TextureDesc {
 }
 
 /// A view of part of a texture, possibly in another (size-compatible) format.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewDesc {
     pub format: Format,
     /// First mip, count.
@@ -156,13 +165,23 @@ pub enum Address {
     Wrap,
     Mirror,
     Clamp,
+    Border,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BorderColor {
+    TransparentBlack,
+    OpaqueBlack,
+    OpaqueWhite,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SamplerDesc {
-    pub min_mag: Filter,
+    pub min: Filter,
+    pub mag: Filter,
     pub mip: Filter,
     pub address: [Address; 3],
+    pub border_color: BorderColor,
     pub max_anisotropy: usize,
 }
 
@@ -202,6 +221,9 @@ pub trait ResourceBackend: ComputeBackend {
     /// A texture SRV or UAV.
     fn write_texture(&self, heap: &Self::Heap, index: usize, tex: &Self::Texture, min_lod: f32);
     fn write_sampler(&self, heap: &Self::Heap, index: usize, s: &Self::Sampler, lod_bias: f32);
+    /// Entry `index` names nothing any more: it reads as one never written, and what it kept
+    /// alive and resident is let go.
+    fn clear_entry(&self, heap: &Self::Heap, index: usize);
 
     fn create_texture(&self, desc: &TextureDesc) -> Result<Self::Texture, String>;
     fn create_texture_view(
@@ -373,6 +395,17 @@ pub struct Blend {
     pub op_alpha: BlendOp,
 }
 
+impl Blend {
+    /// Whether a factor reads the pixel shader's second output (`SRC1_*`): dual-source blending,
+    /// where one target takes two shader outputs and the second is a blend input only.
+    pub fn second_source(&self) -> bool {
+        use BlendFactor::*;
+        [self.src, self.dst, self.src_alpha, self.dst_alpha]
+            .into_iter()
+            .any(|f| matches!(f, Src1Color | InvSrc1Color | Src1Alpha | InvSrc1Alpha))
+    }
+}
+
 /// One colour target's output state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ColorState {
@@ -465,6 +498,10 @@ pub struct RenderPipelineDesc<'a> {
     pub cull: Cull,
     /// Blend and write mask per colour target; targets past the end are opaque, all channels.
     pub color_state: &'a [ColorState],
+    /// The pixel shader writes a second output for target 0, used only as a blend input
+    /// (dual-source blending). Metal wants that declared when the shader is converted, or the
+    /// pipeline is refused for not writing `color(0), index(1)`.
+    pub dual_source: bool,
     pub stencil: Option<StencilState>,
     pub raster: Raster,
 }
@@ -499,6 +536,8 @@ pub enum DrawCall {
         first_instance: u32,
         wide: bool,
     },
+    /// `DispatchMesh` of a mesh pipeline: thread groups in x, y, z.
+    Mesh { groups: [u32; 3] },
 }
 
 /// A viewport as `RSSetViewports` takes it: top left, size, depth range.
@@ -531,10 +570,16 @@ pub struct Draw<'a, B: GraphicsBackend + ?Sized> {
     pub fragment_root: Option<RootArgs>,
     pub heaps: Heaps<'a, B>,
     pub resources: Vec<&'a B::Buffer>,
-    /// `(buffer, title address)` per vertex stream, in `streams` order.
-    pub vertex_buffers: Vec<(&'a B::Buffer, *const u8)>,
+    /// `(input slot, buffer, title address)` for each bound vertex stream.
+    pub vertex_buffers: Vec<(usize, &'a B::Buffer, *const u8)>,
     pub index_buffer: Option<(&'a B::Buffer, *const u8)>,
     pub call: DrawCall,
+    /// `ExecuteIndirect`: the call's counts are read on the GPU from this title address (the
+    /// D3D12 argument records are Metal's indirect ones), and `call` gives only its kind.
+    pub indirect: Option<(&'a B::Buffer, *const u8)>,
+    /// `ExecuteIndirect` with a count buffer: the count's title address and this record's index.
+    /// The record runs only if the index is below the count, which the GPU reads when it runs.
+    pub count: Option<(&'a B::Buffer, *const u8, u32)>,
 }
 
 pub struct RenderPass<'a, B: GraphicsBackend + ?Sized> {
@@ -543,8 +588,18 @@ pub struct RenderPass<'a, B: GraphicsBackend + ?Sized> {
     pub draws: Vec<Draw<'a, B>>,
 }
 
-/// A GPU-side buffer operation on title memory (`CopyBufferRegion`, a fill), ordered with the passes around it.
-pub enum BlitOp<'a, B: ComputeBackend + ?Sized> {
+/// Signed view-relative bounds, with exclusive right and bottom edges.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct ClearRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+/// A GPU-side copy or fill operation, ordered with the passes around it.
+pub enum BlitOp<'a, B: ResourceBackend + ?Sized> {
     Copy {
         src: (&'a B::Buffer, *const u8),
         dst: (&'a B::Buffer, *const u8),
@@ -555,12 +610,50 @@ pub enum BlitOp<'a, B: ComputeBackend + ?Sized> {
         len: usize,
         value: u8,
     },
+    CopyTexture {
+        src: &'a B::Texture,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: &'a B::Texture,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    },
+    CopyBufferToTexture {
+        src: (&'a B::Buffer, *const u8),
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+        size: [usize; 3],
+        dst: &'a B::Texture,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    },
+    CopyTextureToBuffer {
+        src: &'a B::Texture,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: (&'a B::Buffer, *const u8),
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+    },
 }
 
 pub enum Pass<'a, B: GraphicsBackend + ?Sized> {
     Compute(&'a [Dispatch<'a, B>]),
     Render(RenderPass<'a, B>),
     Blit(Vec<BlitOp<'a, B>>),
+    ClearColorRects {
+        target: &'a B::Texture,
+        color: [f32; 4],
+        rects: &'a [ClearRect],
+    },
 }
 
 /// Like `Submission`, with render passes among the dispatches, run in order.
@@ -578,6 +671,15 @@ pub trait GraphicsBackend: ResourceBackend {
         &self,
         desc: &RenderPipelineDesc<'_>,
     ) -> Result<Self::RenderPipeline, String>;
+    /// As `ComputeBackend::create_compute_pipeline_within`: `None` while the pipeline is still
+    /// being made after `wait`. The default makes it at once, however long.
+    fn create_render_pipeline_within(
+        &self,
+        desc: &RenderPipelineDesc<'_>,
+        _wait: std::time::Duration,
+    ) -> Result<Option<Self::RenderPipeline>, String> {
+        self.create_render_pipeline(desc).map(Some)
+    }
     fn submit_passes(
         &self,
         queue: &Self::Queue,

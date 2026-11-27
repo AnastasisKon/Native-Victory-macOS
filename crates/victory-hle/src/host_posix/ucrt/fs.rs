@@ -4,15 +4,15 @@
 //! `_S_IFREG`/`_S_IFDIR` and the read, write and execute bits as the CRT
 //! sets them, and the times are `time_t` seconds.
 
+use std::ffi::CString;
 use std::fs::Metadata;
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::runtime::bad_param;
 use super::stdio::win_errno;
-use super::{
-    Ch, EACCES, EEXIST, EINVAL, ENOENT, ERANGE, exports, fail, heap, leak_cstr, set_errno, units,
-};
+use super::{Ch, EACCES, EEXIST, EINVAL, ENOENT, ERANGE, exports, fail, heap, set_errno, units};
 use crate::host_posix::files;
 
 const S_IFDIR: u16 = 0x4000;
@@ -232,16 +232,34 @@ pub extern "system" fn _wremove(path: *const u16) -> i32 {
 }
 
 fn rename_paths(from: Option<PathBuf>, to: Option<PathBuf>) -> i32 {
-    let (Some(from), Some(to)) = (from, to) else {
+    let (Some(from_path), Some(to_path)) = (from, to) else {
         set_errno(ENOENT);
         return -1;
     };
-    // Windows does not replace an existing file.
-    if to.exists() {
-        set_errno(EEXIST);
+    let [Ok(from), Ok(to)] = [&from_path, &to_path].map(|p| CString::new(p.as_os_str().as_bytes()))
+    else {
+        set_errno(EINVAL);
         return -1;
+    };
+    // SAFETY: both paths are live, NUL-terminated C strings.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        0
+    } else {
+        rename_error(&from_path, &to_path, std::io::Error::last_os_error())
     }
-    done(std::fs::rename(from, to))
+}
+
+fn rename_error(from_path: &Path, to_path: &Path, err: std::io::Error) -> i32 {
+    if err.raw_os_error() == Some(libc::ENOTSUP) {
+        // This filesystem has no RENAME_EXCL: check, then rename (not atomic).
+        if std::fs::symlink_metadata(to_path).is_ok() {
+            set_errno(EEXIST);
+            return -1;
+        }
+        return done(std::fs::rename(from_path, to_path));
+    }
+    set_errno(win_errno(&err));
+    -1
 }
 
 pub extern "system" fn rename(from: *const u8, to: *const u8) -> i32 {
@@ -284,8 +302,10 @@ pub(super) unsafe fn stat_from_metadata(out: *mut u8, m: &Metadata, wide_size: b
 
 fn put_str(dst: *mut u8, size: usize, s: &str) -> i32 {
     if s.len() + 1 > size {
-        // SAFETY: a buffer of at least one unit.
-        unsafe { dst.write(0) };
+        if size > 0 {
+            // SAFETY: a buffer of at least one unit.
+            unsafe { dst.write(0) };
+        }
         return fail(ERANGE);
     }
     // SAFETY: the title's buffer of `size`.
@@ -296,17 +316,38 @@ fn put_str(dst: *mut u8, size: usize, s: &str) -> i32 {
     0
 }
 
+/// `s` and a NUL in a `malloc` block of at least `min` bytes, which the title may `free`.
+fn malloc_str(s: &str, min: usize) -> *mut u8 {
+    let p: *mut u8 = heap::malloc((s.len() + 1).max(min)).cast();
+    if !p.is_null() {
+        // SAFETY: a fresh block of at least `s.len() + 1` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
+            p.add(s.len()).write(0);
+        }
+    }
+    p
+}
+
 pub extern "system" fn _getcwd(buf: *mut u8, max: i32) -> *mut u8 {
-    let Ok(cwd) = std::env::current_dir() else {
+    if !buf.is_null() && max <= 0 {
+        bad_param(EINVAL);
         return std::ptr::null_mut();
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            set_errno(win_errno(&e));
+            return std::ptr::null_mut();
+        }
     };
     let s = cwd.to_string_lossy().into_owned();
-    let buf = if buf.is_null() {
-        leak_cstr(s.as_bytes())
-    } else {
-        buf
-    };
-    if put_str(buf, max.max(0) as usize, &s) != 0 {
+    // No buffer: a malloc block of at least `max` bytes, as `_wgetcwd` makes (`heap::malloc`
+    // sets ENOMEM when it fails).
+    if buf.is_null() {
+        return malloc_str(&s, max.max(0) as usize);
+    }
+    if put_str(buf, max as usize, &s) != 0 {
         std::ptr::null_mut()
     } else {
         buf
@@ -366,11 +407,10 @@ pub extern "system" fn _fullpath(buf: *mut u8, path: *const u8, max: usize) -> *
     let Some(f) = full(&String::from_utf8_lossy(unsafe { super::bytes(path) })) else {
         return std::ptr::null_mut();
     };
-    let buf = if buf.is_null() {
-        leak_cstr(f.as_bytes())
-    } else {
-        buf
-    };
+    // No buffer: a malloc block the title frees, whatever `max` says.
+    if buf.is_null() {
+        return malloc_str(&f, 0);
+    }
     if put_str(buf, max, &f) != 0 {
         std::ptr::null_mut()
     } else {
@@ -412,8 +452,10 @@ unsafe fn copy_out<C: Ch>(dst: *mut C, size: usize, src: &[C], secure: bool) -> 
         return 0;
     }
     if secure && src.len() + 1 > size {
-        // SAFETY: a buffer of at least one unit.
-        unsafe { dst.write(C::default()) };
+        if size > 0 {
+            // SAFETY: a buffer of at least one unit.
+            unsafe { dst.write(C::default()) };
+        }
         return bad_param(ERANGE);
     }
     // SAFETY: the title's buffer.
@@ -424,17 +466,38 @@ unsafe fn copy_out<C: Ch>(dst: *mut C, size: usize, src: &[C], secure: bool) -> 
     0
 }
 
+unsafe fn clear_outputs<C: Ch>(out: [(*mut C, usize); 4]) {
+    for (dst, size) in out {
+        if !dst.is_null() && size > 0 {
+            // SAFETY: a buffer of at least one unit.
+            unsafe { dst.write(C::default()) };
+        }
+    }
+}
+
 unsafe fn g_splitpath<C: Ch>(path: *const C, out: [(*mut C, usize); 4], secure: bool) -> i32 {
+    if secure && out.iter().any(|&(dst, size)| dst.is_null() != (size == 0)) {
+        // SAFETY: only non-null buffers with positive size are cleared.
+        unsafe { clear_outputs(out) };
+        return bad_param(EINVAL);
+    }
     if path.is_null() {
+        if secure {
+            // SAFETY: only non-null buffers with positive size are cleared.
+            unsafe { clear_outputs(out) };
+        }
         return bad_param(EINVAL);
     }
     // SAFETY: a NUL-terminated path and the title's buffers.
     unsafe {
         let p = units(path);
         let parts = split(p);
-        for ((range, (dst, size)), _) in parts.iter().zip(out).zip(0..) {
+        for (range, (dst, size)) in parts.iter().zip(out) {
             let r = copy_out(dst, size, &p[range.clone()], secure);
             if r != 0 {
+                if secure {
+                    clear_outputs(out);
+                }
                 return r;
             }
         }
@@ -539,7 +602,7 @@ unsafe fn g_makepath<C: Ch>(
     ext: *const C,
     secure: bool,
 ) -> i32 {
-    if out.is_null() {
+    if out.is_null() || (secure && size == 0) {
         return bad_param(EINVAL);
     }
     let mut v: Vec<C> = Vec::new();
@@ -635,19 +698,15 @@ fn list(path: Option<PathBuf>) -> Option<Vec<Entry>> {
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
-    let mut entries: Vec<Entry> = vec![(".".into(), None), ("..".into(), None)];
-    for e in std::fs::read_dir(dir).ok()?.flatten() {
-        entries.push((
-            e.file_name().to_string_lossy().into_owned(),
-            e.metadata().ok(),
-        ));
-    }
+    let read = std::fs::read_dir(dir).ok()?;
+    let mut entries: Vec<Entry> = files::matching_entries(read, &pattern)
+        .map(|(name, entry)| (name, entry.and_then(|e| files::find_metadata(e.metadata()))))
+        .collect();
     for (name, meta) in entries.iter_mut() {
         if meta.is_none() {
-            *meta = std::fs::metadata(dir.join(&*name)).ok();
+            *meta = files::find_metadata(std::fs::metadata(dir.join(&*name)));
         }
     }
-    entries.retain(|(n, _)| files::wildcard(&pattern, &n.chars().collect::<Vec<_>>()));
     Some(entries)
 }
 
@@ -661,6 +720,8 @@ unsafe fn fill_find(out: *mut u8, e: &Entry, wide_name: bool, wide_size: bool) {
     });
     // SAFETY: the title's structure of at least 296 (or 560) bytes.
     unsafe {
+        let name_at = if wide_size { 40 } else { 36 };
+        std::ptr::write_bytes(out, 0, name_at);
         out.cast::<u32>().write_unaligned(attrib);
         if let Some(m) = meta {
             out.add(8)
@@ -673,14 +734,12 @@ unsafe fn fill_find(out: *mut u8, e: &Entry, wide_name: bool, wide_size: bool) {
                 .cast::<i64>()
                 .write_unaligned(secs(m.modified()));
         }
-        let name_at = if wide_size {
+        if wide_size {
             out.add(32).cast::<i64>().write_unaligned(len as i64);
-            40
         } else {
             out.add(32)
                 .cast::<u32>()
                 .write_unaligned(len.min(u64::from(u32::MAX)) as u32);
-            36
         };
         if wide_name {
             let w: Vec<u16> = name.encode_utf16().take(259).collect();
@@ -698,7 +757,17 @@ unsafe fn fill_find(out: *mut u8, e: &Entry, wide_name: bool, wide_size: bool) {
     }
 }
 
-fn find_first(path: Option<PathBuf>, out: *mut u8, wide_name: bool, wide_size: bool) -> isize {
+fn find_first(
+    path: Option<Option<PathBuf>>,
+    out: *mut u8,
+    wide_name: bool,
+    wide_size: bool,
+) -> isize {
+    // `None`: no file specification at all, which is an invalid parameter (EINVAL).
+    let Some(path) = path else {
+        bad_param(EINVAL);
+        return -1;
+    };
     if out.is_null() {
         bad_param(EINVAL);
         return -1;
@@ -725,12 +794,18 @@ fn find_first(path: Option<PathBuf>, out: *mut u8, wide_name: bool, wide_size: b
 }
 
 fn find_next(handle: isize, out: *mut u8, wide_name: bool, wide_size: bool) -> i32 {
+    if out.is_null() {
+        bad_param(EINVAL);
+        return -1;
+    }
     let mut table = finds();
-    let Some(Some(l)) = usize::try_from(handle - 1)
-        .ok()
+    let Some(Some(l)) = handle
+        .checked_sub(1)
+        .and_then(|i| usize::try_from(i).ok())
         .and_then(|i| table.get_mut(i))
     else {
-        set_errno(super::EBADF);
+        // FindNextFile fails on a bad handle, an error the CRT reports as EINVAL.
+        set_errno(EINVAL);
         return -1;
     };
     let Some(e) = l.entries.get(l.next) else {
@@ -743,20 +818,29 @@ fn find_next(handle: isize, out: *mut u8, wide_name: bool, wide_size: bool) -> i
     0
 }
 
+/// A find's file specification: `None` when there is none (a null pointer).
+fn narrow_spec(path: *const u8) -> Option<Option<PathBuf>> {
+    (!path.is_null()).then(|| narrow_name(path).0)
+}
+
+fn wide_spec(path: *const u16) -> Option<Option<PathBuf>> {
+    (!path.is_null()).then(|| wide_name(path).0)
+}
+
 pub extern "system" fn _findfirst64i32(path: *const u8, out: *mut u8) -> isize {
-    find_first(narrow_name(path).0, out, false, false)
+    find_first(narrow_spec(path), out, false, false)
 }
 
 pub extern "system" fn _findfirst64(path: *const u8, out: *mut u8) -> isize {
-    find_first(narrow_name(path).0, out, false, true)
+    find_first(narrow_spec(path), out, false, true)
 }
 
 pub extern "system" fn _wfindfirst64i32(path: *const u16, out: *mut u8) -> isize {
-    find_first(wide_name(path).0, out, true, false)
+    find_first(wide_spec(path), out, true, false)
 }
 
 pub extern "system" fn _wfindfirst64(path: *const u16, out: *mut u8) -> isize {
-    find_first(wide_name(path).0, out, true, true)
+    find_first(wide_spec(path), out, true, true)
 }
 
 pub extern "system" fn _findnext64i32(handle: isize, out: *mut u8) -> i32 {
@@ -777,8 +861,9 @@ pub extern "system" fn _wfindnext64(handle: isize, out: *mut u8) -> i32 {
 
 pub extern "system" fn _findclose(handle: isize) -> i32 {
     let mut table = finds();
-    match usize::try_from(handle - 1)
-        .ok()
+    match handle
+        .checked_sub(1)
+        .and_then(|i| usize::try_from(i).ok())
         .and_then(|i| table.get_mut(i))
     {
         Some(slot @ Some(_)) => {
@@ -786,7 +871,8 @@ pub extern "system" fn _findclose(handle: isize) -> i32 {
             0
         }
         _ => {
-            set_errno(super::EBADF);
+            // As Microsoft documents for any failure of `_findclose`.
+            set_errno(ENOENT);
             -1
         }
     }
@@ -826,6 +912,27 @@ mod tests {
             assert!(heap::_msize(allocated.cast()) >= max as usize * size_of::<u16>());
             heap::free(allocated.cast());
         }
+    }
+
+    #[test]
+    fn getcwd_and_fullpath_malloc_when_given_no_buffer() {
+        let mut narrow = [0u8; 4096];
+        assert_eq!(_getcwd(narrow.as_mut_ptr(), 4096), narrow.as_mut_ptr());
+        let cwd = text(&narrow);
+        // `_getcwd(NULL, 0)`, then `free`, is Microsoft's own example.
+        for max in [0, 1, 4096] {
+            let p = _getcwd(std::ptr::null_mut(), max);
+            assert!(!p.is_null());
+            assert_eq!(unsafe { super::super::bytes(p) }, cwd.as_bytes());
+            assert!(heap::_msize(p.cast()) >= max as usize);
+            heap::free(p.cast());
+        }
+        assert!(_getcwd(narrow.as_mut_ptr(), 0).is_null());
+        assert_eq!(super::super::errno(), EINVAL);
+        let p = _fullpath(std::ptr::null_mut(), c("x").as_ptr(), 0);
+        assert!(!p.is_null());
+        assert_eq!(unsafe { super::super::bytes(p) }, format!("{cwd}/x").as_bytes());
+        heap::free(p.cast());
     }
 
     fn c(s: &str) -> Vec<u8> {
@@ -879,11 +986,87 @@ mod tests {
         let gp = c(g.to_str().unwrap());
         assert_eq!(rename(fp.as_ptr(), gp.as_ptr()), -1);
         assert_eq!(super::super::errno(), EEXIST);
+        assert_eq!(std::fs::read(&f).unwrap(), b"12345");
+        assert_eq!(std::fs::read(&g).unwrap(), b"x");
         assert_eq!(remove(gp.as_ptr()), 0);
         assert_eq!(rename(fp.as_ptr(), gp.as_ptr()), 0);
+        assert!(!f.try_exists().unwrap());
+        assert_eq!(std::fs::read(&g).unwrap(), b"12345");
         assert_eq!(remove(gp.as_ptr()), 0);
         assert_eq!(remove(gp.as_ptr()), -1);
         assert_eq!(_rmdir(dp.as_ptr()), 0);
+    }
+
+    #[test]
+    fn rename_falls_back_when_exclusive_rename_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("source");
+        let to = dir.path().join("destination");
+        let fallback =
+            || rename_error(&from, &to, std::io::Error::from_raw_os_error(libc::ENOTSUP));
+
+        std::fs::write(&from, b"first").unwrap();
+        assert_eq!(fallback(), 0);
+        assert!(!from.try_exists().unwrap());
+        assert_eq!(std::fs::read(&to).unwrap(), b"first");
+
+        std::fs::write(&from, b"second").unwrap();
+        assert_eq!(fallback(), -1);
+        assert_eq!(super::super::errno(), EEXIST);
+        assert_eq!(std::fs::read(&from).unwrap(), b"second");
+        assert_eq!(std::fs::read(&to).unwrap(), b"first");
+
+        std::fs::remove_file(&to).unwrap();
+        let target = Path::new("missing");
+        std::os::unix::fs::symlink(target, &to).unwrap();
+        set_errno(0);
+        assert_eq!(fallback(), -1);
+        assert_eq!(super::super::errno(), EEXIST);
+        assert_eq!(std::fs::read(&from).unwrap(), b"second");
+        assert_eq!(std::fs::read_link(&to).unwrap(), target);
+    }
+
+    #[test]
+    fn wrename_preserves_dangling_destination_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("source");
+        let to = dir.path().join("destination");
+        let target = std::path::Path::new("missing");
+        std::fs::write(&from, b"source bytes").unwrap();
+        std::os::unix::fs::symlink(target, &to).unwrap();
+
+        let wide = |p: &std::path::Path| {
+            p.to_str()
+                .unwrap()
+                .encode_utf16()
+                .chain([0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(_wrename(wide(&from).as_ptr(), wide(&to).as_ptr()), -1);
+        assert_eq!(super::super::errno(), EEXIST);
+        assert_eq!(std::fs::read(&from).unwrap(), b"source bytes");
+        assert_eq!(std::fs::read_link(&to).unwrap(), target);
+    }
+
+    #[test]
+    fn find_first_only_reads_metadata_for_matching_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..999 {
+            std::fs::File::create(dir.path().join(format!("{i}.bin"))).unwrap();
+        }
+        std::fs::write(dir.path().join("slot.sav"), b"saved").unwrap();
+
+        let pattern = c(dir.path().join("*.sav").to_str().unwrap());
+        let mut data = [0u8; 304];
+        files::FIND_METADATA_LOOKUPS.set(0);
+        let handle = _findfirst64i32(pattern.as_ptr(), data.as_mut_ptr());
+        assert!(handle > 0);
+        assert_eq!(files::FIND_METADATA_LOOKUPS.get(), 1);
+        assert_eq!(text(&data[36..]), "slot.sav");
+        assert_eq!(u32::from_le_bytes(data[32..36].try_into().unwrap()), 5);
+        assert_eq!(_findnext64i32(handle, data.as_mut_ptr()), -1);
+        assert_eq!(super::super::errno(), ENOENT);
+        assert_eq!(_findclose(handle), 0);
     }
 
     #[test]
@@ -916,6 +1099,7 @@ mod tests {
         assert_eq!(_findclose(h), -1);
         let none = c(&format!("{}/*.zzz", dir.path().to_str().unwrap()));
         assert_eq!(_findfirst64i32(none.as_ptr(), data.as_mut_ptr()), -1);
+        assert_eq!(super::super::errno(), ENOENT);
         // `.` and `..` match `*`; the wide, 64-bit-size form has its name at 40.
         let all: Vec<u16> = format!("{}/*", dir.path().to_str().unwrap())
             .encode_utf16()
@@ -926,6 +1110,27 @@ mod tests {
         assert!(h > 0);
         assert_eq!(wdata[40], b'.');
         assert_eq!(_findclose(h), 0);
+    }
+
+    #[test]
+    fn find_calls_set_the_errno_microsoft_documents() {
+        // `_findfirst`: EINVAL for a null file specification; `_findnext`: EINVAL for an
+        // error other than "no more files" (a bad handle); `_findclose`: ENOENT on failure.
+        let mut data = [0u8; 304];
+        set_errno(0);
+        assert_eq!(_findfirst64i32(std::ptr::null(), data.as_mut_ptr()), -1);
+        assert_eq!(super::super::errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(_wfindfirst64(std::ptr::null(), data.as_mut_ptr()), -1);
+        assert_eq!(super::super::errno(), EINVAL);
+        for handle in [0, -1, 9999] {
+            set_errno(0);
+            assert_eq!(_findnext64i32(handle, data.as_mut_ptr()), -1, "{handle}");
+            assert_eq!(super::super::errno(), EINVAL, "{handle}");
+            set_errno(0);
+            assert_eq!(_findclose(handle), -1, "{handle}");
+            assert_eq!(super::super::errno(), ENOENT, "{handle}");
+        }
     }
 
     #[test]
@@ -1025,5 +1230,109 @@ mod tests {
             }),
             r"C:\x"
         );
+    }
+
+    #[test]
+    fn zero_size_path_buffers_and_find_edge_cases() {
+        // Zero-sized buffers must never be written out of bounds.
+        let mut guard = [0xAAu8; 4];
+        set_errno(0);
+        assert!(_fullpath(guard.as_mut_ptr(), c(r"C:\x").as_ptr(), 0).is_null());
+        assert_eq!(super::super::errno(), ERANGE);
+        assert_eq!(guard, [0xAA; 4]);
+
+        assert_eq!(
+            _makepath_s(
+                guard.as_mut_ptr(),
+                0,
+                c("C:").as_ptr(),
+                c("d").as_ptr(),
+                c("f").as_ptr(),
+                c("e").as_ptr()
+            ),
+            EINVAL
+        );
+        assert_eq!(guard, [0xAA; 4]);
+
+        let mut drive = [b'x'; 4];
+        let mut ext = [b'y'; 2];
+        assert_eq!(
+            _splitpath_s(
+                c(r"C:\a\b.txt").as_ptr(),
+                drive.as_mut_ptr(),
+                drive.len(),
+                guard.as_mut_ptr(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+            ),
+            EINVAL
+        );
+        assert_eq!(guard, [0xAA; 4]);
+        assert_eq!(drive[0], 0);
+
+        // Non-zero size with a null pointer is `EINVAL`.
+        assert_eq!(
+            _splitpath_s(
+                c(r"C:\a\b.txt").as_ptr(),
+                std::ptr::null_mut(),
+                4,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+            ),
+            EINVAL
+        );
+
+        // Overflow on a later component clears earlier outputs too.
+        drive = [b'x'; 4];
+        assert_eq!(
+            _splitpath_s(
+                c(r"C:\a\b.txt").as_ptr(),
+                drive.as_mut_ptr(),
+                drive.len(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                ext.as_mut_ptr(),
+                ext.len(),
+            ),
+            ERANGE
+        );
+        assert_eq!(drive[0], 0);
+        assert_eq!(ext[0], 0);
+
+        // `_findnext*` rejects null output, and `isize::MIN` handles do not underflow.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"1").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"2").unwrap();
+        let pattern = c(&format!("{}/*.txt", dir.path().to_str().unwrap()));
+        let mut data = [0u8; 304];
+        let h = _findfirst64i32(pattern.as_ptr(), data.as_mut_ptr());
+        assert!(h > 0);
+        set_errno(0);
+        assert_eq!(_findnext64i32(h, std::ptr::null_mut()), -1);
+        assert_eq!(super::super::errno(), EINVAL);
+        assert_eq!(_findclose(h), 0);
+
+        set_errno(0);
+        assert_eq!(_findnext64i32(isize::MIN, data.as_mut_ptr()), -1);
+        assert_eq!(super::super::errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(_findclose(isize::MIN), -1);
+        assert_eq!(super::super::errno(), ENOENT);
+
+        // Missing metadata zeroes timestamp fields instead of keeping stale bytes.
+        let mut stale = [0xFFu8; 304];
+        // SAFETY: `stale` is large enough for `_finddata64i32_t`.
+        unsafe { fill_find(stale.as_mut_ptr(), &("ghost".into(), None), false, false) };
+        assert_eq!(&stale[..36], &[0u8; 36]);
+        assert_eq!(&stale[36..42], b"ghost\0");
     }
 }

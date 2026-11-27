@@ -61,8 +61,10 @@ pub mod resource;
 pub mod root;
 mod rootser;
 mod sampler;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub mod shader_cache;
+#[cfg(target_os = "macos")]
+mod prewarm;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;

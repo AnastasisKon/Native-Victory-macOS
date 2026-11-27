@@ -83,6 +83,22 @@ fn compute_pipelines_are_cached_by_the_content_of_their_dxil() {
     assert_eq!(t.shaders.pipelines, 2);
 }
 
+/// A compute pipeline Metal has not compiled within the frame's wait is put off, not refused: a
+/// later use picks it up, and each miss is counted.
+#[test]
+fn a_compute_pipeline_put_off_is_made_by_a_later_use() {
+    let Some(mut t) = title() else { return };
+    let cs = host_shader(HwStage::Cs, read("tests/affine.dxil"));
+    t.compile_wait = std::time::Duration::ZERO;
+    let mut asks = 0;
+    while !matches!(t.compute_pipe(&cs, "a"), Pipe::Compute(_)) {
+        asks += 1;
+        assert!(asks < 3000, "never made: {:?}", t.shaders);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!((t.shaders.put_off, t.shaders.pipelines, t.shaders.refusals()), (asks, 1, 0));
+}
+
 /// What the host cannot give a shader is refused, counted by reason, and logged once; nothing
 /// fails.
 #[test]
@@ -91,19 +107,15 @@ fn shaders_the_host_cannot_run_are_refused_and_counted() {
     let dxil = read("tests/affine.dxil");
     let mut paged = host_shader(HwStage::Cs, dxil.clone());
     paged.memory_writes = true;
-    let mut indexing = host_shader(HwStage::Cs, dxil.clone());
-    indexing.heap = true;
-    indexing.dxil.push(0); // another shader
     let garbage = host_shader(HwStage::Cs, b"DXBC but not really".to_vec());
-    for s in [&paged, &paged, &indexing, &garbage] {
+    for s in [&paged, &paged, &garbage] {
         // The same refusal twice is two refusals of one reason.
         assert!(matches!(t.compute_pipe(s, "x"), Pipe::Refused));
     }
     let ShaderStats { refused, pipelines, .. } = t.shaders.clone();
     assert_eq!(pipelines, 0);
-    assert_eq!(refused.len(), 3, "{refused:?}");
+    assert_eq!(refused.len(), 2, "{refused:?}");
     assert!(refused.iter().any(|(why, _)| why.contains("marks the pages")));
-    assert!(refused.iter().any(|(why, _)| why.contains("heap")));
     assert!(refused.iter().any(|(why, _)| why.contains("thread group") || why.contains("conversion")));
     // Compute shaders get the page table; a graphics pipeline does not yet.
     let mut vs = host_shader(HwStage::Vs, read("tests/fixtures/tri_vs.dxil"));
@@ -112,7 +124,7 @@ fn shaders_the_host_cannot_run_are_refused_and_counted() {
     assert!(matches!(t.render_pipe(&vs, None, &g, "vs"), Pipe::Refused));
     assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("graphics pipeline")));
     t.refused_translation("y", "no DXIL part".into());
-    assert_eq!(t.shaders.refusals(), 6, "{:?}", t.shaders.refused);
+    assert_eq!(t.shaders.refusals(), 5, "{:?}", t.shaders.refused);
 }
 
 /// A graphics pipeline from a vertex and pixel shader and a pipeline-state stream's state:
@@ -156,8 +168,22 @@ fn render_pipelines_come_from_the_translated_shaders_and_the_streams_state() {
         // SAFETY: whole subobjects over live elements and names.
         unsafe { g.read(kind, s.as_ptr()) };
     }
-    let pipe = t.render_pipe(&vs, Some(&ps), &g, "tri");
-    assert!(matches!(pipe, Pipe::Render(..)), "{:?}", t.shaders);
+    // With no time to wait it is put off while Metal compiles it, not refused: nothing is cached
+    // and a later use picks it up.
+    t.compile_wait = std::time::Duration::ZERO;
+    let mut asks = 0;
+    let pipe = loop {
+        let pipe = t.render_pipe(&vs, Some(&ps), &g, "tri");
+        if matches!(pipe, Pipe::Render(..)) {
+            break pipe;
+        }
+        asks += 1;
+        assert!(asks < 3000, "never made: {:?}", t.shaders);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(asks > 0);
+    assert_eq!((t.shaders.put_off, t.shaders.refusals()), (asks, 0));
+    t.compile_wait = std::time::Duration::MAX;
     assert!(matches!(t.render_pipe(&vs, Some(&ps), &g, "tri again"), Pipe::Render(..)));
     assert_eq!((t.shaders.pipelines, t.shaders.cached), (1, 1));
 

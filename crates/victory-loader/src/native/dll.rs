@@ -93,8 +93,8 @@ fn map_imports(
 }
 
 /// The file called `name` in `dir`, whatever its case (volumes can be case
-/// sensitive; imports are not).
-fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+/// sensitive; imports and the title's manifest name are not).
+pub fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     let direct = dir.join(name);
     if direct.is_file() {
         return Some(direct);
@@ -124,13 +124,17 @@ fn map_dll(
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let image = NativeImage::map(&bytes, None).with_context(|| format!("mapping {name}"))?;
     drop(bytes);
+    // Its own imports first, so it is initialised after them.
+    if let Err(err) = map_imports(image.info(), dir, wanted, seen, mapped) {
+        // SAFETY: not registered in TLS or exposed to title code yet.
+        unsafe { image.unmap() };
+        return Err(err);
+    }
     // Before any thread runs title code, and while its index word is writable.
     #[cfg(target_arch = "x86_64")]
     if let Some(tls) = image.tls() {
         super::teb::register_tls(tls);
     }
-    // Its own imports first, so it is initialised after them.
-    map_imports(image.info(), dir, wanted, seen, mapped)?;
     let dll: &'static TitleDll = Box::leak(Box::new(TitleDll { name, path, image }));
     registry().push(dll);
     mapped.push(dll);
@@ -138,13 +142,13 @@ fn map_dll(
 }
 
 /// Where an export is: in the image, or forwarded to another DLL.
-enum Export {
+enum Export<'a> {
     Address(usize),
-    Forward(String),
+    Forward(&'a str),
 }
 
 impl TitleDll {
-    fn export(&self, symbol: &ImportSymbol) -> Option<Export> {
+    fn export(&self, symbol: &ImportSymbol) -> Option<Export<'_>> {
         let exports = &self.image.info().exports;
         let found: &ExportInfo = match symbol {
             ImportSymbol::Name { name, .. } => exports
@@ -154,8 +158,34 @@ impl TitleDll {
         };
         match (found.rva, &found.forward) {
             (Some(rva), _) => Some(Export::Address(self.image.base() + rva as usize)),
-            (None, Some(forward)) => Some(Export::Forward(forward.clone())),
+            (None, Some(forward)) => Some(Export::Forward(forward)),
             (None, None) => None,
+        }
+    }
+
+    /// Resolves an export of this image. Each forwarded target goes through
+    /// the runtime and host resolver before the mapped title DLLs.
+    pub fn resolve_export(&self, symbol: &ImportSymbol, inner: &dyn ImportResolver) -> Resolution {
+        let mut export = self.export(symbol);
+        let mut seen = HashSet::new();
+        while let Some(Export::Forward(forward)) = export {
+            if !seen.insert(forward) {
+                return Resolution::Missing;
+            }
+            let Some((dll, target)) = forward_target(forward) else {
+                return Resolution::Missing;
+            };
+            match inner.resolve(&dll, &target) {
+                Resolution::Missing => export = find(&dll).and_then(|d| d.export(&target)),
+                found => return found,
+            }
+        }
+        match export {
+            Some(Export::Address(address)) => Resolution::Found {
+                address,
+                provenance: Provenance::Title,
+            },
+            _ => Resolution::Missing,
         }
     }
 }
@@ -163,6 +193,9 @@ impl TitleDll {
 /// `"dll.name"` or `"dll.#7"`, as an export forwards to it.
 fn forward_target(forward: &str) -> Option<(String, ImportSymbol)> {
     let (dll, name) = forward.rsplit_once('.')?;
+    if dll.is_empty() || name.is_empty() {
+        return None;
+    }
     let symbol = match name.strip_prefix('#') {
         Some(ordinal) => ImportSymbol::Ordinal(ordinal.parse().ok()?),
         None => ImportSymbol::Name {
@@ -173,58 +206,60 @@ fn forward_target(forward: &str) -> Option<(String, ImportSymbol)> {
     Some((format!("{dll}.dll"), symbol))
 }
 
-/// Address of an export of the title DLL at `base` (what `GetProcAddress`
-/// returns); forwards are followed among the title's DLLs.
-pub fn proc_address(base: usize, symbol: &ImportSymbol) -> Option<usize> {
-    let mut dll = find_base(base)?;
-    let mut symbol = symbol.clone();
-    for _ in 0..8 {
-        match dll.export(&symbol)? {
-            Export::Address(address) => return Some(address),
-            Export::Forward(forward) => {
-                let (next, target) = forward_target(&forward)?;
-                dll = find(&next)?;
-                symbol = target;
-            }
-        }
-    }
-    None
-}
-
 /// Resolves through `inner`, then through the exports of the title's DLLs.
 pub struct WithTitleDlls<'a> {
     pub inner: &'a dyn ImportResolver,
 }
 
-impl WithTitleDlls<'_> {
-    fn lookup_in_dlls(&self, dll: &str, symbol: &ImportSymbol, depth: u32) -> Resolution {
-        let Some(found) = find(dll).filter(|_| depth < 8) else {
-            return Resolution::Missing;
-        };
-        match found.export(symbol) {
-            Some(Export::Address(address)) => Resolution::Found {
-                address,
-                provenance: Provenance::Title,
-            },
-            Some(Export::Forward(forward)) => {
-                let Some((next, target)) = forward_target(&forward) else {
-                    return Resolution::Missing;
-                };
-                match self.inner.resolve(&next, &target) {
-                    Resolution::Missing => self.lookup_in_dlls(&next, &target, depth + 1),
-                    found => found,
-                }
-            }
-            None => Resolution::Missing,
+impl ImportResolver for WithTitleDlls<'_> {
+    fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+        match self.inner.resolve(dll, symbol) {
+            Resolution::Missing => find(dll)
+                .map_or(Resolution::Missing, |d| d.resolve_export(symbol, self.inner)),
+            found => found,
         }
     }
 }
 
-impl ImportResolver for WithTitleDlls<'_> {
-    fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
-        match self.inner.resolve(dll, symbol) {
-            Resolution::Missing => self.lookup_in_dlls(dll, symbol, 0),
-            found => found,
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_is_found_whatever_its_case_and_only_if_it_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MSVCP140.DLL"), b"").unwrap();
+        std::fs::write(dir.path().join("microsoftgame.config"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("bink2scarlett.dll")).unwrap();
+
+        let found = find_file(dir.path(), "msvcp140.dll").unwrap();
+        assert!(found.is_file());
+        let config = find_file(dir.path(), "MicrosoftGame.config").unwrap();
+        assert!(config.is_file());
+        assert_eq!(find_file(dir.path(), "vcruntime140.dll"), None);
+        // A folder of that name is not the DLL.
+        assert_eq!(find_file(dir.path(), "bink2scarlett.dll"), None);
+    }
+
+    #[test]
+    fn forward_target_rejects_empty_dll_or_symbol() {
+        assert_eq!(forward_target(".Func"), None);
+        assert_eq!(forward_target("kernel32."), None);
+        assert_eq!(forward_target("kernel32.#"), None);
+        assert_eq!(forward_target("plain"), None);
+        assert_eq!(
+            forward_target("api-ms-win-crt-runtime-l1-1-0.exit"),
+            Some((
+                "api-ms-win-crt-runtime-l1-1-0.dll".into(),
+                ImportSymbol::Name {
+                    hint: 0,
+                    name: "exit".into(),
+                }
+            ))
+        );
+        assert_eq!(
+            forward_target("ws2_32.#7"),
+            Some(("ws2_32.dll".into(), ImportSymbol::Ordinal(7)))
+        );
     }
 }

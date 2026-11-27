@@ -5,8 +5,9 @@
 //! Each translator's entries are in a folder of their own, named by the
 //! start of that key: older translators' folders can be deleted whole.
 //! Entries go through `victory-pipeline`'s content-addressed cache, which
-//! writes them atomically; an entry that does not read back is translated
-//! again. A container that does not translate is kept too, with the reason,
+//! writes them atomically. Each entry starts with the blake3 sum of the rest,
+//! as in `victory_metal::disk`: an entry that is damaged, cut short or does
+//! not read back is translated again and rewritten. A container that does not translate is kept too, with the reason,
 //! so it is not tried again on every run.
 //!
 //! `victory translate --cache` fills the same cache ahead of a run, through
@@ -44,7 +45,132 @@ pub fn use_shader_cache(dir: PathBuf) -> Option<PathBuf> {
     }
 }
 
-/// Shaders found in the cache and translated since the start.
+/// The native host's translations: a folder of their own ([`use_native_cache`]).
+static NATIVE: OnceLock<Cache> = OnceLock::new();
+
+/// Keeps the native host's translations in a folder of `dir` from now on (one per translator,
+/// like [`use_shader_cache`]), and the Metal libraries made from them beside it. Does nothing
+/// with `VICTORY_NO_SHADER_CACHE` set. `None` if it is off or the folder cannot be opened.
+pub fn use_native_cache(dir: PathBuf) -> Option<PathBuf> {
+    if std::env::var_os("VICTORY_NO_SHADER_CACHE").is_some_and(|v| !v.is_empty() && v != "0") {
+        tracing::info!("native shader cache off (VICTORY_NO_SHADER_CACHE)");
+        return None;
+    }
+    let parent = dir;
+    let dir = parent.join(&blake3::Hash::from(*build()).to_hex()[..16]);
+    match Cache::open(dir.join("translated")) {
+        Ok(cache) => {
+            tracing::info!(dir = %dir.display(), "native shader cache");
+            let _ = NATIVE.set(cache);
+            let _ = FIRST_BINDS.set(parent.join(FIRST_BINDS_FILE));
+            let _ = std::fs::write(dir.join(LAST_USED), b"");
+            // Deleting a build's ~20,000 entries takes a while: not on the start-up path.
+            let (keep, current) = (parent.clone(), dir.clone());
+            let _ = std::thread::Builder::new()
+                .name("shader-cache-prune".into())
+                .spawn(move || prune(&keep, &current, KEEP_BUILDS));
+            #[cfg(target_os = "macos")]
+            victory_metal::disk::use_dir(dir.join("metal"));
+            Some(dir)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "no native shader cache");
+            None
+        }
+    }
+}
+
+/// The containers the native host bound, by their short hash, one per line, in the order of
+/// their first bind (`pipeline::prewarm` reads it to translate those first). Beside the build
+/// folders: it names containers, not translations, so it outlives a changed translator.
+static FIRST_BINDS: OnceLock<PathBuf> = OnceLock::new();
+const FIRST_BINDS_FILE: &str = "first-binds.txt";
+
+/// Where the native host keeps its list of first binds, if the cache is on.
+pub fn first_binds_file() -> Option<&'static std::path::Path> {
+    FIRST_BINDS.get().map(PathBuf::as_path)
+}
+
+/// Written into a build folder each time a run opens it: its time orders the folders for [`prune`].
+const LAST_USED: &str = "last-used";
+/// Build folders kept: this build's and the newest others (about 400 MB each).
+const KEEP_BUILDS: usize = 3;
+
+/// A folder stamped this recently is never deleted: another run (the other `game-run.sh` slot
+/// shares the cache folder) may still be using it.
+const IN_USE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Deletes the build folders of `parent` (named by 16 hex digits) but the `keep` used last,
+/// `current` always among them, and any stamped within [`IN_USE`]. A folder never stamped counts
+/// by its own time.
+fn prune(parent: &std::path::Path, current: &std::path::Path, keep: usize) {
+    prune_at(parent, current, keep, std::time::SystemTime::now());
+}
+
+fn prune_at(parent: &std::path::Path, current: &std::path::Path, keep: usize, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    let mut builds: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.len() == 16 && n.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+        .map(|p| {
+            let used = std::fs::metadata(p.join(LAST_USED)).or_else(|_| std::fs::metadata(&p)).and_then(|m| m.modified());
+            (used.unwrap_or(std::time::UNIX_EPOCH), p)
+        })
+        .collect();
+    builds.sort_by_key(|b| std::cmp::Reverse(b.0));
+    let mut kept = usize::from(builds.iter().any(|(_, p)| p == current));
+    for (used, p) in builds {
+        if p == current || now.duration_since(used).is_ok_and(|age| age < IN_USE) {
+            continue;
+        }
+        if kept < keep {
+            kept += 1;
+            continue;
+        }
+        tracing::info!(dir = %p.display(), "deleting an old build's shader cache");
+        let _ = std::fs::remove_dir_all(&p);
+    }
+}
+
+/// A translation for the native host, from the cache when there is one. `settings` is whatever
+/// else the translation depends on besides the container (its options); the closure translates.
+pub fn native_shader(
+    container: &[u8],
+    settings: &str,
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> Result<HostShader, String> {
+    let Some(cache) = NATIVE.get() else {
+        return translate(container);
+    };
+    let started = std::time::Instant::now();
+    let (made, hit) = cached(cache, &native_key(settings), container, translate);
+    let ms = started.elapsed().as_millis();
+    if ms >= 20 {
+        tracing::info!(ms, hit, size = container.len(), "native shader translation");
+    }
+    made
+}
+
+/// The native host's build key for translations made with `settings`: [`build`] and the settings.
+fn native_key(settings: &str) -> [u8; 32] {
+    *blake3::Hasher::new().update(build()).update(settings.as_bytes()).finalize().as_bytes()
+}
+
+/// Whether the native host's cache holds the translation of `container` with `settings` (as
+/// [`native_shader`] would key it), without reading or translating it.
+pub fn native_present(container: &[u8], settings: &str) -> bool {
+    let Some(cache) = NATIVE.get() else { return false };
+    let converter = Translate { translate: |_: &[u8]| Err::<HostShader, String>(String::new()), ran: AtomicBool::new(false) };
+    let input = [&native_key(settings)[..], container].concat();
+    cache.path_for(&victory_pipeline::CacheKey::new(&converter, &input)).is_file()
+}
+
+/// Shaders found in the cache and translated since the start (both hosts). The slow-translation
+/// log line shows only translations of 20 ms or more, which a hit never is.
 pub fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
@@ -175,6 +301,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         rect_list: false,
         copy_params: [0; 32],
         extra_params: 0,
+        // `DispatchX` runs thread counts as group counts here (`list::dispatch_x`).
+        thread_counts: false,
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
@@ -210,7 +338,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        Ok(encode(&(self.translate)(&input[32..])))
+        Ok(seal(encode(&(self.translate)(&input[32..]))))
     }
 }
 
@@ -233,7 +361,7 @@ fn cached(
                 break;
             }
         };
-        if let Some(shader) = crate::read_file(&path).ok().and_then(|b| decode(&b)) {
+        if let Some(shader) = crate::read_file(&path).ok().and_then(|b| decode(unseal(&b)?)) {
             let hit = !converter.ran.load(Ordering::Relaxed);
             let (counter, what) = if hit {
                 (&HITS, "from the cache")
@@ -251,7 +379,7 @@ fn cached(
     ((converter.translate)(container), false)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 /// A container that does not translate: the reason follows.
 const REFUSED: &[u8; 4] = b"VSHE";
 const STAGES: [HwStage; 8] = [
@@ -313,9 +441,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         heap,
         heap_writes,
         view_marks,
-        // Pixel-input splits and table extents belong to the native host path only.
-        splits: _,
-        table_entries: _,
+        splits,
+        table_entries,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -367,7 +494,28 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
+    word(&mut out, splits.len() as u32);
+    for &(a, b) in splits {
+        word(&mut out, a);
+        word(&mut out, b);
+    }
+    word(&mut out, table_entries.len() as u32);
+    for &(slot, n) in table_entries {
+        word(&mut out, u32::from(slot));
+        word(&mut out, n);
+    }
     out
+}
+
+/// An entry: the blake3 sum of the encoding, then the encoding.
+fn seal(encoding: Vec<u8>) -> Vec<u8> {
+    [blake3::hash(&encoding).as_bytes().as_slice(), &encoding].concat()
+}
+
+/// The encoding in an entry; `None` if the sum does not match (a damaged or cut-short file).
+fn unseal(entry: &[u8]) -> Option<&[u8]> {
+    let (sum, encoding) = entry.split_at_checked(32)?;
+    (blake3::hash(encoding).as_bytes() == sum).then_some(encoding)
 }
 
 fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
@@ -428,9 +576,19 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let memory = r.word()?;
+    let n = r.word()? as usize;
+    let mut splits = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        splits.push((r.word()?, r.word()?));
+    }
+    let n = r.word()? as usize;
+    let mut table_entries = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        table_entries.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(Ok(HostShader {
-        splits: Vec::new(),
-        table_entries: Vec::new(),
+        splits,
+        table_entries,
         stage,
         dxil,
         user_data,
@@ -454,8 +612,8 @@ mod tests {
 
     fn shader() -> HostShader {
         HostShader {
-            splits: Vec::new(),
-            table_entries: Vec::new(),
+            splits: vec![(3, 9), (4, 10)],
+            table_entries: vec![(1, 7), (5, 130)],
             stage: HwStage::Ps,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
@@ -513,7 +671,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(
             cached(&cache, &build, container, translate),
@@ -534,8 +692,19 @@ mod tests {
         };
         let refused = (Err("unsupported".to_owned()), false);
         assert_eq!(cached(&cache, &build, b"other", fail), refused);
-        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0, true));
+        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0.clone(), true));
         assert_eq!(fails.load(Ordering::Relaxed), 1);
+
+        // A cut-short refusal still decodes (to a shorter reason); the sum
+        // makes it a miss, translated and rewritten.
+        for e in walk(dir.path()) {
+            let bytes = std::fs::read(&e).unwrap();
+            std::fs::write(&e, &bytes[..bytes.len() - 1]).unwrap();
+        }
+        assert_eq!(cached(&cache, &build, b"other", fail), refused);
+        assert_eq!(fails.load(Ordering::Relaxed), 2);
+        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0, true));
+        assert_eq!(fails.load(Ordering::Relaxed), 2);
     }
 
     /// The key's parts: a change to any of them (the translator's sources,
@@ -564,6 +733,57 @@ mod tests {
         );
     }
 
+    /// Two runs of one build: each makes the key afresh and opens the folder anew, and the second
+    /// finds what the first translated. Settings that change the output change the key.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_second_run_reads_the_first_runs_translations() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = || format!("{:?}", crate::native::shaders::options());
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let first = Cache::open(dir.path()).unwrap();
+        let input = [&native_key(&settings())[..], b"container"].concat();
+        let probe = Translate { translate: |_: &[u8]| Err::<HostShader, String>(String::new()), ran: AtomicBool::new(false) };
+        let path = first.path_for(&victory_pipeline::CacheKey::new(&probe, &input));
+        assert!(!path.is_file());
+        assert_eq!(cached(&first, &native_key(&settings()), b"container", translate).1, false);
+        // Where `native_present` looks: the entry `cached` wrote.
+        assert!(path.is_file());
+        drop(first);
+        let second = Cache::open(dir.path()).unwrap();
+        assert_eq!(cached(&second, &native_key(&settings()), b"container", translate).1, true);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        let rect = format!("{:?}", victory_shader::emit::Options { rect_list: true, ..crate::native::shaders::options() });
+        assert_ne!(native_key(&settings()), native_key(&rect));
+    }
+
+    /// The current build and the two used last stay; older ones, by their stamp, go. Other
+    /// folders and files are left alone.
+    #[test]
+    fn old_build_folders_are_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = |s: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + s);
+        let builds: Vec<PathBuf> = (0..5).map(|n| dir.path().join(format!("{n:016x}"))).collect();
+        for (n, b) in builds.iter().enumerate() {
+            std::fs::create_dir_all(b.join("translated")).unwrap();
+            let f = std::fs::File::create(b.join(LAST_USED)).unwrap();
+            f.set_modified(t(n as u64)).unwrap();
+        }
+        std::fs::create_dir(dir.path().join("not-a-build")).unwrap();
+        std::fs::write(dir.path().join(FIRST_BINDS_FILE), b"x").unwrap();
+        // The oldest is the one in use. Stamps are from 1970; a run within the hour keeps all.
+        prune_at(dir.path(), &builds[0], 3, t(10));
+        assert!(builds.iter().all(|b| b.exists()), "used within the hour");
+        prune_at(dir.path(), &builds[0], 3, t(4 + 2 * 3600));
+        let left: Vec<bool> = builds.iter().map(|b| b.exists()).collect();
+        assert_eq!(left, [true, false, false, true, true]);
+        assert!(dir.path().join("not-a-build").exists() && dir.path().join(FIRST_BINDS_FILE).exists());
+    }
+
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
         for e in std::fs::read_dir(dir).unwrap().flatten() {
@@ -582,7 +802,7 @@ mod tests {
         assert_eq!(decode(&bytes), Some(Ok(shader())));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
-        assert_eq!(decode(b"VSH0"), None);
+        assert_eq!(decode(b"VSH1"), None);
         let refusal = Err("GFX10 code at 0x10: x is not supported".to_owned());
         assert_eq!(decode(&encode(&refusal)), Some(refusal));
         assert_eq!(decode(&[b"VSHE".as_slice(), &[0xff]].concat()), None);

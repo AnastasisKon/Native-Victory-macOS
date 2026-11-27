@@ -62,6 +62,12 @@ pub struct Dispatch<'a, B: ComputeBackend + ?Sized> {
     pub heaps: Heaps<'a, B>,
     pub groups: [usize; 3],
     pub threads_per_group: [usize; 3],
+    /// `ExecuteIndirect`: the group counts are read on the GPU from this title address (three
+    /// words) instead of `groups`.
+    pub indirect: Option<(&'a B::Buffer, *const u8)>,
+    /// `ExecuteIndirect` with a count buffer: the count's title address and this record's index.
+    /// The record runs only if the index is below the count, which the GPU reads when it runs.
+    pub count: Option<(&'a B::Buffer, *const u8, u32)>,
 }
 
 /// The descriptor heaps a draw or dispatch binds (`SetDescriptorHeaps`): slot 0 and slot 1.
@@ -102,6 +108,10 @@ pub trait ComputeBackend {
     fn create_fence(&self, initial: u64) -> Result<Self::Fence, String>;
     /// Wrap `ptr..ptr+len` (page-aligned) without copying; it stays mapped while the buffer lives.
     fn wrap_title_memory(&self, ptr: *mut u8, len: usize) -> Result<Self::Buffer, String>;
+    /// A zeroed buffer of the host's own (`len` bytes) and where the CPU writes it. It lives
+    /// while the caller or work submitted with it holds it: memory the GPU reads after the
+    /// caller let go (a page table that was replaced) must not be the caller's to free.
+    fn host_buffer(&self, len: usize) -> Result<(Self::Buffer, *mut u8), String>;
     /// Makes `buffers` resident for everything submitted to `queue` from now on, so that dispatches
     /// and draws need not name them one by one (Metal: an `MTLResidencySet` of the title's pools,
     /// made once, committed when a pool joins, added to each queue once). Idempotent; a buffer
@@ -120,6 +130,22 @@ pub trait ComputeBackend {
         dxil: &[u8],
         layout: &RootLayout,
     ) -> Result<Self::Pipeline, String>;
+    /// As the two above, waiting at most `wait` for the pipeline: `None` while it is still being
+    /// made, and the same call later picks it up. The default makes it at once, however long.
+    fn create_compute_pipeline_within(
+        &self,
+        dxil: &[u8],
+        layout: Option<&RootLayout>,
+        _wait: std::time::Duration,
+    ) -> Result<Option<Self::Pipeline>, String> {
+        match layout {
+            Some(l) => self.create_compute_pipeline_with(dxil, l),
+            None => self.create_compute_pipeline(dxil),
+        }
+        .map(Some)
+    }
+    /// Names a pipeline for diagnostics (`VICTORY_TRACE_GPU_FAILS`); the default does nothing.
+    fn name_pipeline(&self, _p: &Self::Pipeline, _name: &str) {}
     /// Queue the work and return; never waits for the GPU.
     fn submit(&self, queue: &Self::Queue, work: &Submission<'_, Self>) -> Result<(), String>;
     /// `ID3D12Fence::Signal` from the CPU: queues waiting for `value` go on.

@@ -2,7 +2,7 @@
 //! and `os_sync` (macOS 14.4 and later) for wait-on-address.
 
 use std::io;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -112,8 +112,10 @@ impl Semaphore {
         }
         *count += n;
         drop(count);
-        for _ in 0..n {
-            self.cv.notify_one();
+        match n {
+            0 => {}
+            1 => self.cv.notify_one(),
+            _ => self.cv.notify_all(),
         }
         Some(before)
     }
@@ -150,27 +152,41 @@ unsafe extern "C" {
 /// differs; `false` if `timeout` passes first. Spurious wake-ups are
 /// possible: the caller re-checks.
 pub fn wait_on_address(addr: &AtomicU32, expected: u32, timeout: Option<Duration>) -> bool {
+    if let Some(t) = timeout
+        && t.is_zero()
+    {
+        return addr.load(Ordering::Acquire) != expected;
+    }
+    let deadline = timeout.map(|t| Instant::now() + t);
     let p = addr.as_ptr();
     loop {
         // SAFETY: `p` is a live 4-byte aligned atomic.
         let r = unsafe {
-            match timeout {
+            match deadline {
                 None => os_sync_wait_on_address(p, u64::from(expected), 4, 0),
-                Some(t) => os_sync_wait_on_address_with_timeout(
-                    p,
-                    u64::from(expected),
-                    4,
-                    0,
-                    OS_CLOCK_MACH_ABSOLUTE_TIME,
-                    t.as_nanos().min(u128::from(u64::MAX)) as u64,
-                ),
+                Some(d) => {
+                    let Some(left) = d.checked_duration_since(Instant::now()) else {
+                        return addr.load(Ordering::Acquire) != expected;
+                    };
+                    if left.is_zero() {
+                        return addr.load(Ordering::Acquire) != expected;
+                    }
+                    os_sync_wait_on_address_with_timeout(
+                        p,
+                        u64::from(expected),
+                        4,
+                        0,
+                        OS_CLOCK_MACH_ABSOLUTE_TIME,
+                        left.as_nanos().min(u128::from(u64::MAX)) as u64,
+                    )
+                }
             }
         };
         if r >= 0 {
             return true;
         }
         match io::Error::last_os_error().raw_os_error() {
-            Some(4) => {}             // EINTR
+            Some(4) => {}             // EINTR: retry with remaining time
             Some(60) => return false, // ETIMEDOUT
             _ => return true,         // EFAULT and the like: let the caller look
         }
@@ -187,4 +203,59 @@ pub fn wake_one(addr: &AtomicU32) {
 pub fn wake_all(addr: &AtomicU32) {
     // SAFETY: as above.
     unsafe { os_sync_wake_by_address_all(addr.as_ptr(), 4, 0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Semaphore;
+    use std::sync::{Barrier, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn semaphore_can_release_the_maximum_count_promptly() {
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let semaphore = Semaphore::new(0, u32::MAX).unwrap();
+            let previous = semaphore.release(u32::MAX);
+            tx.send((previous, semaphore.release(0))).unwrap();
+        });
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("bulk release timed out"),
+            (Some(0), Some(u32::MAX))
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn semaphore_waiters_can_only_take_released_permits() {
+        let semaphore = Semaphore::new(0, 2).unwrap();
+        let ready = Barrier::new(4);
+        let (tx, rx) = mpsc::channel();
+        thread::scope(|scope| {
+            for _ in 0..3 {
+                let (semaphore, ready, tx) = (&semaphore, &ready, tx.clone());
+                scope.spawn(move || {
+                    ready.wait();
+                    tx.send(semaphore.wait(Some(Duration::from_secs(5))))
+                        .unwrap();
+                });
+            }
+            ready.wait();
+            // Give the workers a chance to enter the condition variable wait.
+            thread::sleep(Duration::from_millis(20));
+
+            assert_eq!(semaphore.release(0), Some(0));
+            assert!(!semaphore.wait(Some(Duration::ZERO)));
+            assert_eq!(semaphore.release(2), Some(0));
+            for _ in 0..2 {
+                assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+            }
+            assert_eq!(semaphore.release(1), Some(0));
+            assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+            assert!(!semaphore.wait(Some(Duration::ZERO)));
+        });
+    }
 }

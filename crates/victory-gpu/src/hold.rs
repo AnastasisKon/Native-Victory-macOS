@@ -42,12 +42,15 @@ const ALWAYS: u32 = 8;
 impl ValueWait {
     /// Whether it holds with `read` giving the memory's value: `None` for a
     /// comparison we do not know (counted by the caller, taken as holding)
-    /// and for memory that cannot be read (taken as not holding).
+    /// and `Some(false)` for memory that cannot be read (taken as not holding).
     pub(crate) fn holds(&self, read: &dyn Fn(u64, u8) -> Option<u64>) -> Option<bool> {
         if !(NEVER..=ALWAYS).contains(&self.comparison) {
             return None;
         }
-        let value = read(self.address, self.bytes)? & self.mask;
+        let Some(raw) = read(self.address, self.bytes) else {
+            return Some(false);
+        };
+        let value = raw & self.mask;
         let reference = self.reference;
         Some(match self.comparison {
             NEVER => false,
@@ -72,7 +75,7 @@ pub(crate) enum Item<S> {
     FenceWait(usize, u64),
 }
 
-/// What a pump did, for the frame's accounting.
+/// Work completed by a pump.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub(crate) struct Pumped {
     /// Pieces given to the host GPU, and the segments in them.
@@ -81,6 +84,8 @@ pub(crate) struct Pumped {
     /// Of those, segments that had waited (not run when submitted): their
     /// queue and how long.
     pub(crate) waited: Vec<(usize, Duration)>,
+    /// Tokens of fence waits popped from the queues during this pump.
+    pub(crate) retired_waits: Vec<usize>,
     /// Waits with a comparison we do not know (taken as holding).
     pub(crate) unknown: u32,
 }
@@ -182,8 +187,8 @@ impl<S> Held<S> {
                             piece.push(s);
                             done.segments += 1;
                         }
-                        Some(Item::Signal(..)) => {}
-                        Some(Item::FenceWait(..)) | None => {}
+                        Some(Item::FenceWait(token, _)) => done.retired_waits.push(token),
+                        Some(Item::Signal(..)) | None => {}
                     }
                 }
                 if !piece.is_empty() {
@@ -213,12 +218,6 @@ impl<S> Held<S> {
                 Some((*q, items.len(), since.elapsed(), unmet))
             })
             .collect()
-    }
-
-    pub(crate) fn waits_for(&self, token: usize) -> bool {
-        self.queues.iter().any(|(_, items)| items.iter().any(|(item, ..)| {
-            matches!(item, Item::FenceWait(f, _) if *f == token)
-        }))
     }
 
     /// Whether no queue holds anything.
@@ -291,6 +290,36 @@ mod tests {
     }
 
     #[test]
+    fn blocked_pumps_check_only_the_head_and_report_each_satisfied_wait_once() {
+        let mut held = Held::<()>::new();
+        for token in 0..1024 {
+            held.push(1, Item::FenceWait(token, 1));
+        }
+        let value = std::cell::Cell::new(0);
+        let checked = RefCell::new(Vec::new());
+        let mut world = World {
+            read: &|_, _| None,
+            fence: &|token| {
+                checked.borrow_mut().push(token);
+                value.get()
+            },
+            run: &mut |_, _| unreachable!(),
+            signal: &mut |_, _| unreachable!(),
+        };
+        for _ in 0..2 {
+            assert!(held.pump(&mut world).retired_waits.is_empty());
+            assert_eq!(checked.take(), [0]);
+        }
+
+        value.set(1);
+        let tokens: Vec<_> = (0..1024).collect();
+        assert_eq!(held.pump(&mut world).retired_waits, tokens);
+        assert_eq!(checked.take(), tokens);
+        assert!(held.pump(&mut world).retired_waits.is_empty());
+        assert!(checked.take().is_empty());
+    }
+
+    #[test]
     fn a_pending_action_holds_only_its_own_queue() {
         let mut held = Held::new();
         held.push(1, Item::Segment("render", vec![]));
@@ -326,7 +355,31 @@ mod tests {
         assert_eq!(w(GREATER, 4).holds(&read), Some(true));
         assert_eq!(w(0, 5).holds(&read), None, "unknown comparison");
         assert_eq!(w(9, 5).holds(&read), None);
-        assert_eq!(w(EQUAL, 5).holds(&|_, _| None), None, "unreadable memory");
+        assert_eq!(w(EQUAL, 5).holds(&|_, _| None), Some(false), "unreadable memory");
+    }
+
+    #[test]
+    fn unreadable_memory_holds_the_queue_without_counting_unknown() {
+        let mut held = Held::default();
+        let wait = ge(0x100, 1);
+        held.push(2, Item::Segment("waiter", vec![wait]));
+        let mut ran = Vec::new();
+        let read = |_, _| None;
+        let fence = |_| 0;
+        let mut run = |q, segs: Vec<&'static str>| ran.push((q, segs));
+        let mut signal = |_, _| true;
+        let p = held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        });
+        assert_eq!((p.pieces, p.segments, p.unknown), (0, 0, 0));
+        assert!(ran.is_empty());
+        assert!(held.holds_work(2));
+        let blocked = held.blocked(&read);
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].3, vec![wait]);
     }
 
     /// The compute queue's list waits for a value the graphics queue's list

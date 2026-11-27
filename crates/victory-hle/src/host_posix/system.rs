@@ -14,7 +14,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use victory_gpu::clock;
 use victory_loader::native::{self, seh, teb};
@@ -33,6 +33,7 @@ const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_NOT_OWNER: u32 = 288;
 const ERROR_INVALID_FLAGS: u32 = 1004;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
 
 /// 100 ns ticks from 1601 to 1970.
 const EPOCH_DIFFERENCE: u64 = 116_444_736_000_000_000;
@@ -84,8 +85,16 @@ unsafe fn units<'a, T: Copy + Default + PartialEq>(p: *const T, n: i32) -> &'a [
 /// needed if `size` is 0, else the count written, 0 with
 /// `ERROR_INSUFFICIENT_BUFFER` if it does not fit.
 fn copy_out<T: Copy>(text: &[T], out: *mut T, size: i32) -> i32 {
+    if size < 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     if size == 0 {
         return text.len() as i32;
+    }
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
     }
     if text.len() > size as usize {
         set_error(ERROR_INSUFFICIENT_BUFFER);
@@ -130,7 +139,7 @@ pub extern "system" fn WideCharToMultiByte(
     src_len: i32,
     out: *mut u8,
     size: i32,
-    _default: *const u8,
+    default: *const u8,
     used_default: *mut i32,
 ) -> i32 {
     if src.is_null() {
@@ -144,13 +153,30 @@ pub extern "system" fn WideCharToMultiByte(
     // SAFETY: see above.
     let text =
         String::from_utf16_lossy(unsafe { units(src, if src_len < 0 { -1 } else { src_len }) });
+    let mut replaced = false;
+    let fallback = if default.is_null() {
+        b'?'
+    } else {
+        // SAFETY: the title passes a pointer to a single default byte.
+        unsafe { default.read() }
+    };
     let mut bytes: Vec<u8> = if matches!(code_page, 1252 | 28591) {
         text.chars()
-            .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
+            .map(|c| match u8::try_from(u32::from(c)) {
+                Ok(b) => b,
+                Err(_) => {
+                    replaced = true;
+                    fallback
+                }
+            })
             .collect()
     } else {
         text.into_bytes()
     };
+    if replaced && !used_default.is_null() {
+        // SAFETY: see above.
+        unsafe { used_default.write(1) };
+    }
     if src_len < 0 {
         bytes.push(0);
     }
@@ -274,6 +300,10 @@ pub extern "system" fn LCMapStringEx(
     _reserved: *const c_void,
     _param: isize,
 ) -> i32 {
+    if src.is_null() || len == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: see above.
     let mut text = unsafe { units(src, len) }.to_vec();
     for unit in &mut text {
@@ -290,6 +320,9 @@ pub extern "system" fn LCMapStringEx(
         if let Some(m) = mapped.filter(|m| (*m as u32) < 0x1_0000) {
             *unit = m as u32 as u16;
         }
+    }
+    if len < 0 {
+        text.push(0);
     }
     copy_out(&text, out, size)
 }
@@ -360,6 +393,169 @@ pub extern "system" fn FormatMessageA(
     // SAFETY: the title's buffer of `size` bytes.
     unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), out, text.len()) };
     (text.len() - 1) as u32
+}
+
+/// `FormatMessageW`, the part a library uses (Microsoft Learn): `FROM_SYSTEM`, `FROM_STRING`
+/// with `%1`..`%99` inserts, `IGNORE_INSERTS`, `ARGUMENT_ARRAY`, `ALLOCATE_BUFFER` and
+/// `MAX_WIDTH_MASK` (other widths do not wrap: guess, `docs/native-host.md`). Other sources
+/// (`FROM_HMODULE`) or flags fail with `ERROR_INVALID_PARAMETER`.
+pub extern "system" fn FormatMessageW(
+    flags: u32,
+    source: *const c_void,
+    id: u32,
+    _language: u32,
+    out: *mut u16,
+    size: u32,
+    args: *const c_void,
+) -> u32 {
+    const ALLOCATE_BUFFER: u32 = 0x100;
+    const IGNORE_INSERTS: u32 = 0x200;
+    const FROM_STRING: u32 = 0x400;
+    const FROM_SYSTEM: u32 = 0x1000;
+    const ARGUMENT_ARRAY: u32 = 0x2000;
+    const MAX_WIDTH_MASK: u32 = 0xFF;
+    let known = ALLOCATE_BUFFER | IGNORE_INSERTS | FROM_STRING | FROM_SYSTEM | ARGUMENT_ARRAY;
+    let text = match flags & (FROM_STRING | FROM_SYSTEM) {
+        _ if flags & !(known | MAX_WIDTH_MASK) != 0 || out.is_null() => None,
+        FROM_SYSTEM => {
+            let text = system_message(id);
+            Some(if flags & MAX_WIDTH_MASK == MAX_WIDTH_MASK {
+                text.trim_end_matches("\r\n").to_owned()
+            } else {
+                text
+            })
+        }
+        FROM_STRING if !source.is_null() => {
+            let format = files::wide_str(source.cast());
+            let args = match () {
+                () if flags & IGNORE_INSERTS != 0 => None,
+                () if flags & ARGUMENT_ARRAY != 0 => Some(args.cast::<u64>()),
+                // SAFETY: without `ARGUMENT_ARRAY`, `args` is a `va_list *`.
+                () if !args.is_null() => Some(unsafe { args.cast::<*const u64>().read() }),
+                () => Some(std::ptr::null()),
+            };
+            expand(&format, args)
+        }
+        _ => None,
+    };
+    let Some(text) = text else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    let len = (units.len() - 1) as u32;
+    if flags & ALLOCATE_BUFFER != 0 {
+        // shortcut: leaked, as `FormatMessageA`'s, since `LocalFree` keeps nothing to free; give
+        // them a heap if a title formats many messages.
+        let leaked: &'static mut [u16] = Box::leak(units.into_boxed_slice());
+        // SAFETY: with ALLOCATE_BUFFER `out` is a `wchar_t **`.
+        unsafe { out.cast::<*mut u16>().write(leaked.as_mut_ptr()) };
+        return len;
+    }
+    if units.len() > size as usize {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    // SAFETY: the title's buffer of `size` UTF-16 units.
+    unsafe { std::ptr::copy_nonoverlapping(units.as_ptr(), out, units.len()) };
+    len
+}
+
+/// `FROM_SYSTEM`'s text for `id`, a Win32 error or the `HRESULT` of one, ending in "\r\n" as
+/// Windows' do: its English text for common errors, else "Error 0x%08X". Guess: Windows fails
+/// with `ERROR_MR_MID_NOT_FOUND` for an id it has no text for; a title that logs it is better
+/// served by the number.
+fn system_message(id: u32) -> String {
+    let code = if id & 0xFFFF_0000 == 0x8007_0000 {
+        id & 0xFFFF
+    } else {
+        id
+    };
+    let text = match code {
+        0 => "The operation completed successfully.",
+        1 => "Incorrect function.",
+        2 => "The system cannot find the file specified.",
+        3 => "The system cannot find the path specified.",
+        4 => "The system cannot open the file.",
+        5 => "Access is denied.",
+        6 => "The handle is invalid.",
+        8 => "Not enough memory resources are available to process this command.",
+        14 => "Not enough memory resources are available to complete this operation.",
+        50 => "The request is not supported.",
+        87 => "The parameter is incorrect.",
+        120 => "This function is not supported on this system.",
+        122 => "The data area passed to a system call is too small.",
+        0x8000_4001 => "Not implemented",
+        0x8000_4002 => "No such interface supported",
+        0x8000_4003 => "Invalid pointer",
+        0x8000_4005 => "Unspecified error",
+        _ => return format!("Error 0x{id:08X}\r\n"),
+    };
+    format!("{text}\r\n")
+}
+
+/// Expands a `FROM_STRING` message: `%1`..`%99` with an optional `!printf!` of `s`, `ls`, `ws`,
+/// `d`, `i`, `u`, `x` or `X` (`!s!` when absent), and the escapes `%0` (ends the text), `%n`,
+/// `%t`, `%%`, `%.`, `%!` and `% `. Arguments are 64-bit slots from `args`; `None` passes the
+/// inserts through (`IGNORE_INSERTS`). `None` back for another `printf` or no arguments.
+fn expand(format: &[u16], args: Option<*const u64>) -> Option<String> {
+    let chars: Vec<char> = String::from_utf16_lossy(format).chars().collect();
+    let mut text = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        if c != '%' {
+            text.push(c);
+            continue;
+        }
+        let Some(&next) = chars.get(i) else {
+            text.push('%');
+            break;
+        };
+        i += 1;
+        match next {
+            '0' => return Some(text),
+            'n' => text.push_str("\r\n"),
+            't' => text.push('\t'),
+            '1'..='9' => {
+                let start = i - 2;
+                let mut n = next as usize - '0' as usize;
+                if let Some(d) = chars.get(i).and_then(|c| c.to_digit(10)) {
+                    n = n * 10 + d as usize;
+                    i += 1;
+                }
+                let mut spec = String::from("s");
+                if chars.get(i) == Some(&'!') {
+                    let end = chars[i + 1..].iter().position(|&c| c == '!')? + i + 1;
+                    spec = chars[i + 1..end].iter().collect();
+                    i = end + 1;
+                }
+                let Some(args) = args else {
+                    text.extend(&chars[start..i]);
+                    continue;
+                };
+                if args.is_null() {
+                    return None;
+                }
+                // SAFETY: the title passes an argument for each insert it uses.
+                let arg = unsafe { args.add(n - 1).read_unaligned() };
+                match spec.as_str() {
+                    "s" | "ls" | "ws" if arg == 0 => return None,
+                    "s" | "ls" | "ws" => {
+                        text.push_str(&String::from_utf16_lossy(&files::wide_str(arg as _)));
+                    }
+                    "d" | "i" => text.push_str(&(arg as u32 as i32).to_string()),
+                    "u" => text.push_str(&(arg as u32).to_string()),
+                    "x" => text.push_str(&format!("{:x}", arg as u32)),
+                    "X" => text.push_str(&format!("{:X}", arg as u32)),
+                    _ => return None,
+                }
+            }
+            other => text.push(other),
+        }
+    }
+    Some(text)
 }
 
 pub extern "system" fn LocalFree(memory: *mut c_void) -> *mut c_void {
@@ -438,14 +634,36 @@ fn to_system_time(ticks: u64) -> SystemTimeFields {
     ]
 }
 
+fn days_in_month(year: u16, month: u16) -> u16 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap =
+                (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
 fn from_system_time(t: &SystemTimeFields) -> Option<u64> {
     let [y, m, _, d, h, mi, s, ms] = *t;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 59 || ms > 999 {
+    if !(1601..=30827).contains(&y)
+        || !(1..=12).contains(&m)
+        || d == 0
+        || d > days_in_month(y, m)
+        || h > 23
+        || mi > 59
+        || s > 59
+        || ms > 999
+    {
         return None;
     }
     let days = days_from_civil(i64::from(y), u32::from(m), u32::from(d)) + DAYS_1601_TO_1970;
+    let days = u64::try_from(days).ok()?;
     let seconds = u64::from(h) * 3600 + u64::from(mi) * 60 + u64::from(s);
-    Some(days as u64 * TICKS_PER_DAY + seconds * TICKS_PER_SECOND + u64::from(ms) * 10_000)
+    Some(days * TICKS_PER_DAY + seconds * TICKS_PER_SECOND + u64::from(ms) * 10_000)
 }
 
 pub extern "system" fn GetSystemTimeAsFileTime(out: *mut u64) {
@@ -469,12 +687,20 @@ pub extern "system" fn GetLocalTime(out: *mut SystemTimeFields) {
 }
 
 pub extern "system" fn FileTimeToSystemTime(ft: *const u64, out: *mut SystemTimeFields) -> i32 {
+    if ft.is_null() || out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: a FILETIME and a SYSTEMTIME.
     unsafe { out.write_unaligned(to_system_time(ft.read_unaligned())) };
     1
 }
 
 pub extern "system" fn SystemTimeToFileTime(st: *const SystemTimeFields, out: *mut u64) -> i32 {
+    if st.is_null() || out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: a SYSTEMTIME and a FILETIME.
     let fields = unsafe { st.read_unaligned() };
     match from_system_time(&fields) {
@@ -491,6 +717,10 @@ pub extern "system" fn SystemTimeToFileTime(st: *const SystemTimeFields, out: *m
 }
 
 pub extern "system" fn FileTimeToLocalFileTime(ft: *const u64, out: *mut u64) -> i32 {
+    if ft.is_null() || out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: two FILETIMEs.
     unsafe {
         out.write_unaligned(
@@ -502,6 +732,10 @@ pub extern "system" fn FileTimeToLocalFileTime(ft: *const u64, out: *mut u64) ->
 }
 
 pub extern "system" fn LocalFileTimeToFileTime(ft: *const u64, out: *mut u64) -> i32 {
+    if ft.is_null() || out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: two FILETIMEs.
     unsafe {
         out.write_unaligned(
@@ -604,13 +838,17 @@ pub extern "system" fn GlobalMemoryStatusEx(out: *mut u8) -> i32 {
 }
 
 pub extern "system" fn GetLogicalProcessorInformation(out: *mut u8, length: *mut u32) -> i32 {
+    if length.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SYSTEM_LOGICAL_PROCESSOR_INFORMATION is 32 bytes: one entry per
     // core, and one for the package.
     let n = cpus().min(64);
     let needed = (n + 1) * 32;
     // SAFETY: the title's length word and buffer.
     unsafe {
-        if length.read_unaligned() < needed {
+        if out.is_null() || length.read_unaligned() < needed {
             length.write_unaligned(needed);
             set_error(ERROR_INSUFFICIENT_BUFFER);
             return 0;
@@ -796,6 +1034,110 @@ pub extern "system" fn GetCommandLineA() -> *const u8 {
     LINE.as_ptr()
 }
 
+/// The variable `name` of the process environment, which the C runtime's `getenv` reads too:
+/// its own name and its value, matched ignoring case as Windows does.
+fn env_entry(name: &str) -> Option<(String, String)> {
+    std::env::var(name).ok().map(|v| (name.to_string(), v)).or_else(|| {
+        std::env::vars_os()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+    })
+}
+
+/// `GetEnvironmentVariable`'s result for `value` and the title's buffer of `size` units: the
+/// units written without the NUL, or the room the value and its NUL need.
+fn put_env_value<T: Copy + Default>(value: Option<Vec<T>>, buf: *mut T, size: u32) -> u32 {
+    let Some(v) = value else {
+        set_error(ERROR_ENVVAR_NOT_FOUND);
+        return 0;
+    };
+    if buf.is_null() || (size as usize) <= v.len() {
+        return v.len() as u32 + 1;
+    }
+    // SAFETY: the title's buffer of `size` units, which holds the value and its NUL.
+    unsafe {
+        std::ptr::copy_nonoverlapping(v.as_ptr(), buf, v.len());
+        buf.add(v.len()).write(T::default());
+    }
+    v.len() as u32
+}
+
+/// Sets `name` (an existing variable of any case) to `value`, or removes it for `None`.
+fn set_env(name: &str, value: Option<&str>) -> i32 {
+    // The host's environment takes no `=` in a name (Windows' hidden `=C:` ones included).
+    if name.is_empty() || name.contains('=') {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // One title writer at a time, so the name matched ignoring case is still the one set (two
+    // threads setting `Foo` and `FOO` would otherwise make two variables).
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _writing = lock(&WRITING);
+    let key = env_entry(name).map_or_else(|| name.to_string(), |(k, _)| k);
+    // shortcut: std::env locks around each of its calls, so this cannot race the C runtime's
+    // getenv (std::env too) or GetEnvironmentVariable; host C code that calls libc's getenv
+    // while a title thread sets a variable still can. Move to a title-private environment if a
+    // crash ever points there.
+    // SAFETY: the process environment, changed as the title asks, as `_putenv` does.
+    unsafe {
+        match value {
+            Some(v) => std::env::set_var(&key, v),
+            None => std::env::remove_var(&key),
+        }
+    }
+    1
+}
+
+pub extern "system" fn GetEnvironmentVariableA(name: *const u8, buf: *mut u8, size: u32) -> u32 {
+    if name.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: a NUL-terminated name.
+    let name = String::from_utf8_lossy(unsafe { units(name, -1) });
+    put_env_value(env_entry(&name).map(|(_, v)| v.into_bytes()), buf, size)
+}
+
+pub extern "system" fn GetEnvironmentVariableW(name: *const u16, buf: *mut u16, size: u32) -> u32 {
+    if name.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: a NUL-terminated name.
+    let name = String::from_utf16_lossy(unsafe { units(name, -1) });
+    put_env_value(env_entry(&name).map(|(_, v)| v.encode_utf16().collect()), buf, size)
+}
+
+pub extern "system" fn SetEnvironmentVariableA(name: *const u8, value: *const u8) -> i32 {
+    if name.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: NUL-terminated strings; a null value removes the variable.
+    let (name, value) = unsafe {
+        (
+            String::from_utf8_lossy(units(name, -1)).into_owned(),
+            (!value.is_null()).then(|| String::from_utf8_lossy(units(value, -1)).into_owned()),
+        )
+    };
+    set_env(&name, value.as_deref())
+}
+
+pub extern "system" fn SetEnvironmentVariableW(name: *const u16, value: *const u16) -> i32 {
+    if name.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: NUL-terminated strings; a null value removes the variable.
+    let (name, value) = unsafe {
+        (
+            String::from_utf16_lossy(units(name, -1)),
+            (!value.is_null()).then(|| String::from_utf16_lossy(units(value, -1))),
+        )
+    };
+    set_env(&name, value.as_deref())
+}
+
 pub extern "system" fn GetModuleHandleExW(
     flags: u32,
     name: *const u16,
@@ -844,7 +1186,12 @@ pub extern "system" fn VirtualQuery(address: *const c_void, out: *mut u8, length
             } else {
                 MEM_COMMIT
             };
-            (r.base, r.base + r.len - at, state, flags)
+            // The allocation: the image or the region of ours around it; the Mach region, a
+            // run of one protection, only for memory that is neither.
+            let base = seh::unwind::image_base_of(at)
+                .or_else(|| super::region_at(at).map(|(base, _)| base))
+                .unwrap_or(r.base);
+            (base, r.base + r.len - at, state, flags)
         }
         next => (
             at,
@@ -1225,8 +1572,14 @@ const FLS_SLOTS: usize = 4096;
 
 static FLS_USED: Mutex<Vec<bool>> = Mutex::new(Vec::new());
 
+/// Bumped each time a slot is handed out: a thread's value from an earlier owner of the slot
+/// reads 0, as Windows clears a freed slot in every thread.
+static FLS_GENERATION: [AtomicU32; FLS_SLOTS] = [const { AtomicU32::new(0) }; FLS_SLOTS];
+
 thread_local! {
-    static FLS_VALUES: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Each slot's value and the generation it was set in.
+    static FLS_VALUES: std::cell::RefCell<Vec<(u32, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 // shortcut: the destructor callback is not called (at thread end or `FlsFree`).
@@ -1241,11 +1594,7 @@ pub extern "system" fn FlsAlloc(_callback: usize) -> u32 {
         used.push(true);
     }
     used[free] = true;
-    FLS_VALUES.with(|v| {
-        if let Some(slot) = v.borrow_mut().get_mut(free) {
-            *slot = 0;
-        }
-    });
+    FLS_GENERATION[free].fetch_add(1, Ordering::Relaxed);
     free as u32
 }
 
@@ -1264,7 +1613,14 @@ pub extern "system" fn FlsFree(index: u32) -> i32 {
 
 pub extern "system" fn FlsGetValue(index: u32) -> usize {
     set_error(0);
-    FLS_VALUES.with(|v| v.borrow().get(index as usize).copied().unwrap_or(0))
+    let Some(generation) = FLS_GENERATION.get(index as usize) else {
+        return 0;
+    };
+    let generation = generation.load(Ordering::Relaxed);
+    FLS_VALUES.with(|v| match v.borrow().get(index as usize) {
+        Some(&(set_in, value)) if set_in == generation => value,
+        _ => 0,
+    })
 }
 
 pub extern "system" fn FlsSetValue(index: u32, value: usize) -> i32 {
@@ -1275,25 +1631,45 @@ pub extern "system" fn FlsSetValue(index: u32, value: usize) -> i32 {
     FLS_VALUES.with(|v| {
         let mut v = v.borrow_mut();
         if v.len() <= index as usize {
-            v.resize(index as usize + 1, 0);
+            v.resize(index as usize + 1, (0, 0));
         }
-        v[index as usize] = value;
+        v[index as usize] = (FLS_GENERATION[index as usize].load(Ordering::Relaxed), value);
     });
     1
 }
 
-// The thread pool: one thread per submission or timer firing (the real one
-// reuses threads; titles cannot tell). Callbacks are title code, called with
-// the Windows ABI as `(instance, context, object)`.
-
+// One worker per submission or timer arm. Callbacks use the Windows ABI
+// (instance, context, object).
 pub(crate) struct PoolObject {
     callback: usize,
     context: usize,
-    /// Callbacks queued or running, for the waits.
-    pending: Mutex<u32>,
-    idle: Condvar,
-    /// Retires the timer thread of an earlier `SetThreadpoolTimer`.
-    generation: AtomicU64,
+    state: Mutex<PoolState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct PoolState {
+    /// Replacing the deadline retires workers still waiting for it.
+    timer_generation: u64,
+    /// Canceling queued callbacks invalidates their tickets, including after a rearm.
+    cancel_generation: u64,
+    queued: u32,
+    running: u32,
+}
+
+impl PoolState {
+    fn queue_callback(&mut self) -> u64 {
+        self.queued += 1;
+        self.cancel_generation
+    }
+
+    fn take_queued(&mut self, ticket: u64) -> bool {
+        if ticket != self.cancel_generation {
+            return false;
+        }
+        self.queued -= 1;
+        true
+    }
 }
 
 /// What a callback gets as its instance: nothing it can use, but not null.
@@ -1303,48 +1679,72 @@ fn new_pool_object(callback: usize, context: usize) -> *mut PoolObject {
     Box::into_raw(Box::new(PoolObject {
         callback,
         context,
-        pending: Mutex::new(0),
-        idle: Condvar::new(),
-        generation: AtomicU64::new(0),
+        state: Mutex::default(),
+        changed: Condvar::new(),
     }))
 }
 
-/// Runs the callback of `object` on a thread of its own after `delay`.
-fn run_callback(object: usize, delay: Duration, period: Duration, generation: Option<u64>) {
-    // SAFETY: pool objects are leaked: valid for the life of the process.
-    let o = unsafe { &*(object as *const PoolObject) };
-    *lock(&o.pending) += 1;
-    std::thread::spawn(move || {
-        // SAFETY: as above.
-        let o = unsafe { &*(object as *const PoolObject) };
-        std::thread::sleep(delay);
-        loop {
-            if generation.is_some_and(|g| o.generation.load(Ordering::Acquire) != g) {
-                break;
+impl PoolObject {
+    fn submit(&'static self, state: &mut PoolState, delay: Duration, period: Duration) {
+        let generation = state.timer_generation;
+        let armed = Instant::now();
+        // An immediately due callback is queued before the submitting call returns.
+        let mut ticket = delay.is_zero().then(|| state.queue_callback());
+        std::thread::spawn(move || {
+            let mut state = lock(&self.state);
+            let mut delay = delay.saturating_sub(armed.elapsed());
+            loop {
+                let run = if let Some(epoch) = ticket.take() {
+                    state.take_queued(epoch)
+                } else {
+                    (state, _) = self
+                        .changed
+                        .wait_timeout_while(state, delay, |s| s.timer_generation == generation)
+                        .unwrap_or_else(|e| e.into_inner());
+                    if state.timer_generation != generation {
+                        return;
+                    }
+                    // The waiting worker starts the callback directly at expiry.
+                    true
+                };
+                if run {
+                    state.running += 1;
+                    drop(state);
+                    // SAFETY: the title's TP_WORK_CALLBACK or TP_TIMER_CALLBACK.
+                    unsafe {
+                        native::call_win64(
+                            self.callback,
+                            &[
+                                &raw const INSTANCE as u64,
+                                self.context as u64,
+                                self as *const Self as u64,
+                            ],
+                        )
+                    };
+                    state = lock(&self.state);
+                    state.running -= 1;
+                    self.changed.notify_all();
+                }
+                if period.is_zero() || state.timer_generation != generation {
+                    return;
+                }
+                delay = period;
             }
-            // SAFETY: the title's `TP_WORK_CALLBACK` or `TP_TIMER_CALLBACK`.
-            unsafe {
-                native::call_win64(
-                    o.callback,
-                    &[&raw const INSTANCE as u64, o.context as u64, object as u64],
-                )
-            };
-            if period.is_zero() {
-                break;
-            }
-            std::thread::sleep(period);
-        }
-        *lock(&o.pending) -= 1;
-        o.idle.notify_all();
-    });
-}
+        });
+    }
 
-fn wait_idle(object: *const PoolObject) {
-    // SAFETY: as above.
-    let o = unsafe { &*object };
-    let mut pending = lock(&o.pending);
-    while *pending > 0 {
-        pending = o.idle.wait(pending).unwrap_or_else(|e| e.into_inner());
+    fn wait_idle(&self, cancel: bool) {
+        let mut state = lock(&self.state);
+        if cancel && state.queued != 0 {
+            state.cancel_generation = state.cancel_generation.wrapping_add(1);
+            state.queued = 0;
+            self.changed.notify_all();
+        }
+        drop(
+            self.changed
+                .wait_while(state, |s| s.queued != 0 || s.running != 0)
+                .unwrap_or_else(|e| e.into_inner()),
+        );
     }
 }
 
@@ -1357,15 +1757,19 @@ pub extern "system" fn CreateThreadpoolWork(
 }
 
 pub extern "system" fn SubmitThreadpoolWork(work: *mut PoolObject) {
-    run_callback(work as usize, Duration::ZERO, Duration::ZERO, None);
+    // SAFETY: pool objects live for the life of the process.
+    let o = unsafe { &*work };
+    o.submit(&mut lock(&o.state), Duration::ZERO, Duration::ZERO);
 }
 
 pub extern "system" fn WaitForThreadpoolWorkCallbacks(work: *mut PoolObject, _cancel: i32) {
-    wait_idle(work);
+    // SAFETY: as above.
+    unsafe { &*work }.wait_idle(false);
 }
 
 pub extern "system" fn CloseThreadpoolWork(work: *mut PoolObject) {
-    wait_idle(work);
+    // SAFETY: as above.
+    unsafe { &*work }.wait_idle(false);
 }
 
 pub extern "system" fn CreateThreadpoolTimer(
@@ -1384,29 +1788,27 @@ pub extern "system" fn SetThreadpoolTimer(
 ) {
     // SAFETY: as above.
     let o = unsafe { &*timer };
-    let generation = o.generation.fetch_add(1, Ordering::AcqRel) + 1;
-    if due.is_null() {
-        return;
+    let mut state = lock(&o.state);
+    state.timer_generation = state.timer_generation.wrapping_add(1);
+    o.changed.notify_all();
+    if !due.is_null() {
+        // SAFETY: the title's due time.
+        let delay = until(unsafe { due.read_unaligned() });
+        o.submit(
+            &mut state,
+            delay,
+            Duration::from_millis(u64::from(period_ms)),
+        );
     }
-    // SAFETY: the title's due time.
-    let delay = until(unsafe { due.read_unaligned() });
-    run_callback(
-        timer as usize,
-        delay,
-        Duration::from_millis(u64::from(period_ms)),
-        Some(generation),
-    );
 }
 
 pub extern "system" fn WaitForThreadpoolTimerCallbacks(timer: *mut PoolObject, cancel: i32) {
-    if cancel != 0 {
-        // SAFETY: as above.
-        unsafe { &*timer }.generation.fetch_add(1, Ordering::AcqRel);
-    }
-    wait_idle(timer);
+    // SAFETY: as above.
+    unsafe { &*timer }.wait_idle(cancel != 0);
 }
 
 pub extern "system" fn CloseThreadpoolTimer(timer: *mut PoolObject) {
+    SetThreadpoolTimer(timer, std::ptr::null(), 0, 0);
     WaitForThreadpoolTimerCallbacks(timer, 1);
 }
 
@@ -1507,6 +1909,10 @@ pub extern "system" fn GetTempPathW(size: u32, out: *mut u16) -> u32 {
     let text: Vec<u16> = r"T:\".encode_utf16().chain([0]).collect();
     if (size as usize) < text.len() {
         return text.len() as u32;
+    }
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
     }
     // SAFETY: the title's buffer of `size` units.
     unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), out, text.len()) };
@@ -1675,6 +2081,9 @@ pub extern "system" fn CoCreateGuid(out: *mut u8) -> i32 {
 }
 
 pub extern "system" fn StringFromGUID2(guid: *const u8, out: *mut u16, size: i32) -> i32 {
+    if guid.is_null() || out.is_null() || size <= 0 {
+        return 0;
+    }
     // SAFETY: a 16-byte GUID.
     let g = unsafe { std::slice::from_raw_parts(guid, 16) };
     let text = format!(
@@ -1970,6 +2379,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             LocaleNameToLCID,
             GetLocaleInfoEx,
             FormatMessageA,
+            FormatMessageW,
             LocalFree,
             GlobalFree,
             EncodePointer,
@@ -2009,6 +2419,10 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             GetStartupInfoW,
             GetCommandLineW,
             GetCommandLineA,
+            GetEnvironmentVariableA,
+            GetEnvironmentVariableW,
+            SetEnvironmentVariableA,
+            SetEnvironmentVariableW,
             GetModuleHandleExW,
             VirtualQuery,
             VirtualQueryEx,
@@ -2120,6 +2534,154 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// What `amd_fidelityfx_upscaler_xbox.dll` imports by these names resolves (#123's run).
+    #[test]
+    fn the_upscaler_dll_finds_its_debug_localization_and_math_imports() {
+        for (dll, name) in [
+            ("api-ms-win-core-debug-l1-1-0.dll", "DebugBreak"),
+            ("api-ms-win-core-localization-l1-2-0.dll", "FormatMessageW"),
+            ("api-ms-win-crt-math-l1-1-0.dll", "_ldsign"),
+        ] {
+            assert!(super::super::lookup(dll, name).is_some(), "{dll}!{name}");
+        }
+    }
+
+    /// `FormatMessageW` as a library logs with it: system texts (from an `HRESULT` too), the
+    /// inserts of a string with an argument array or a `va_list`, an allocated buffer, and the
+    /// documented failures.
+    #[test]
+    fn format_message_w_formats_system_errors_and_inserts() {
+        const SYSTEM: u32 = 0x1000 | 0x200; // FROM_SYSTEM | IGNORE_INSERTS
+        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let format = |flags, source: &[u16], id, args: *const c_void| {
+            let mut out = [0u16; 128];
+            let n = FormatMessageW(
+                flags,
+                source.as_ptr().cast(),
+                id,
+                0,
+                out.as_mut_ptr(),
+                128,
+                args,
+            );
+            (n, String::from_utf16_lossy(&out[..n as usize]))
+        };
+        assert_eq!(
+            format(SYSTEM, &[0], 5, std::ptr::null()),
+            (19, "Access is denied.\r\n".into())
+        );
+        let missing = format(SYSTEM, &[0], 0x8007_0002, std::ptr::null()).1;
+        assert_eq!(missing, "The system cannot find the file specified.\r\n");
+        assert_eq!(
+            format(SYSTEM, &[0], 0xDEAD, std::ptr::null()).1,
+            "Error 0x0000DEAD\r\n"
+        );
+        assert_eq!(
+            format(SYSTEM | 0xFF, &[0], 5, std::ptr::null()).1,
+            "Access is denied."
+        );
+
+        // %1 is a wide string by default, %2!d! an int; %n, %t, %% and %0 are escapes.
+        let name = wide("dll");
+        let args = [name.as_ptr() as u64, u64::from(-3i32 as u32)];
+        let source = wide("%1%t%2!d!%n100%%%0 never");
+        let expanded = "dll\t-3\r\n100%";
+        assert_eq!(
+            format(0x400 | 0x2000, &source, 0, args.as_ptr().cast()).1,
+            expanded
+        );
+        let list = args.as_ptr();
+        assert_eq!(
+            format(0x400, &source, 0, (&raw const list).cast()).1,
+            expanded,
+            "va_list"
+        );
+        let kept = format(0x400 | 0x200, &wide("%1!x! %n"), 0, std::ptr::null()).1;
+        assert_eq!(kept, "%1!x! \r\n", "IGNORE_INSERTS keeps the inserts");
+
+        let mut allocated: *mut u16 = std::ptr::null_mut();
+        let n = FormatMessageW(
+            SYSTEM | 0x100,
+            std::ptr::null(),
+            6,
+            0,
+            (&raw mut allocated).cast(),
+            0,
+            std::ptr::null(),
+        );
+        // SAFETY: `n` units and a NUL, leaked for good.
+        let text = unsafe { std::slice::from_raw_parts(allocated, n as usize + 1) };
+        assert_eq!(
+            String::from_utf16_lossy(text),
+            "The handle is invalid.\r\n\0"
+        );
+
+        let mut small = [0u16; 4];
+        assert_eq!(
+            FormatMessageW(
+                SYSTEM,
+                std::ptr::null(),
+                5,
+                0,
+                small.as_mut_ptr(),
+                4,
+                std::ptr::null()
+            ),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+        assert_eq!(
+            format(0x800, &[0], 5, std::ptr::null()).0,
+            0,
+            "FROM_HMODULE"
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(
+            format(0x400 | 0x2000, &wide("%1!f!"), 0, args.as_ptr().cast()).0,
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn environment_variables_are_set_read_and_removed_ignoring_case() {
+        // The AMD upscaler imports them through this API set.
+        let api = "api-ms-win-core-processenvironment-l1-1-0.dll";
+        assert!(lookup(api, "GetEnvironmentVariableA").is_some());
+        assert!(lookup(api, "SetEnvironmentVariableA").is_some());
+        let (name, lower) = (b"VICTORY_TEST_ENV_5E2B\0", b"victory_test_env_5e2b\0");
+        let get = |size: u32| {
+            let mut buf = [b'x'; 8];
+            let n = GetEnvironmentVariableA(lower.as_ptr(), buf.as_mut_ptr(), size);
+            (n, buf)
+        };
+        assert_eq!(SetEnvironmentVariableA(name.as_ptr(), c"abc".as_ptr().cast()), 1);
+        // The C runtime's getenv reads the same environment.
+        assert_eq!(std::env::var("VICTORY_TEST_ENV_5E2B").as_deref(), Ok("abc"));
+        assert_eq!(get(8), (3, *b"abc\0xxxx"));
+        // Too small for the value and its NUL: the room needed, nothing written.
+        assert_eq!(get(3), (4, *b"xxxxxxxx"));
+        assert_eq!(GetEnvironmentVariableA(name.as_ptr(), std::ptr::null_mut(), 0), 4);
+        let wide: Vec<u16> = "victory_test_env_5e2b".encode_utf16().chain([0]).collect();
+        let mut out = [0xFFFFu16; 8];
+        assert_eq!(GetEnvironmentVariableW(wide.as_ptr(), out.as_mut_ptr(), 8), 3);
+        assert_eq!(out[..4], [97, 98, 99, 0]);
+        // Another case names the same variable.
+        let value: Vec<u16> = "xyzw".encode_utf16().chain([0]).collect();
+        assert_eq!(SetEnvironmentVariableW(wide.as_ptr(), value.as_ptr()), 1);
+        assert_eq!(std::env::var("VICTORY_TEST_ENV_5E2B").as_deref(), Ok("xyzw"));
+        assert!(std::env::var("victory_test_env_5e2b").is_err());
+        assert_eq!(SetEnvironmentVariableA(name.as_ptr(), c"".as_ptr().cast()), 1);
+        assert_eq!(get(8), (0, *b"\0xxxxxxx"));
+        // A null value removes it.
+        assert_eq!(SetEnvironmentVariableA(name.as_ptr(), std::ptr::null()), 1);
+        assert_eq!(get(8), (0, *b"xxxxxxxx"));
+        assert_eq!(super::super::GetLastError(), ERROR_ENVVAR_NOT_FOUND);
+        assert_eq!(SetEnvironmentVariableA(c"".as_ptr().cast(), c"v".as_ptr().cast()), 0);
+        assert_eq!(SetEnvironmentVariableA(c"A=B".as_ptr().cast(), c"v".as_ptr().cast()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
     #[test]
     fn file_times_and_system_times_round_trip() {
         // 2024-02-29 13:45:07.250, a Thursday.
@@ -2199,6 +2761,23 @@ mod tests {
         assert!(InterlockedPopEntrySList(head.as_mut_ptr()).is_null());
     }
 
+    /// `AllocationBase` is the base `VirtualAlloc` returned, not where a run of one protection
+    /// starts.
+    #[test]
+    fn virtual_query_names_the_allocation_base() {
+        let g = super::super::GRANULARITY;
+        let p = super::super::VirtualAlloc(std::ptr::null_mut(), 2 * g, 0x3000, 0x04);
+        assert!(!p.is_null());
+        let mut old = 0;
+        let second = p.cast::<u8>().wrapping_add(g).cast();
+        assert_eq!(super::super::VirtualProtect(second, g, 0x02, &mut old), 1);
+        let mut info = [0u8; 48];
+        assert_eq!(VirtualQuery(second, info.as_mut_ptr(), 48), 48);
+        let field = |at: usize| usize::from_le_bytes(info[at..at + 8].try_into().unwrap());
+        assert_eq!((field(0), field(8)), (second as usize, p as usize));
+        assert_eq!(super::super::VirtualFree(p, 0, 0x8000), 1);
+    }
+
     #[test]
     fn fiber_local_storage_is_per_thread() {
         let slot = FlsAlloc(0);
@@ -2210,6 +2789,128 @@ mod tests {
         assert_eq!((FlsGetValue(slot), other), (7, 0));
         assert_eq!(FlsFree(slot), 1);
         assert_eq!(FlsSetValue(slot, 1), 0);
+    }
+
+    /// An FLS slot freed and handed out again reads 0 in every thread, not what it held before.
+    #[test]
+    fn a_reused_fls_slot_reads_zero_in_every_thread() {
+        let slot = FlsAlloc(0);
+        assert_ne!(slot, FLS_OUT_OF_INDEXES);
+        let (set, go) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<u32>());
+        let (set_tx, go_rx) = (set.0, go.1);
+        let other = std::thread::spawn(move || {
+            assert_eq!(FlsSetValue(slot, 5), 1);
+            set_tx.send(()).unwrap();
+            FlsGetValue(go_rx.recv().unwrap())
+        });
+        set.1.recv().unwrap();
+        assert_eq!(FlsFree(slot), 1);
+        let again = FlsAlloc(0);
+        assert_ne!(again, FLS_OUT_OF_INDEXES);
+        go.0.send(again).unwrap();
+        assert_eq!(other.join().unwrap(), 0);
+        assert_eq!(FlsFree(again), 1);
+    }
+
+    const ONE_HOUR_DUE: i64 = -3600 * TICKS_PER_SECOND as i64;
+
+    #[test]
+    fn disarming_a_threadpool_timer_does_not_wait_for_its_deadline() {
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn count(_instance: usize, _context: usize, _timer: usize) {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let (done, result) = std::sync::mpsc::channel();
+        let callback = native::host_callbacks(&[(count as *const () as usize, false)]).unwrap()[0];
+        std::thread::spawn(move || {
+            let timer = CreateThreadpoolTimer(callback, 0, std::ptr::null());
+            SetThreadpoolTimer(timer, &ONE_HOUR_DUE, 0, 0);
+            SetThreadpoolTimer(timer, std::ptr::null(), 0, 0);
+            WaitForThreadpoolTimerCallbacks(timer, 0);
+            CloseThreadpoolTimer(timer);
+            let _ = done.send(());
+        });
+        result.recv_timeout(Duration::from_millis(750)).unwrap();
+        assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn canceling_a_queued_timer_callback_preserves_the_armed_deadline() {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            extern "C" fn unused(_instance: usize, _context: usize, _timer: usize) {}
+            let callback =
+                native::host_callbacks(&[(unused as *const () as usize, false)]).unwrap()[0];
+            let timer = CreateThreadpoolTimer(callback, 0, std::ptr::null());
+            SetThreadpoolTimer(timer, &ONE_HOUR_DUE, 0, 0);
+            WaitForThreadpoolTimerCallbacks(timer, 0);
+
+            // Hold a submission between queueing and dispatch without racing a worker thread.
+            // SAFETY: the allocated timer lives through close.
+            let o = unsafe { &*timer };
+            let (generation, ticket) = {
+                let mut state = lock(&o.state);
+                (state.timer_generation, state.queue_callback())
+            };
+            WaitForThreadpoolTimerCallbacks(timer, 1);
+            {
+                let mut state = lock(&o.state);
+                assert_eq!(state.timer_generation, generation);
+                assert!(!state.take_queued(ticket));
+            }
+            CloseThreadpoolTimer(timer);
+            let _ = done.send(());
+        });
+        result.recv_timeout(Duration::from_millis(750)).unwrap();
+    }
+
+    #[test]
+    fn a_threadpool_timer_waits_for_a_running_callback_after_rearm() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        struct Gate {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        extern "C" fn block(_instance: usize, context: usize, _timer: usize) {
+            // SAFETY: the test keeps this gate alive through close.
+            let gate = unsafe { &*(context as *const Gate) };
+            let _ = gate.entered.send(());
+            let _ = lock(&gate.release).recv();
+        }
+
+        let callback = native::host_callbacks(&[(block as *const () as usize, false)]).unwrap()[0];
+        for cancel in [0, 1] {
+            let (entered, started) = mpsc::channel();
+            let (release, resume) = mpsc::channel();
+            let gate = Box::leak(Box::new(Gate {
+                entered,
+                release: Mutex::new(resume),
+            }));
+            let timer =
+                CreateThreadpoolTimer(callback, gate as *const Gate as usize, std::ptr::null());
+            SetThreadpoolTimer(timer, &ONE_HOUR_DUE, 0, 0);
+            SetThreadpoolTimer(timer, &0, 0, 0);
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            SetThreadpoolTimer(timer, std::ptr::null(), 0, 0);
+
+            let (waiting, ready) = mpsc::sync_channel(0);
+            let (done, result) = mpsc::channel();
+            let handle = timer as usize;
+            let waiter = std::thread::spawn(move || {
+                waiting.send(()).unwrap();
+                WaitForThreadpoolTimerCallbacks(handle as *mut PoolObject, cancel);
+                let _ = done.send(());
+            });
+            ready.recv().unwrap();
+            let before_release = result.recv_timeout(Duration::from_millis(50));
+            release.send(()).unwrap();
+            assert_eq!(before_release, Err(RecvTimeoutError::Timeout));
+            result.recv_timeout(Duration::from_secs(1)).unwrap();
+            waiter.join().unwrap();
+            CloseThreadpoolTimer(timer);
+        }
     }
 
     #[test]
@@ -2224,6 +2925,91 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(CancelWaitableTimer(timer), 1);
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn system_time_rejects_pre_1601_and_invalid_calendar_dates() {
+        let mut ft = 0u64;
+        for bad in [
+            [1600, 12, 0, 31, 0, 0, 0, 0],
+            [0, 1, 0, 1, 0, 0, 0, 0],
+            [2023, 2, 0, 29, 0, 0, 0, 0],
+            [1900, 2, 0, 29, 0, 0, 0, 0],
+            [2024, 4, 0, 31, 0, 0, 0, 0],
+            [30828, 1, 0, 1, 0, 0, 0, 0],
+        ] {
+            assert_eq!(SystemTimeToFileTime(&bad, &mut ft), 0, "accepted {bad:?}");
+            assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        }
+        // Leap-year 2000-02-29 and epoch 1601-01-01 are valid.
+        assert_eq!(SystemTimeToFileTime(&[1601, 1, 0, 1, 0, 0, 0, 0], &mut ft), 1);
+        assert_eq!(ft, 0);
+        assert_eq!(SystemTimeToFileTime(&[2000, 2, 0, 29, 0, 0, 0, 0], &mut ft), 1);
+        assert_eq!(SystemTimeToFileTime(std::ptr::null(), &mut ft), 0);
+        assert_eq!(FileTimeToSystemTime(&ft, std::ptr::null_mut()), 0);
+    }
+
+    #[test]
+    fn string_guid_and_processor_helpers_guard_edge_cases() {
+        // LCMapStringEx with len < 0 includes the terminating NUL.
+        let src: Vec<u16> = "AbC\0".encode_utf16().collect();
+        let mut out = [0xFFFFu16; 8];
+        let n = LCMapStringEx(
+            std::ptr::null(),
+            LCMAP_LOWERCASE,
+            src.as_ptr(),
+            -1,
+            out.as_mut_ptr(),
+            8,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert_eq!(n, 4);
+        assert_eq!(&out[..4], &[b'a' as u16, b'b' as u16, b'c' as u16, 0]);
+        assert_eq!(
+            LCMapStringEx(
+                std::ptr::null(),
+                LCMAP_LOWERCASE,
+                src.as_ptr(),
+                -1,
+                out.as_mut_ptr(),
+                -1,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            ),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        // WideCharToMultiByte reports used_default and honors a custom default byte.
+        let wide: Vec<u16> = "A\u{20AC}B".encode_utf16().collect();
+        let mut mb = [0u8; 8];
+        let mut used = 0i32;
+        let def = b'#';
+        assert_eq!(
+            WideCharToMultiByte(1252, 0, wide.as_ptr(), 3, mb.as_mut_ptr(), 8, &def, &mut used),
+            3
+        );
+        assert_eq!((&mb[..3], used), (&b"A#B"[..], 1));
+
+        // Negative buffer size in copy_out / StringFromGUID2 and null buffer in GetLogicalProcessorInformation.
+        assert_eq!(
+            MultiByteToWideChar(65001, 0, c"hi".as_ptr().cast(), -1, out.as_mut_ptr(), -1),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        let guid = [0u8; 16];
+        assert_eq!(StringFromGUID2(guid.as_ptr(), out.as_mut_ptr(), -1), 0);
+        assert_eq!(StringFromGUID2(std::ptr::null(), out.as_mut_ptr(), 64), 0);
+
+        let mut len = 1024u32;
+        assert_eq!(GetLogicalProcessorInformation(std::ptr::null_mut(), &mut len), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+        assert!(len >= 64);
+        assert_eq!(GetLogicalProcessorInformation(std::ptr::null_mut(), std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
     }
 }
 

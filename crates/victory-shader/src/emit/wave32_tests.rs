@@ -35,7 +35,7 @@ const READLANE: &[u32] = &[
     S_ENDPGM,
 ];
 
-/// Each lane reads `v0` of the lane 32 above it (modulo 64).
+/// Adding 32 to the dword index wraps back to this lane in its half.
 const BPERMUTE: &[u32] = &[
     0x4A02_00A0, // v_add_nc_u32_e32 v1, 32, v0
     0x3402_0282, // v_lshlrev_b32_e32 v1, 2, v1
@@ -173,14 +173,31 @@ fn a_ballot_of_64_lanes_is_two_host_waves_joined() {
 
 #[test]
 fn a_lane_read_across_the_halves_goes_through_group_shared_memory() {
-    for words in [READLANE, BPERMUTE] {
-        let l = host32(words, 64);
-        assert_eq!(l.wave_size, Some(32));
-        assert!(l.exchanges);
-    }
-    assert_eq!(host32(READLANE, 64).barriers, 2);
-    // The permute also ballots the lanes that run (0 from the others).
-    assert_eq!(host32(BPERMUTE, 64).barriers, 4);
+    let l = host32(READLANE, 64);
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.exchanges);
+    assert_eq!(l.barriers, 2);
+}
+
+#[test]
+fn bpermute_reads_within_each_host_wave() {
+    // Each host wave must read its own lane 0 at byte address 124 + 4.
+    // Store the result so the lane read is live in the emitted DXIL.
+    let words = [
+        0x7E02_02FF, 124, // v_mov_b32 v1, 124
+        0xDACC_0004, 0x0200_0001, // ds_bpermute_b32 v2, v1, v0 offset:4
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xD834_0000, 0x0000_0203, // ds_write_b32 v3, v2
+        S_ENDPGM,
+    ];
+    let l = lowered(&words, 64, true, true).unwrap();
+    assert_eq!(l.wave_size, Some(32));
+    assert_eq!(l.barriers, 0);
+    assert!(!l.exchanges);
+    assert_eq!(
+        l.wave_read_lane_calls,
+        [("dx.op.waveReadLaneAt.i32".into(), vec![Some(117), None, Some(0)])]
+    );
 }
 
 #[test]
@@ -247,6 +264,40 @@ fn lds_a_wave_shares_unsynced_in_divergent_code_is_refused() {
     assert_eq!(l.barriers, 1);
 }
 
+#[test]
+fn a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves() {
+    // `v_readfirstlane` reads each host wave's own first lane (0 and 32 here), so a branch on
+    // what it gives can split the console wave: the halves would not meet at a barrier.
+    const FIRST: [u32; 3] = [
+        0x7E04_0500, // v_readfirstlane_b32 s2, v0
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF84_0003, // s_cbranch_scc0 3
+    ];
+    let mut readlane = FIRST.to_vec();
+    readlane.extend([
+        0xD760_0004,
+        0x0001_5101, // v_readlane_b32 s4, v1, 40
+        0x7E0A_0204, // v_mov_b32_e32 v5, s4
+        S_ENDPGM,
+    ]);
+    let l = host32(&readlane, 64);
+    assert_eq!((l.barriers, l.exchanges), (0, false));
+    // LDS written and read behind such a branch (over 6 words): no barrier fits.
+    let mut lds = FIRST.to_vec();
+    lds[2] = 0xBF84_0006; // s_cbranch_scc0 6
+    lds.extend([
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0xD834_0000,
+        0x0000_0001, // ds_write_b32 v1, v0
+        0xD8D8_0004,
+        0x0200_0001, // ds_read_b32 v2, v1 offset:4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        S_ENDPGM,
+    ]);
+    let r = lowered(&lds, 64, true, true);
+    assert!(matches!(r, Err(crate::ShaderError::Unsupported { .. })));
+}
+
 /// A sum over the 64 lanes the way a compiler expands `WaveActiveSum`: all
 /// lanes on, butterflies inside each row of 16, then the rows' sums by lane.
 const REDUCE: &[u32] = &[
@@ -281,6 +332,95 @@ fn a_whole_wave_sum_combines_the_two_halves() {
     assert_eq!(l.wave_size, Some(32));
     // Whatever the section leaves is one reduction: write, barrier, read, barrier.
     assert_eq!(l.barriers, 2);
+}
+
+/// [`REDUCE`] with `v_mul_f32` and 1.0 in the lanes off: a product, which the
+/// two host waves of a console wave exchange as they do a sum.
+#[test]
+fn a_whole_wave_product_combines_the_two_halves() {
+    let mut words = REDUCE.to_vec();
+    words[2] = 0x000A_00F2; // v_cndmask_b32_e64 v1, 1.0, v0, s[2:3]
+    for w in &mut words {
+        match *w {
+            0x4A02_02FA => *w = 0x1002_02FA, // v_mul_f32_dpp v1, v1, v1
+            0x4A02_0501 => *w = 0x1002_0501, // v_mul_f32_e32 v1, v1, v2
+            0xD525_0003 => *w = 0xD508_0003, // v_mul_f32_e64 v3, s4, s5
+            _ => {}
+        }
+    }
+    let l = host32(&words, 64);
+    assert_eq!(l.wave_size, Some(32));
+    assert_eq!(l.barriers, 2);
+}
+
+#[test]
+fn whole_wave_float_prefix_products() {
+    for inclusive in [false, true] {
+        // Form an inclusive scan within each 16-lane row in v1.
+        let mut words = vec![
+            0xBE82_25C1, // s_or_saveexec_b64 s[2:3], -1
+            0xD501_0001,
+            0x000A_00F2, // v_cndmask_b32 v1, 1.0, v0, s[2:3]
+        ];
+        for shift in [1, 2, 4, 8] {
+            words.extend([0x1002_02FA, 0xFF01_1001 | (shift << 8)]); // v_mul_f32 row_shr
+        }
+        if inclusive {
+            words.push(0x7E04_0301); // v_mov_b32 v2, v1
+        } else {
+            // Shift the row prefix one lane, leaving 1.0 in its first lane.
+            words.extend([0x7E04_02F2, 0x7E04_02FA, 0xFF01_1101]);
+        }
+        // Multiply each completed row's product into all subsequent rows.
+        for lane in [15, 31, 47] {
+            let mask = u64::MAX << (lane + 1);
+            words.extend([
+                0xD760_0004,
+                ((128 + lane) << 9) | 257, // v_readlane_b32 s4, v1, lane
+                0xBEFE_03FF,
+                mask as u32, // s_mov_b32 exec_lo, mask.lo
+                0xBEFF_03FF,
+                (mask >> 32) as u32, // s_mov_b32 exec_hi, mask.hi
+                0x1004_0404,         // v_mul_f32 v2, s4, v2
+                0xBEFE_04C1,         // s_mov_b64 exec, -1
+            ]);
+        }
+        words.extend([
+            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0xD834_0000,
+            0x0000_0203, // ds_write_b32 v3, v2
+            S_ENDPGM,
+        ]);
+
+        for host32 in [false, true] {
+            let l = lowered(&words, 64, true, host32).unwrap();
+            assert_eq!(
+                l.wave_prefix_calls,
+                [(
+                    "dx.op.wavePrefixOp.f32".into(),
+                    vec![Some(121), None, Some(1), Some(0)]
+                )]
+            );
+            if host32 {
+                assert_eq!(
+                    l.wave_active_calls,
+                    [(
+                        "dx.op.waveActiveOp.f32".into(),
+                        vec![Some(119), None, Some(1), Some(0)]
+                    )]
+                );
+            } else {
+                assert!(l.wave_active_calls.is_empty());
+            }
+            // Inclusive folds in this lane; the split wave folds in the lower half.
+            assert_eq!(
+                l.float_multiplies,
+                usize::from(inclusive) + usize::from(host32)
+            );
+            assert_eq!(l.barriers, if host32 { 2 } else { 0 });
+        }
+    }
 }
 
 #[test]

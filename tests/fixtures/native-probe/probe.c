@@ -45,6 +45,7 @@ IMPORT int TlsSetValue(u32, ptr);
 IMPORT ptr AddVectoredExceptionHandler(u32, ptr);
 IMPORT u32 RemoveVectoredExceptionHandler(ptr);
 IMPORT void RaiseException(u32, u32, u32, const u64 *);
+IMPORT void DebugBreak(void);
 
 /* Threads and synchronisation. */
 IMPORT u32 SuspendThread(ptr);
@@ -291,8 +292,10 @@ enum {
     E_UNHANDLED_SKIPPED = 1u << 12,
     E_AFTER = 1u << 13,
     E_ORDER = 1u << 14,
+    E_BREAK = 1u << 15,
+    E_BREAK_CONTINUE = 1u << 16,
 };
-#define EXC_ALL 0x7FFFu
+#define EXC_ALL 0x1FFFFu
 
 static volatile int *volatile null_pointer = (volatile int *)8;
 static volatile int zero;
@@ -449,6 +452,27 @@ u32 probe_seh(ptr unused)
         RemoveVectoredExceptionHandler(handle);
         VirtualFree(veh_page, 0, 0x8000);
     }
+    /* DebugBreak raises EXCEPTION_BREAKPOINT, which __except takes... */
+    caught = 0;
+    seen_code = 0;
+    __try {
+        DebugBreak();
+    } __except (record_filter((struct exception_pointers *)_exception_info())) {
+        caught = 1;
+    }
+    if (caught && seen_code == 0x80000003)
+        ok |= E_BREAK;
+    /* ...and a filter that continues returns from it. */
+    after = 0;
+    __try {
+        DebugBreak();
+        after = 1;
+    } __except (continue_filter((struct exception_pointers *)_exception_info())) {
+        after = 2;
+    }
+    if (after == 1)
+        ok |= E_BREAK_CONTINUE;
+
     /* Everything above left the thread able to carry on. */
     if (read_gs(0x30) == teb_at_start)
         ok |= E_AFTER;
@@ -575,6 +599,11 @@ u32 probe_threads(ptr unused)
 static u8 cs_area[64] __attribute__((aligned(16)));
 static u8 srw_area[16] __attribute__((aligned(16)));
 static u8 cv_area[16] __attribute__((aligned(16)));
+
+/* Bounds on waits for another thread to get scheduled at all: loose for
+   slow hosts, where scheduling a thread can take seconds. Waits that must
+   time out stay short: a time-out cannot come early on a monotonic clock. */
+enum { THREAD_SCHEDULED_MS = 30000 };
 static volatile u32 shared_counter, cv_ready, cv_seen;
 static ptr consumer_done;
 
@@ -650,9 +679,9 @@ u32 probe_sync(ptr unused)
         ok |= T_WAIT_ALL_KEEPS;
     SetEvent(e[0]);
     ptr th = CreateThread(0, 0, (ptr)late_setter, e[1], 0, 0);
-    if (WaitForMultipleObjects(2, e, 1, 5000) == 0)
+    if (WaitForMultipleObjects(2, e, 1, THREAD_SCHEDULED_MS) == 0)
         ok |= T_WAIT_ALL;
-    WaitForSingleObject(th, 5000);
+    WaitForSingleObject(th, THREAD_SCHEDULED_MS);
     CloseHandle(th);
     CloseHandle(e[0]);
     CloseHandle(e[1]);
@@ -667,7 +696,7 @@ u32 probe_sync(ptr unused)
     ptr w[2];
     w[0] = CreateThread(0, 0, (ptr)cs_worker, (ptr)1, 0, 0);
     w[1] = CreateThread(0, 0, (ptr)cs_worker, (ptr)1, 0, 0);
-    WaitForMultipleObjects(2, w, 1, 20000);
+    WaitForMultipleObjects(2, w, 1, THREAD_SCHEDULED_MS);
     if (shared_counter == 40000)
         ok |= T_CS;
     CloseHandle(w[0]);
@@ -677,7 +706,7 @@ u32 probe_sync(ptr unused)
     EnterCriticalSection(cs_area);
     shared_counter = 0xFFFFFFFF;
     ptr tr = CreateThread(0, 0, (ptr)try_from_other, 0, 0, 0);
-    u32 tried = WaitForSingleObject(tr, 5000);
+    u32 tried = WaitForSingleObject(tr, THREAD_SCHEDULED_MS);
     u32 rejected = tr && tried == 0 && shared_counter == 0;
     LeaveCriticalSection(cs_area);
     CloseHandle(tr);
@@ -695,7 +724,7 @@ u32 probe_sync(ptr unused)
     shared_counter = 0;
     w[0] = CreateThread(0, 0, (ptr)cs_worker, 0, 0, 0);
     w[1] = CreateThread(0, 0, (ptr)cs_worker, 0, 0, 0);
-    WaitForMultipleObjects(2, w, 1, 20000);
+    WaitForMultipleObjects(2, w, 1, THREAD_SCHEDULED_MS);
     if (shared_counter == 40000)
         ok |= T_SRW;
     CloseHandle(w[0]);
@@ -718,7 +747,7 @@ u32 probe_sync(ptr unused)
     cv_ready = 1;
     LeaveCriticalSection(cs_area);
     WakeConditionVariable(cv_area);
-    if (WaitForSingleObject(consumer_done, 5000) == 0 && cv_seen)
+    if (WaitForSingleObject(consumer_done, THREAD_SCHEDULED_MS) == 0 && cv_seen)
         ok |= T_CV;
     CloseHandle(c);
     CloseHandle(consumer_done);
@@ -733,11 +762,11 @@ u32 probe_sync(ptr unused)
     ran_flag = 0;
     ptr d = CreateThread(0, 0, (ptr)delayed_flag, 0, 0, 0);
     u64 t0 = GetTickCount64();
-    while (!ran_flag && GetTickCount64() < t0 + 3000)
+    while (!ran_flag && GetTickCount64() < t0 + THREAD_SCHEDULED_MS)
         SwitchToThread();
     if (ran_flag)
         ok |= T_SWITCH;
-    WaitForSingleObject(d, 5000);
+    WaitForSingleObject(d, THREAD_SCHEDULED_MS);
     CloseHandle(d);
     return ok;
 }
@@ -939,6 +968,39 @@ u32 probe_dll(ptr unused)
     ptr add = module ? GetProcAddress(module, "DllProbeAdd") : 0;
     if (add && add == (ptr)DllProbeAdd && ((u32(*)(u32, u32))add)(1, 2) == 3)
         ok |= D_PROC;
+    return ok;
+}
+
+/* The DLL forwards SetError to KERNEL32.SetLastError. Use distinct values to
+ * check both the static import and the address returned to the title. */
+IMPORT void SetError(u32);
+u32 probe_forwarders(ptr unused)
+{
+    (void)unused;
+    u32 ok = 0;
+    ptr module = GetModuleHandleA("victory-probe-dll.dll");
+    SetError(41);
+    if (GetLastError() == 41)
+        ok |= 1;
+    if (!module)
+        return ok;
+    void (*set_error)(u32) = (void (*)(u32))GetProcAddress(module, "SetError");
+    if (set_error) {
+        set_error(42);
+        if (GetLastError() == 42)
+            ok |= 2;
+    }
+    if (GetProcAddress(module, "AddAlias") == (ptr)DllProbeAdd)
+        ok |= 4;
+    SetLastError(0);
+    if (!GetProcAddress(module, "Loop") && GetLastError() == 127)
+        ok |= 8;
+    SetLastError(0);
+    if (!GetProcAddress(module, "Missing") && GetLastError() == 127)
+        ok |= 16;
+    int (*initialize)(void) = (int (*)(void))GetProcAddress(module, "Initialize");
+    if (initialize && initialize() == 0)
+        ok |= 32;
     return ok;
 }
 

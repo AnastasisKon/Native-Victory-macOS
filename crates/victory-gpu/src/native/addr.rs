@@ -26,7 +26,6 @@
 //! entry, 16 GiB of mappings is 2 MiB of words. A 64 KiB title page that is not wholly inside one
 //! mapping of one pool (mappings of 16 KiB granularity, or a pool boundary) is a null page.
 
-use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::rc::Rc;
 use victory_backend::backend::ComputeBackend;
 
@@ -71,24 +70,50 @@ pub struct Mapping {
     pub offset: u64,
 }
 
-/// The view pairs made so far: pair `n` (n >= 1) is `keys[n - 1]`. Only ever grows, so a heap
-/// that has the first k pairs written only needs the ones after them.
+/// The view pairs made so far: pair `n` (n >= 1) is `keys[n - 1]`, `None` once its pool was
+/// released (the slot is free for the next pool). `epoch` changes whenever a slot that existed
+/// changes (released or reused), so a heap whose pairs were written in another epoch writes them
+/// all again; otherwise it only needs the ones after those it has.
 #[derive(Default, Debug)]
 pub struct Pairs {
-    pub keys: Vec<PairKey>,
+    pub keys: Vec<Option<PairKey>>,
+    pub epoch: u64,
 }
 
 impl Pairs {
     fn pair(&mut self, key: PairKey) -> Option<u32> {
-        let n = match self.keys.iter().rposition(|k| *k == key) {
+        let n = match self.keys.iter().rposition(|k| *k == Some(key)) {
             Some(n) => n,
-            None if self.keys.len() + 1 < PAIRS => {
-                self.keys.push(key);
-                self.keys.len() - 1
-            }
-            None => return None,
+            None => match self.keys.iter().position(Option::is_none) {
+                Some(n) => {
+                    self.keys[n] = Some(key);
+                    self.epoch += 1;
+                    n
+                }
+                None if self.keys.len() + 1 < PAIRS => {
+                    self.keys.push(Some(key));
+                    self.keys.len() - 1
+                }
+                None => {
+                    static FULL: std::sync::Once = std::sync::Once::new();
+                    FULL.call_once(|| {
+                        tracing::warn!(pairs = PAIRS - 1, "every title memory view pair is taken: pages of further pools read as zero and drop their writes (first time)");
+                    });
+                    return None;
+                }
+            },
         };
         Some(n as u32 + 1)
+    }
+
+    /// Pool `pool` was released: its pairs are free for other pools.
+    pub fn release(&mut self, pool: usize) {
+        for k in &mut self.keys {
+            if k.is_some_and(|k| k.pool == pool) {
+                *k = None;
+                self.epoch += 1;
+            }
+        }
     }
 
     /// The bytes of the pool a pair shows: from `chunk * CHUNK`, a chunk and a page long, as far
@@ -146,12 +171,25 @@ pub fn build(maps: &[Mapping], pairs: &mut Pairs, first: u32) -> Vec<u32> {
 
 /// A root SRV or UAV address as the translator's root views want it (`emit`, "Root SRVs and root
 /// UAVs"): the heap index of the view pair's SRV (the UAV is the next entry) and the byte offset of
-/// the address in the view. An address no mapping shows is the null view at offset 0.
+/// the address in the view. The first containing mapping wins. An unmapped address gets the null
+/// view at offset 0.
 pub fn root_view(maps: &[Mapping], pairs: &mut Pairs, first: u32, address: u64) -> (u32, u32) {
+    let mapping = maps.iter().find(|m| address >= m.at && address - m.at < m.len);
+    mapped_root_view(mapping, pairs, first, address)
+}
+
+/// Root view in a pool-table snapshot: starts are strictly increasing and no range extends
+/// past the next start, so only the last mapping starting at or before the address can contain it.
+#[cfg(test)]
+fn sorted_root_view(maps: &[Mapping], pairs: &mut Pairs, first: u32, address: u64) -> (u32, u32) {
+    let end = maps.partition_point(|m| m.at <= address);
+    let mapping = maps[..end].last().filter(|m| address - m.at < m.len);
+    mapped_root_view(mapping, pairs, first, address)
+}
+
+pub(super) fn mapped_root_view(mapping: Option<&Mapping>, pairs: &mut Pairs, first: u32, address: u64) -> (u32, u32) {
     let null = (pair_index(first, 0), 0);
-    let Some(m) = maps.iter().find(|m| address >= m.at && address - m.at < m.len) else {
-        return null;
-    };
+    let Some(m) = mapping else { return null };
     let pool_at = m.offset + (address - m.at);
     let key = PairKey {
         pool: m.pool,
@@ -162,6 +200,30 @@ pub fn root_view(maps: &[Mapping], pairs: &mut Pairs, first: u32, address: u64) 
     match pairs.pair(key) {
         Some(pair) => (pair_index(first, pair), (pool_at - key.chunk * CHUNK) as u32),
         None => null,
+    }
+}
+
+/// `VICTORY_TRACE_ROOT_SPAN`: how far from `address` the title's range stays linear in the pool the
+/// mapping holding it shows (the next mappings start where the last ended, in the same pool, at the
+/// pool offset that follows), up to `limit` bytes; the mapping holding `address`, and the one the
+/// title has at the end of the run (`None`: nothing mapped there). `None` if nothing holds `address`.
+/// `sorted`: indices of `maps` by address.
+pub fn linear_run(
+    maps: &[Mapping],
+    sorted: &[usize],
+    address: u64,
+    limit: u64,
+) -> Option<(u64, Mapping, Option<Mapping>)> {
+    let m = *maps.iter().find(|m| address >= m.at && address - m.at < m.len)?;
+    let (mut end, mut pool_end) = (m.at + m.len, m.offset + m.len);
+    loop {
+        let from = sorted.partition_point(|&i| maps[i].at < end);
+        let mut at_end = sorted[from..].iter().map(|&i| maps[i]).take_while(|n| n.at == end);
+        let first = at_end.clone().next();
+        match at_end.find(|n| n.pool == m.pool && n.offset == pool_end) {
+            Some(n) if end - address < limit => (end, pool_end) = (end + n.len, pool_end + n.len),
+            _ => return Some((end - address, m, first)),
+        }
     }
 }
 
@@ -179,35 +241,26 @@ pub fn lookup(words: &[u32], va: u64) -> Option<(u32, u32)> {
     (view != words[LEVEL_1]).then(|| (view, (va as u32).wrapping_sub(start)))
 }
 
-/// Zeroed, page-aligned host memory wrapped as a GPU buffer: the table, the null view.
+/// A zeroed GPU buffer of the host's own: the table, the null view. The backend owns its memory,
+/// so work submitted with it keeps it after the host replaced it (a table is replaced whenever a
+/// mapping changed, and the GPU may run work submitted with the old one much later: a queue held
+/// behind a wait).
 pub struct Pages<B: ComputeBackend> {
     pub buf: Rc<B::Buffer>,
     ptr: *mut u8,
-    layout: Layout,
+    len: usize,
 }
 
 impl<B: ComputeBackend> Pages<B> {
     /// `bytes` rounded up to 16 KiB (a page on Apple silicon; a multiple of every page size here).
     pub fn new(backend: &B, bytes: usize) -> Result<Pages<B>, String> {
-        let layout = Layout::from_size_align(bytes.max(1).next_multiple_of(1 << 14), 1 << 14)
-            .map_err(|e| e.to_string())?;
-        // SAFETY: a non-zero size.
-        let ptr = unsafe { alloc_zeroed(layout) };
-        if ptr.is_null() {
-            return Err(format!("no memory for {} bytes", layout.size()));
-        }
-        match backend.wrap_title_memory(ptr, layout.size()) {
-            Ok(buf) => Ok(Pages {
-                buf: Rc::new(buf),
-                ptr,
-                layout,
-            }),
-            Err(e) => {
-                // SAFETY: allocated above with this layout, not wrapped.
-                unsafe { dealloc(ptr, layout) };
-                Err(e)
-            }
-        }
+        let len = bytes.max(1).next_multiple_of(1 << 14);
+        let (buf, ptr) = backend.host_buffer(len)?;
+        Ok(Pages {
+            buf: Rc::new(buf),
+            ptr,
+            len,
+        })
     }
 
     pub fn ptr(&self) -> *mut u8 {
@@ -216,16 +269,9 @@ impl<B: ComputeBackend> Pages<B> {
 
     /// Writes `words` from the start.
     pub fn write(&self, words: &[u32]) {
-        assert!(words.len() * 4 <= self.layout.size());
-        // SAFETY: inside the allocation; the GPU does not read a table before it is bound.
+        assert!(words.len() * 4 <= self.len);
+        // SAFETY: inside the buffer `buf` keeps; the GPU does not read a table before it is bound.
         unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), self.ptr.cast(), words.len()) };
-    }
-}
-
-impl<B: ComputeBackend> Drop for Pages<B> {
-    fn drop(&mut self) {
-        // SAFETY: allocated in `new` with this layout.
-        unsafe { dealloc(self.ptr, self.layout) };
     }
 }
 
@@ -251,6 +297,61 @@ mod tests {
         assert_eq!(root_view(&maps, &mut pairs, first, 0x30_0000_0000), (pair_index(first, 0), 0));
     }
 
+    #[test]
+    fn sorted_root_views_match_linear_lookup_at_mapping_and_chunk_boundaries() {
+        let start = (1 << 32) + 100;
+        let maps = [
+            map(start, 0, 1, 16, 0),
+            map(start + 2, 8, 2, CHUNK + 4, CHUNK - 4),
+            map(start + 10, 3, 3, 32, 17),
+            map(start + 14, 0, 4, 16, 0),
+            map(start + 17, 2, 2, CHUNK + 4, 1),
+        ];
+        // Try every prefix so each mapping is also tested as the final entry, and the table can be empty.
+        for len in 0..=maps.len() {
+            let maps = &maps[..len];
+            let (mut sorted, mut linear) = (Pairs::default(), Pairs::default());
+            for address in (start - 1..=start + 20).chain([0, u64::MAX]) {
+                assert_eq!(
+                    sorted_root_view(maps, &mut sorted, FIRST, address),
+                    root_view(maps, &mut linear, FIRST, address),
+                    "len {len}, address {address:#x}"
+                );
+                assert_eq!(sorted.keys, linear.keys);
+            }
+        }
+    }
+
+    #[test]
+    fn root_view_uses_the_first_match_in_an_unsorted_slice() {
+        let maps = [map(12, 4, 1, 32, 23), map(10, 10, 2, 16, 0)];
+        let mut pairs = Pairs::default();
+        assert_eq!(root_view(&maps, &mut pairs, FIRST, 13), (pair_index(FIRST, 1), 24));
+        assert_eq!(pairs.keys[0].unwrap().pool, 1);
+    }
+
+    #[test]
+    fn a_linear_run_follows_mappings_that_continue_the_pool() {
+        // 64 KiB of pool 10 at its offset 0x10000, the next 64 KiB continuing it, then a 64 KiB
+        // that is pool 10 elsewhere (an alias), then pool 11.
+        let maps = [
+            map(0x8_0000_0000, PAGE, 10, 1 << 30, 0x1_0000),
+            map(0x8_0002_0000, PAGE, 10, 1 << 30, 0x9_0000),
+            map(0x8_0001_0000, PAGE, 10, 1 << 30, 0x2_0000),
+            map(0x8_0003_0000, PAGE, 11, PAGE, 0),
+        ];
+        let mut sorted: Vec<usize> = (0..maps.len()).collect();
+        sorted.sort_by_key(|&i| maps[i].at);
+        let (run, m, next) = linear_run(&maps, &sorted, 0x8_0000_0100, 1 << 20).unwrap();
+        assert_eq!((run, m.offset), (2 * PAGE - 0x100, 0x1_0000));
+        assert_eq!(next.map(|n| n.offset), Some(0x9_0000));
+        // Stops once the limit is reached; nothing mapped is None.
+        assert_eq!(linear_run(&maps, &sorted, 0x8_0000_0100, 0x100).unwrap().0, PAGE - 0x100);
+        let (run, _, next) = linear_run(&maps, &sorted, 0x8_0003_0000, 1 << 20).unwrap();
+        assert_eq!((run, next.is_none()), (PAGE, true));
+        assert!(linear_run(&maps, &sorted, 0x9_0000_0000, 1 << 20).is_none());
+    }
+
     /// Where a heap of a thousand title entries has its pairs.
     const FIRST: u32 = 1000;
 
@@ -268,7 +369,7 @@ mod tests {
     /// What the lookup says an address of the title is: the pair's view and where in the pool.
     fn resolve(words: &[u32], pairs: &Pairs, va: u64) -> Option<(usize, u64)> {
         let (view, offset) = lookup(words, va)?;
-        let key = pairs.keys[((view - FIRST) / 2 - 1) as usize];
+        let key = pairs.keys[((view - FIRST) / 2 - 1) as usize].unwrap();
         Some((key.pool, key.chunk * CHUNK + u64::from(offset)))
     }
 
@@ -307,7 +408,7 @@ mod tests {
             assert_eq!(r, (5, off), "{off:#x}");
             // The offset is inside the view of that pair (a chunk and a page long, to the pool's end).
             let (view, o) = lookup(&words, at + off).unwrap();
-            let key = pairs.keys[((view - FIRST) / 2 - 1) as usize];
+            let key = pairs.keys[((view - FIRST) / 2 - 1) as usize].unwrap();
             let (_, size) = Pairs::span(&key);
             assert!(u64::from(o) + 4 <= u64::from(size), "{off:#x}");
         }
@@ -353,5 +454,26 @@ mod tests {
         assert_eq!(resolve(&words, &pairs, 0x10_0000_0000 + (PAIRS as u64 * 2 - 1) * PAGE), None);
         // The pairs and the translator's own null views fit below the clamp.
         assert!(fits(1_000_000) && !fits(victory_shader::emit::NULL_BUFFER_VIEW as usize));
+    }
+
+    #[test]
+    fn a_released_pools_pairs_go_to_the_next_pools() {
+        let mut pairs = Pairs::default();
+        // Every pair taken.
+        let many: Vec<Mapping> = (0..PAIRS as u64)
+            .map(|i| map(0x10_0000_0000 + i * PAGE, PAGE, 100 + i as usize, PAGE, 0))
+            .collect();
+        build(&many, &mut pairs, FIRST);
+        assert_eq!(pairs.keys.len(), PAIRS - 1);
+        let fresh = map(0x20_0000_0000, PAGE, 999, PAGE, 0);
+        assert_eq!(resolve(&build(&[fresh], &mut pairs, FIRST), &pairs, 0x20_0000_0000), None);
+        // Pool 105 goes: its pair (6) is the new pool's, and heaps must write their pairs again.
+        let epoch = pairs.epoch;
+        pairs.release(105);
+        assert_ne!(pairs.epoch, epoch);
+        let words = build(&[fresh], &mut pairs, FIRST);
+        assert_eq!(resolve(&words, &pairs, 0x20_0000_0010), Some((999, 0x10)));
+        assert_eq!(lookup(&words, 0x20_0000_0000).unwrap().0, pair_index(FIRST, 6));
+        assert_eq!(pairs.keys.len(), PAIRS - 1);
     }
 }

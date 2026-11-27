@@ -31,23 +31,44 @@ pub fn options() -> Options {
 
 /// A console shader container as DXIL for the native host.
 pub fn translate(container: &[u8]) -> Result<HostShader, String> {
-    victory_shader::emit::translate_with(container, options()).map_err(|e| e.to_string())
+    translate_cached(container, options())
+}
+
+/// [`victory_shader::emit::translate_with`] through the on-disk cache (`shader_cache::native_shader`):
+/// `o` is part of the key.
+fn translate_cached(container: &[u8], o: Options) -> Result<HostShader, String> {
+    crate::shader_cache::native_shader(container, &format!("{o:?}"), |c| {
+        victory_shader::emit::translate_with(c, o).map_err(|e| e.to_string())
+    })
+}
+
+/// A compute shader's container translated for dispatches of thread counts
+/// (`Options::thread_counts`).
+pub fn translate_threads(container: &[u8]) -> Result<HostShader, String> {
+    translate_cached(container, Options { thread_counts: true, ..options() })
 }
 
 /// A guessed vertex shader's container translated to draw rectangle lists (`Options::rect_list`).
 pub fn translate_rect(container: &[u8]) -> Result<HostShader, String> {
-    victory_shader::emit::translate_with(container, Options { rect_list: true, ..options() }).map_err(|e| e.to_string())
+    translate_cached(container, Options { rect_list: true, ..options() })
 }
 
 /// A guessed vertex shader's container translated for rectangle lists or not, writing the
 /// `TEXCOORD` parameters in `extra` (bit n) too: those its pixel shader reads and it does not write.
 pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> Result<HostShader, String> {
-    victory_shader::emit::translate_with(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
-        .map_err(|e| e.to_string())
+    translate_cached(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
+}
+
+/// Whether [`translate_extra`]'s translation is in the disk cache already.
+pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> bool {
+    let o = Options { rect_list: rect, extra_params: extra, copy_params, ..options() };
+    crate::shader_cache::native_present(container, &format!("{o:?}"))
 }
 
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
-/// give the page table (compute and guessed graphics shaders).
+/// give the page table (compute and guessed graphics shaders). A shader that indexes the resource
+/// heap itself is not refused here: the bound heaps are at the converter's heap slots for every
+/// stage (`bind_root_render`, `bind_root` in `victory-metal`).
 pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
     if shader.memory_writes {
         return Some("marks the pages it writes (translated without zero_copy_memory)");
@@ -57,9 +78,6 @@ pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
     }
     if shader.view_addresses || shader.view_marks {
         return Some("needs view addresses or write marks");
-    }
-    if shader.heap {
-        return Some("indexes the descriptor heap itself");
     }
     None
 }
@@ -95,6 +113,9 @@ pub struct ShaderStats {
     pub pipelines: u64,
     /// Pipelines served from the library cache.
     pub cached: u64,
+    /// Times a pipeline was not compiled within `Title::compile_wait`: its work is dropped that
+    /// time and nothing is cached, so a later use picks the pipeline up.
+    pub put_off: u64,
     /// Refusals, by reason, with how often.
     pub refused: Vec<(String, u64)>,
 }
@@ -138,6 +159,8 @@ impl<B: PresentBackend> Title<B> {
     /// The compute pipeline of a translated shader: from the cache when its DXIL was converted
     /// before, else converted now. [`Pipe::Refused`] (counted) when the host cannot run it.
     pub fn compute_pipe(&mut self, shader: &HostShader, name: &str) -> Pipe<B> {
+        // Shaders indexing the heap themselves run: the heaps are bound for compute as for render
+        // (`heap_tests::a_compute_shader_loads_a_texture_by_heap_index`).
         if let Some(why) = unsupported(shader, true) {
             self.shaders.refuse(name, why.into());
             return Pipe::Refused;
@@ -147,8 +170,11 @@ impl<B: PresentBackend> Title<B> {
             self.shaders.cached += 1;
             return p.clone();
         }
+        let put_off = self.shaders.put_off;
         let made = self.make_compute(shader, name);
-        self.libraries.compute.insert(key, made.clone());
+        if self.shaders.put_off == put_off {
+            self.libraries.compute.insert(key, made.clone());
+        }
         made
     }
 
@@ -159,14 +185,13 @@ impl<B: PresentBackend> Title<B> {
         };
         // Translator output carries no root signature: the argument buffer is laid out by the
         // binding the host fills it by.
-        let binding = Binding::of(shader);
-        let made = match binding.layout() {
-            Some(l) => self.host.backend.create_compute_pipeline_with(&shader.dxil, &l),
-            None => self.host.backend.create_compute_pipeline(&shader.dxil),
-        };
+        let binding = Binding { name: name.into(), ..Binding::of(shader) };
+        let made = self.host.backend.create_compute_pipeline_within(&shader.dxil, binding.layout().as_ref(), self.compile_wait);
         match made {
-            Ok(pso) => {
+            Ok(None) => self.put_off(),
+            Ok(Some(pso)) => {
                 self.shaders.pipelines += 1;
+                self.host.backend.name_pipeline(&pso, name);
                 Pipe::Compute(Rc::new(ComputePso {
                     pso,
                     threads,
@@ -203,9 +228,21 @@ impl<B: PresentBackend> Title<B> {
             self.shaders.cached += 1;
             return p.clone();
         }
+        let put_off = self.shaders.put_off;
         let made = self.make_render(vs, ps, graphics, name);
-        self.libraries.render.insert(key, made.clone());
+        if self.shaders.put_off == put_off {
+            self.libraries.render.insert(key, made.clone());
+        }
         made
+    }
+
+    /// A pipeline Metal is still compiling: no pipeline this time, and the caller caches nothing.
+    fn put_off(&mut self) -> Pipe<B> {
+        self.shaders.put_off += 1;
+        if self.shaders.put_off.is_power_of_two() {
+            tracing::info!(put_off = self.shaders.put_off, "pipelines put off for their compiles so far");
+        }
+        Pipe::Refused
     }
 
     fn make_render(
@@ -240,12 +277,16 @@ impl<B: PresentBackend> Title<B> {
             return Pipe::Refused;
         }
         let color_state = g.color_state();
-        if std::env::var_os("VICTORY_TRACE_PIPES").is_some() {
+        // A pixel shader with one output more than there are targets feeds target 0's second
+        // blend source; the converter must be told, or Metal refuses the pipeline.
+        let targets = ps.map_or_else(Vec::new, |p| state::pixel_targets(&p.dxil));
+        let dual_source = state::dual_source(color.len(), &targets, &color_state);
+        if env_set!("VICTORY_TRACE_PIPES") {
             tracing::info!(name, stencil = ?g.stencil(), depth = ?g.depth_test(), ?color_state, "guessed pipeline state");
         }
-        let vs_binding = Binding::of(vs);
+        let vs_binding = Binding { name: name.into(), ..Binding::of(vs) };
         let ps_binding = ps
-            .map(Binding::of)
+            .map(|ps| Binding { name: name.into(), ..Binding::of(ps) })
             .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
         // As for compute: without the host's layout the converter makes the user-data block a
         // root CBV (a pointer), while the host writes its dwords inline, so the shader reads its
@@ -264,13 +305,15 @@ impl<B: PresentBackend> Title<B> {
             depth_test: depth.and(g.depth_test()),
             cull: g.cull(),
             color_state: &color_state,
+            dual_source,
             stencil: depth.and(g.stencil()),
             raster: g.raster(),
         };
-        match self.host.render_pipeline(&desc) {
-            Ok(p) => {
+        match self.host.backend.create_render_pipeline_within(&desc, self.compile_wait) {
+            Ok(None) => self.put_off(),
+            Ok(Some(p)) => {
                 self.shaders.pipelines += 1;
-                Pipe::Render(p, Some(Rc::new(Binding {
+                Pipe::Render(Rc::new(p), Some(Rc::new(Binding {
                     ps: ps_binding.map(Rc::new),
                     ..vs_binding
                 })))

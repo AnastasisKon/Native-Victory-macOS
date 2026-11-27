@@ -515,8 +515,12 @@ impl Module {
     /// What the instructions [`Module::write`] writes use, of what the
     /// shader flags declare (which must match it, or the validator refuses
     /// the module: "Flags must match usage").
+    #[allow(dead_code, reason = "standalone analysis for callers without an emission plan")]
     pub fn uses(&self) -> Uses {
-        let plan = self.plan();
+        self.uses_with_plan(&self.plan())
+    }
+
+    pub(super) fn uses_with_plan(&self, plan: &Plan) -> Uses {
         let wide = |t: Ty| self.types[t.0 as usize] == TypeDef::Int(64);
         let mut u = Uses::default();
         for b in plan.layout.iter().map(|&b| &self.blocks[b]) {
@@ -595,6 +599,60 @@ impl Module {
             .count()
     }
 
+    /// Binary instructions of this type and opcode that [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_bin_ops(&self, ty: Ty, op: Bin) -> usize {
+        let plan = self.plan();
+        plan.layout.iter().flat_map(|&b| &self.blocks[b].body)
+            .filter(|&&i| plan.live[i as usize])
+            .map(|&i| &self.insts[i as usize])
+            .filter(|inst| inst.ty == ty && matches!(inst.op, Op::Bin(bin, _, _) if bin == op))
+            .count()
+    }
+
+    /// The calls [`Module::write`] writes of functions whose name starts
+    /// with `prefix`, in order: the name and each argument's constant value
+    /// (a float's bits, through bitcasts), if it is one.
+    #[cfg(test)]
+    pub fn written_call_args(&self, prefix: &str) -> Vec<(String, Vec<Option<i64>>)> {
+        fn constant(m: &Module, v: V) -> Option<i64> {
+            match v {
+                V::Const(i) => match m.consts[i as usize].1 {
+                    Const::Int(x) => Some(x),
+                    Const::Float(bits) => Some(bits.into()),
+                    _ => None,
+                },
+                V::Inst(i) => match m.insts[i as usize].op {
+                    Op::Bin(op, a, b) if matches!(m.types[m.type_of(v).0 as usize], TypeDef::Int(32)) => {
+                        let (a, b) = (constant(m, a)? as u32, constant(m, b)? as u32);
+                        let value = match op {
+                            Bin::Add => a.wrapping_add(b),
+                            Bin::LShr => a.checked_shr(b)?,
+                            Bin::And => a & b,
+                            _ => return None,
+                        };
+                        Some(i64::from(value as i32))
+                    }
+                    Op::Cast(Cast::Bitcast, x) => constant(m, x),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        let plan = self.plan();
+        let calls = plan.layout.iter().flat_map(|&b| &self.blocks[b].body);
+        calls
+            .filter(|&&i| plan.live[i as usize])
+            .filter_map(|&i| match &self.insts[i as usize].op {
+                Op::Call(f, args) if self.funcs[*f as usize].name.starts_with(prefix) => Some((
+                    self.funcs[*f as usize].name.clone(),
+                    args.iter().map(|&a| constant(self, a)).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The globals and functions [`Module::write`] declares, each kept
     /// one's new index and their number: functions declared and not called,
     /// and constant globals nothing reads, are left out (the validator
@@ -649,7 +707,7 @@ impl Module {
     /// (lowering splits them so that loops have dedicated exits and
     /// preheaders, as DXC emits them), or its predecessor would reach the
     /// target twice (the target's phis have one entry per predecessor).
-    fn plan(&self) -> Plan {
+    pub(super) fn plan(&self) -> Plan {
         let live = self.live();
         let succs = |b: usize| successors(self.term(b));
         let mut seen = vec![false; self.blocks.len()];
@@ -711,8 +769,12 @@ impl Module {
         plan
     }
 
+    #[allow(dead_code, reason = "standalone serialization for callers without an emission plan")]
     pub fn write(&self) -> Vec<u8> {
-        let plan = self.plan();
+        self.write_with_plan(self.plan())
+    }
+
+    pub(super) fn write_with_plan(&self, plan: Plan) -> Vec<u8> {
         let (live, layout) = (&plan.live, &plan.layout);
         let term_of = |b: usize| self.term(b);
         let target = |t: usize| plan.pos[plan.to(t)];
@@ -1030,7 +1092,7 @@ pub struct Uses {
 }
 
 /// What [`Module::write`] writes ([`Module::plan`]).
-struct Plan {
+pub(super) struct Plan {
     /// Per instruction: written.
     live: Vec<bool>,
     /// Per block: reached from the entry.
@@ -1615,6 +1677,44 @@ mod tests {
         let _ = (m.call(live, sink, vec![t]), h);
         let u = m.uses();
         assert!(u.int64 && !u.heap && !u.sampler_heap, "{u:?}");
+    }
+
+    #[test]
+    fn shared_plan_matches_standalone_with_late_metadata() {
+        // The loop has both live and unread register phis.
+        for take_wave in [false, true] {
+            let mut m = synthetic(8, 3, 2);
+            let tail = m.blocks.len() - 1;
+            let (wave, exit) = (m.new_block(), m.new_block());
+            let cond = m.bool(take_wave);
+            m.terminate(tail, Term::CondBr(cond, wave, exit));
+            let i32t = m.int(32);
+            let ty = m.func_ty(i32t, vec![i32t]);
+            let f = m.function("dx.op.waveGetLaneIndex", ty, Some(Attr::ReadNone), false);
+            let opcode = m.i32(111);
+            let lane = m.call(wave, f, vec![opcode]);
+            let cell = m.global("lane", i32t, 3);
+            m.store(wave, cell, lane);
+            m.terminate(wave, Term::Br(exit));
+            m.terminate(exit, Term::Ret);
+
+            let one = m.i32(1);
+            let table = m.constant_global("metadata_only", one);
+            let plan = m.plan();
+            let uses = m.uses_with_plan(&plan);
+            assert_eq!(uses, Uses { wave: take_wave, ..Uses::default() });
+            assert_eq!(uses, m.uses());
+            let V::Global(id) = table else { unreachable!() };
+            let ((globals, _), _) = m.kept(&plan);
+            assert_eq!(globals[id as usize], u32::MAX);
+
+            let value = m.md_value(table);
+            let node = m.md_node(vec![Some(value)]);
+            m.named_md("table", vec![node]);
+            let ((globals, _), _) = m.kept(&plan);
+            assert_ne!(globals[id as usize], u32::MAX);
+            assert_eq!(m.write_with_plan(plan), m.write());
+        }
     }
 
     #[test]

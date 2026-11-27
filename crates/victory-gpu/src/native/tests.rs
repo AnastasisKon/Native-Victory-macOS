@@ -3,7 +3,7 @@
 //! [`NativeList`], submitted through [`Host`], read back from title memory. Title memory is a pool
 //! (`Alias::primary`, what the GPU buffer wraps) shown to the "title" at a second address
 //! (`Alias::alias`) through the pool table, so every address the list names is translated.
-//! Skipped when Apple's Metal Shader Converter is not installed.
+//! Tests using `host()` skip when Apple's Metal Shader Converter is not installed.
 
 use super::Host;
 use super::list::NativeList;
@@ -16,8 +16,14 @@ use victory_metal::metal::Metal;
 
 #[path = "addr_tests.rs"]
 mod addr_tests;
+#[path = "heap_tests.rs"]
+mod heap_tests;
+#[path = "mesh_tests.rs"]
+mod mesh_tests;
 #[path = "shader_tests.rs"]
 mod shader_tests;
+#[path = "split_wave_tests.rs"]
+mod split_wave_tests;
 #[path = "state_tests.rs"]
 mod state_tests;
 #[path = "texture_tests.rs"]
@@ -33,6 +39,50 @@ fn host() -> Option<Host> {
         return None;
     }
     Some(Host::new(Metal::new().unwrap()))
+}
+
+#[test]
+fn array_texture_ranges_reach_the_backend_for_object_and_placed_views() {
+    use crate::descriptor::{View, record};
+    let host = super::host::NativeHost::new(super::vertex_tests::Capture::default());
+    let mut slot = [0u32; 8];
+    let handle = slot.as_mut_ptr() as u64;
+    host.heap(HeapKind::Resource, handle, 1).unwrap();
+
+    let mut resource = [0; 14];
+    resource[0] = 3; // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+    let address = 0x12000;
+    let texture = Rc::new(TextureDesc::d2(Format::Rgba8Unorm, 4, 4));
+    let key = Rc::as_ptr(&texture) as usize;
+    host.register_texture(key, &texture);
+    host.register_texture(super::textures::placed_key(address, &resource), &texture);
+
+    for unordered in [false, true] {
+        let mut desc = [0; 10];
+        desc[..2].copy_from_slice(&[28, 5]); // RGBA8_UNORM, TEXTURE2DARRAY
+        let object = if unordered {
+            desc[2..5].copy_from_slice(&[1, 2, 1]);
+            View::Unordered(key, 0, Some(desc))
+        } else {
+            desc[4..8].copy_from_slice(&[1, 3, 2, 4]);
+            View::Shader(key, Some(desc))
+        };
+        let mut placed = [0; 16];
+        placed[..10].copy_from_slice(&desc);
+        placed[10] = address as u32;
+        for view in [object, View::Placed(unordered, resource, placed)] {
+            record(handle, view);
+            assert!(host.mirror(handle).unwrap());
+            assert_eq!(
+                host.backend.views.borrow_mut().pop(),
+                Some(ViewDesc {
+                    format: Format::Rgba8Unorm,
+                    mips: (1, if unordered { 1 } else { 3 }),
+                    slices: (2, if unordered { 1 } else { 4 }),
+                })
+            );
+        }
+    }
 }
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -238,7 +288,249 @@ fn table_records_copied_by_the_title_are_mirrored_at_submission() {
     drop(slots);
 }
 
+/// What one encoder is named for a heap (two entries naming one pool buffer: one allocation), for
+/// one dispatch through the heap and then for five; the dispatches' results are checked.
+fn named_for_a_heap(h: &Host) -> [u64; 2] {
+    let pool = Pool::new(h, 4);
+    let (src, dst) = (0, 16384);
+    pool.write(src, &(0..64u32).collect::<Vec<_>>());
+    let slots = vec![0u32; 8 * 8];
+    let start = slots.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 8).unwrap();
+    let placed = |at: usize| {
+        let mut d = [0u32; 16];
+        (d[1], d[6], d[8]) = (1, 64, 1); // raw buffer view of 64 elements
+        d[10] = pool.va(at) as u32;
+        d[11] = (pool.va(at) >> 32) as u32;
+        d
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &placed(src), start);
+    let mut uav = placed(dst);
+    (uav[4], uav[6]) = (64, 0);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 32);
+    assert!(h.mirror(start).unwrap() && h.mirror(start + 32).unwrap());
+
+    let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    let named = |dispatches: u32| {
+        let before = h.backend.residency_counts().heap_resources;
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_constants(0, &[3, 1]);
+        l.set_compute_root_table(1, &heap, 0);
+        for _ in 0..dispatches {
+            l.dispatch(1, 1, 1).unwrap();
+        }
+        run(h, &[&l]);
+        h.backend.residency_counts().heap_resources - before
+    };
+    let named = [named(1), named(5)];
+    assert_eq!(pool.read::<u32>(dst, 64), (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>());
+    drop(slots);
+    named
+}
+
+/// Without residency sets, a heap's resources are named to an encoder once, not at every dispatch:
+/// naming each entry at each draw made frame time grow with the entries the title fills. Two
+/// entries naming one pool buffer are one allocation, so a dispatch names the heap and that buffer.
+#[test]
+fn a_heap_is_named_once_per_encoder() {
+    if host().is_none() {
+        return;
+    }
+    let h = Host::new(Metal::new().unwrap().with_residency_sets(false));
+    // The heap buffer and the one pool buffer, for one dispatch as for five in one encoder.
+    assert_eq!(named_for_a_heap(&h), [2, 2]);
+}
+
+/// With the heaps' sets (the default on a Mac with 32 GiB or more) what a heap names is resident
+/// through the heap's own set, given to the command buffer: nothing is named to the encoders for
+/// it (in GTA VI's world that was 37,000 allocations for every pass, about 155 ms of kernel time
+/// per drawing render pass), and the title's pools are in no set of their own (all of title
+/// memory would stay resident).
+#[test]
+fn a_heap_is_resident_through_its_set() {
+    if host().is_none() {
+        return;
+    }
+    let h = Host::new(Metal::new().unwrap().with_heap_sets());
+    if !h.backend.residency_sets() {
+        eprintln!("skipped: no residency sets on this system");
+        return;
+    }
+    assert_eq!(named_for_a_heap(&h), [0, 0]);
+    let c = h.backend.residency_counts();
+    assert_eq!((c.heap_allocations, c.added, c.queues), (1, 0, 0), "{c:?}");
+    // The heap buffer and the pool buffer its entries name.
+    assert!(c.heap_set_bytes >= 4 * 16384, "{c:?}");
+}
+
 type Vertex = [f32; 8];
+
+/// Issue #15 (writes that land elsewhere): a descriptor the title reuses for a buffer the host
+/// cannot reach kept the host entry of the buffer it named before, so a shader went on writing
+/// that buffer. The entry now shows nothing: the dispatch still runs, and the old buffer stays as
+/// it was.
+#[test]
+fn a_view_of_unmapped_memory_no_longer_shows_the_previous_buffer() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let (src, dst) = (0, 16384);
+    pool.write(src, &(0..64u32).collect::<Vec<_>>());
+    let slots = vec![0u32; 8 * 8];
+    let start = slots.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 8).unwrap();
+    let view = |va: u64| {
+        let mut d = [0u32; 16];
+        (d[1], d[6], d[8]) = (1, 64, 1); // raw buffer view of 64 elements
+        (d[10], d[11]) = (va as u32, (va >> 32) as u32);
+        d
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    crate::descriptor::create_placed_srv(
+        std::ptr::null_mut(),
+        &resource,
+        &view(pool.va(src)),
+        start,
+    );
+    let uav = |va: u64| {
+        let mut d = view(va);
+        (d[4], d[6]) = (64, 0);
+        crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &d, start + 32);
+    };
+    uav(pool.va(dst));
+    assert!(h.mirror(start).unwrap() && h.mirror(start + 32).unwrap());
+
+    let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    let dispatch = || {
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_constants(0, &[3, 1]);
+        l.set_compute_root_table(1, &heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        run(&h, &[&l]);
+    };
+    dispatch();
+    assert_eq!(
+        pool.read::<u32>(dst, 64),
+        (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>()
+    );
+
+    // The same slot, now a view of memory in no pool.
+    pool.write(dst, &[0xEEEE_EEEEu32; 64]);
+    uav(0x10_0000_0000);
+    assert!(h.mirror(start + 32).is_err(), "not in a pool");
+    dispatch();
+    assert_eq!(
+        pool.read::<u32>(dst, 64),
+        [0xEEEE_EEEEu32; 64],
+        "written through a stale entry"
+    );
+
+    // Mapped memory again: the real view comes back.
+    uav(pool.va(dst));
+    assert!(h.mirror(start + 32).unwrap());
+    dispatch();
+    assert_eq!(
+        pool.read::<u32>(dst, 64),
+        (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>()
+    );
+    drop(slots);
+}
+
+#[test]
+fn submission_retries_an_unchanged_buffer_descriptor_after_mapping() {
+    let host = super::host::NativeHost::new(super::vertex_tests::Capture::default());
+    let mut slot = [0u32; 8];
+    let handle = slot.as_mut_ptr() as u64;
+    let heap = host.heap(HeapKind::Resource, handle, 1).unwrap();
+    let address = 0x80100;
+    crate::descriptor::create_cbv(std::ptr::null_mut(), &[address, 0, 256, 0], handle);
+
+    let mut list = NativeList::default();
+    list.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
+    list.set_render_targets(
+        &[Rc::new(victory_backend::resources::TextureDesc::d2(victory_backend::resources::Format::Rgba8Unorm, 1, 1))],
+        None,
+    );
+    list.set_heaps(Some(&heap), None);
+    list.set_graphics_root_table(0, &heap, 0);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    let submit = || host.execute(&(), &[&list], &[], &[]).unwrap();
+
+    submit();
+    assert!(matches!(
+        host.backend.buffer_writes.borrow().as_slice(),
+        [(0, _, _, 0)]
+    ));
+
+    // While the pool table has not changed, later draws do not re-encode the null view.
+    submit();
+    assert_eq!(host.backend.buffer_writes.borrow().len(), 1);
+
+    let pool = PoolInfo {
+        id: 1,
+        base: 0x40000,
+        len: 0x4000,
+        memory_entry: None,
+    };
+    host.memory().mapped(0x80000, pool.len, &pool, 0);
+    submit();
+    assert_eq!(
+        &host.backend.buffer_writes.borrow()[1..],
+        &[(0, pool.base, pool.base + 0x100, 256)]
+    );
+
+    submit();
+    assert_eq!(host.backend.buffer_writes.borrow().len(), 2);
+}
+
+#[test]
+fn submission_retries_an_unrealized_resource_descriptor_once_registered() {
+    let host = super::host::NativeHost::new(super::vertex_tests::Capture::default());
+    let mut slot = [0u32; 8];
+    let handle = slot.as_mut_ptr() as u64;
+    let heap = host.heap(HeapKind::Resource, handle, 1).unwrap();
+    let res_key = 0xDEAD_BEEFusize;
+    crate::descriptor::create_srv(std::ptr::null_mut(), res_key as _, std::ptr::null(), handle);
+
+    let pool = PoolInfo {
+        id: 1,
+        base: 0x40000,
+        len: 0x4000,
+        memory_entry: None,
+    };
+    host.memory().mapped(0x80000, pool.len, &pool, 0);
+
+    let mut list = NativeList::default();
+    list.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
+    list.set_render_targets(
+        &[Rc::new(victory_backend::resources::TextureDesc::d2(victory_backend::resources::Format::Rgba8Unorm, 1, 1))],
+        None,
+    );
+    list.set_heaps(Some(&heap), None);
+    list.set_graphics_root_table(0, &heap, 0);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    let submit = || host.execute(&(), &[&list], &[], &[]).unwrap();
+
+    // Before the resource is registered, mirror returns Ok(false) and marks pending_mirror.
+    submit();
+    submit();
+    assert!(host.backend.buffer_writes.borrow().is_empty());
+
+    // Once registered, resources_epoch advances and the next submission mirrors the view.
+    host.register_buffer(res_key, 0x80200, 512);
+    submit();
+    assert_eq!(
+        host.backend.buffer_writes.borrow().as_slice(),
+        &[(0, pool.base, pool.base + 0x200, 512)]
+    );
+    crate::descriptor::forget(res_key);
+}
 
 fn vertex(x: f32, y: f32, c: [f32; 4]) -> Vertex {
     [x, y, 0.5, 0.5, c[0], c[1], c[2], c[3]]
@@ -409,20 +701,101 @@ fn a_draw_with_no_render_target_is_dropped_alone() {
     assert_eq!(pool.read::<u64>(flag, 1), [0xD6D], "the value write ran");
 }
 
-/// An address outside every mapped pool is an error at submission, not a GPU fault.
+/// `ExecuteIndirect` with a count buffer: three dispatch records (2, 4 and 8 groups), and the count
+/// of records to run (2) written by a copy earlier in the same list, both read on the GPU when the
+/// dispatches run: only the first two run, so 256 values are written, not 512 (or none, if the
+/// count were read before the copy).
 #[test]
-fn unmapped_title_address_is_refused() {
+fn a_count_written_earlier_on_the_gpu_limits_the_indirect_dispatches() {
     let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let (src, dst, records, staged, count) = (0, 16384, 32768, 32816, 32832);
+    pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+    pool.write(dst, &[0u32; N]);
+    pool.write(records, &[2u32, 1, 1, 4, 1, 1, 8, 1, 1]);
+    pool.write(staged, &[2u32]);
+    pool.write(count, &[0u32]);
     let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+
     let mut l = NativeList::default();
+    l.copy_buffer_region(pool.va(count), pool.va(staged), 4);
     l.set_compute_pipeline(&pso);
-    l.set_compute_root_constants(0, &[1, 0]);
+    l.set_compute_root_constants(0, &[5, 7]);
+    l.set_compute_root_view(1, pool.va(src));
+    l.set_compute_root_view(2, pool.va(dst));
+    for i in 0..3 {
+        l.dispatch_indirect_counted(pool.va(records + 12 * i as usize), pool.va(count), i)
+            .unwrap();
+    }
+    run(&h, &[&l]);
+
+    let out: Vec<u32> = pool.read(dst, N);
+    let want: Vec<u32> = (0..N as u32)
+        .map(|i| if i < 256 { i * 5 + 7 } else { 0 })
+        .collect();
+    assert_eq!(out, want);
+}
+
+/// `ExecuteIndirect` of a dispatch: the record is read on the GPU when the dispatch runs, so a copy
+/// earlier in the same list that writes it (as a culling pass would) decides the group count.
+#[test]
+fn an_indirect_dispatch_reads_a_record_written_earlier_on_the_gpu() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let (src, dst, staged, record) = (0, 16384, 32768, 32800);
+    pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+    pool.write(dst, &[0u32; N]);
+    pool.write(staged, &[(N / 128) as u32, 1, 1]);
+    pool.write(record, &[0u32; 3]);
+    let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+
+    let mut l = NativeList::default();
+    l.copy_buffer_region(pool.va(record), pool.va(staged), 12);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[5, 7]);
+    l.set_compute_root_view(1, pool.va(src));
+    l.set_compute_root_view(2, pool.va(dst));
+    l.dispatch_indirect(pool.va(record)).unwrap();
+    run(&h, &[&l]);
+
+    let out: Vec<u32> = pool.read(dst, N);
+    assert!(out[..N / 2].iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "{:?}", &out[..8]);
+    assert!(out[N / 2..].iter().all(|v| *v == 0), "only the record's groups ran");
+}
+
+/// A command that names title memory outside every mapped pool is not encoded (no GPU fault) and
+/// is dropped by itself: the value writes, and the dispatch, recorded around it still run.
+#[test]
+fn a_command_at_unmapped_title_memory_is_dropped_alone() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let (src, dst, flag, done) = (0, 16384, 32768, 32776);
+    pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+    pool.write(dst, &[0xEEEE_EEEEu32; N]);
+    pool.write(flag, &[0u64, 0]);
+    let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+
+    let mut l = NativeList::default();
+    l.write_value(pool.va(flag), 0xD6D, 8);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[5, 7]);
+    // Its source is no title memory the host knows.
     l.set_compute_root_view(1, 0xDEAD_0000);
-    l.set_compute_root_view(2, 0xDEAD_1000);
-    l.dispatch(1, 1, 1).unwrap();
-    let q = h.backend.create_queue().unwrap();
-    let err = h.execute(&q, &[&l], &[], &[]).unwrap_err();
-    assert!(err.contains("not in a mapped pool"), "{err}");
+    l.set_compute_root_view(2, pool.va(dst));
+    l.dispatch((N / 64) as u32, 1, 1).unwrap();
+    l.set_compute_root_view(1, pool.va(src));
+    l.dispatch((N / 64) as u32, 1, 1).unwrap();
+    // A copy from no title memory the host knows.
+    l.copy_buffer_region(pool.va(src), 0xDEAD_1000, 64);
+    l.write_value(pool.va(done), 0xD0E, 8);
+    run(&h, &[&l]);
+
+    assert_eq!(h.unmapped(), 2);
+    assert_eq!(pool.read::<u64>(flag, 2), [0xD6D, 0xD0E], "the value writes ran");
+    let out: Vec<u32> = pool.read(dst, N);
+    assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "the second dispatch ran: {:?}", &out[..4]);
+    let kept: Vec<u32> = pool.read(src, 16);
+    assert_eq!(kept, (0..16).collect::<Vec<u32>>(), "the copy was dropped, not run");
 }
 
 /// A dispatch that reads a root parameter nothing was set in is dropped by itself: the value
@@ -452,6 +825,42 @@ fn a_dispatch_with_an_unset_root_parameter_is_dropped_alone() {
     assert_eq!(pool.read::<u64>(flag, 1), [0xD6D], "the value write ran");
     let out: Vec<u32> = pool.read(dst, N);
     assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "the second dispatch ran: {:?}", &out[..4]);
+}
+
+/// A dispatch the host cannot give its arguments for another reason (here a root parameter that is
+/// not what its shader reads it as) is dropped by itself, not the whole piece: the value write
+/// recorded after it still runs.
+#[test]
+fn a_dispatch_the_host_cannot_prepare_is_dropped_alone() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let flag = 32768;
+    pool.write(flag, &[0u64]);
+    let pso = Rc::new(super::list::ComputePso {
+        pso: h.backend.create_compute_pipeline(&fixture_affine()).unwrap(),
+        threads: [64, 1, 1],
+        binding: Some(super::list::Binding {
+            dwords: 4,
+            user_data: vec![victory_shader::emit::UserData {
+                index: 0,
+                slot: 0,
+                root: victory_shader::RootType::Constants,
+                dword: 0,
+            }],
+            ..Default::default()
+        }),
+    });
+
+    let mut l = NativeList::default();
+    l.set_compute_pipeline(&pso);
+    // Slot 0 holds a root view where the shader reads root constants.
+    l.set_compute_root_view(0, pool.va(0));
+    l.dispatch(1, 1, 1).unwrap();
+    l.write_value(pool.va(flag), 0xD6D, 8);
+    run(&h, &[&l]);
+
+    assert_eq!(h.failed(), 1);
+    assert_eq!(pool.read::<u64>(flag, 1), [0xD6D], "the value write ran");
 }
 
 /// The triangle pipeline of [`clear_and_draw_into_render_target`].
@@ -608,7 +1017,10 @@ fn a_dropped_dispatch_between_two_draws_keeps_them_in_two_passes() {
 /// names every buffer on every dispatch, and gives the same results.
 #[test]
 fn pool_buffers_are_resident_through_one_set_per_queue() {
-    let Some(on) = host() else { return };
+    if host().is_none() {
+        return;
+    }
+    let on = Host::new(Metal::new().unwrap().with_residency_sets(true));
     if !on.backend.residency_sets() {
         eprintln!("skipped: no residency sets on this system");
         return;
@@ -643,7 +1055,7 @@ fn pool_buffers_are_resident_through_one_set_per_queue() {
     let _pool = work(&on, 2, 6);
     let c = on.backend.residency_counts();
     // One pool buffer, in the set once; the set is on both queues; no dispatch names a buffer.
-    assert_eq!(c, victory_metal::metal::ResidencyCounts { use_resource: 0, added: 1, queues: 2 });
+    assert_eq!(c, victory_metal::metal::ResidencyCounts { use_resource: 0, added: 1, queues: 2, ..Default::default() });
 
     let _pool = work(&off, 2, 6);
     let c = off.backend.residency_counts();
@@ -654,7 +1066,10 @@ fn pool_buffers_are_resident_through_one_set_per_queue() {
 /// A pool that goes away takes its buffer out of the set (and does not break the next work).
 #[test]
 fn a_released_pool_leaves_the_residency_set() {
-    let Some(h) = host() else { return };
+    if host().is_none() {
+        return;
+    }
+    let h = Host::new(Metal::new().unwrap().with_residency_sets(true));
     if !h.backend.residency_sets() {
         return;
     }
@@ -696,4 +1111,56 @@ fn a_released_pool_leaves_the_residency_set() {
     dispatch(&second);
     assert_eq!(h.backend.residency_counts().added, 2);
     assert_eq!(second.read::<u32>(4096, 64), (0..64).map(|i| i * 2).collect::<Vec<_>>());
+}
+
+#[test]
+fn zero_count_commands_are_not_recorded_and_still_check_pipeline() {
+    let Some(h) = host() else { return };
+    let mut l = NativeList::default();
+    assert!(l.dispatch(0, 1, 1).is_err());
+    assert!(l.dispatch_threads([0, 1, 1]).is_err());
+    assert!(l.draw_instanced(0, 1, 0, 0).is_err());
+    assert!(l.dispatch_mesh(0, 1, 1).is_err());
+
+    let cs = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    l.set_compute_pipeline(&cs);
+    l.dispatch(0, 1, 1).unwrap();
+    l.dispatch(1, 0, 1).unwrap();
+    l.dispatch(1, 1, 0).unwrap();
+    l.dispatch_threads([0, 1, 1]).unwrap();
+    l.dispatch_threads([64, 0, 1]).unwrap();
+    l.copy_buffer_region(0x1000, 0x2000, 0);
+    l.fill(0x1000, 0, 0xAB);
+
+    let gfx = h
+        .render_pipeline(&RenderPipelineDesc {
+            vs: &fixture("tri_vs"),
+            ps: Some(&fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &[
+                VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
+                VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
+                VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+            ],
+            streams: &[VertexStream {
+                slot: 0,
+                stride: 32,
+                per_instance: false,
+            }],
+            color: &[Format::Rgba8Unorm],
+            depth: None,
+            depth_test: None,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    l.set_graphics_pipeline(&gfx, Topology::Triangles);
+    l.set_index_buffer(0x1000, false);
+    l.draw_instanced(0, 1, 0, 0).unwrap();
+    l.draw_instanced(3, 0, 0, 0).unwrap();
+    l.draw_indexed_instanced(0, 1, 0, 0, 0).unwrap();
+    l.draw_indexed_instanced(3, 0, 0, 0, 0).unwrap();
+    l.dispatch_mesh(0, 1, 1).unwrap();
+    assert!(l.is_empty());
 }

@@ -742,8 +742,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         crate::resource::buffer_bytes(src),
     ) {
         crate::native::glue::copy_memory(this, to as u64, from as u64, a.min(b));
-    } else {
-        #[cfg(target_os = "macos")]
+    } else if !crate::native::glue::copy_texture_resource(this, dst, src) {
         crate::native::glue::dropped_op("CopyResource", dst, src);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -759,9 +758,9 @@ extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct CopyLocation {
-    resource: This,
-    kind: u32,
-    footprint: crate::resource::PlacedFootprint,
+    pub(crate) resource: This,
+    pub(crate) kind: u32,
+    pub(crate) footprint: crate::resource::PlacedFootprint,
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -777,9 +776,12 @@ extern "system" fn copy_texture_region(
     source_box: *const [u32; 6],
 ) {
     #[cfg(target_os = "macos")]
-    // SAFETY: the title passes both locations (null is tolerated).
-    if let (Some(d), Some(s)) = unsafe { (dst.as_ref(), src.as_ref()) } {
-        crate::native::glue::dropped_op("CopyTextureRegion", d.resource, s.resource);
+    // SAFETY: the title passes both locations and an optional box (null is tolerated).
+    if let (Some(&d), Some(&s)) = unsafe { (dst.as_ref(), src.as_ref()) } {
+        let b = unsafe { source_box.as_ref().copied() };
+        if !crate::native::glue::copy_texture_region(this, d, [x, y, z], s, b) {
+            crate::native::glue::dropped_op("CopyTextureRegion", d.resource, s.resource);
+        }
     }
     #[cfg(windows)]
     {
@@ -890,6 +892,15 @@ impl CopyLocation {
     /// Subresource 0 of `resource` (tests).
     pub(crate) fn whole(resource: This) -> Self {
         Self { resource, kind: 0, footprint: crate::resource::PlacedFootprint::new(0, 0, 0, 0, 0) }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl CopyLocation {
+    /// Subresource `index` of `resource` (the index shares the footprint's first dword).
+    pub(crate) fn sub(resource: This, index: u32) -> Self {
+        let footprint = crate::resource::PlacedFootprint { offset: index.into(), format: 0, width: 0, height: 0, depth: 0, row_pitch: 0 };
+        Self { resource, kind: 0, footprint }
     }
 }
 
@@ -1077,18 +1088,14 @@ extern "system" fn resolve(
         }
     }
     #[cfg(target_os = "macos")]
-    crate::native::glue::dropped_op("ResolveSubresource", dst, src);
+    if !crate::native::glue::resolve(this, dst, dst_sub, src, src_sub) {
+        crate::native::glue::dropped_op("ResolveSubresource", dst, src);
+    }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
 }
 
-#[repr(C)]
-pub(crate) struct Rect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
+pub(crate) use victory_backend::resources::ClearRect as Rect;
 
 extern "system" fn clear_rtv(
     this: This,
@@ -1134,10 +1141,15 @@ extern "system" fn clear_rtv(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (count, rects);
         // SAFETY: the title passes four floats (null is tolerated).
         if let Some(&color) = unsafe { color.as_ref() } {
-            crate::native::glue::clear_rtv(this, handle, color);
+            let rects = if count == 0 || rects.is_null() {
+                &[]
+            } else {
+                // SAFETY: the title passes an array of `count` D3D12_RECTs.
+                unsafe { std::slice::from_raw_parts(rects, count as usize) }
+            };
+            crate::native::glue::clear_rtv(this, handle, color, rects);
         }
     }
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -1270,19 +1282,77 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX` flag: the counts are threads, not groups, so the last group
+/// in a dimension is partial. Guess (`docs/native-host.md`): the flags are
+/// the GPU's dispatch initiator bits, this one `USE_THREAD_DIMENSIONS`.
+const DISPATCH_THREADS: u32 = 0x20;
+/// `DispatchX` flag: the program runs in 32-lane waves (`CS_W32_EN` by the
+/// same guess), which its own header says too.
+const DISPATCH_WAVE32: u32 = 0x8000;
+
+/// `VICTORY_TRACE_DISPATCH_FLAGS=1`: the flags of dispatches are logged,
+/// each value once, so one the host does not honour shows.
+fn trace_dispatch_flags() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_DISPATCH_FLAGS").is_some())
+}
+
+/// Whether a dispatch with these `DispatchX` flags gives thread counts.
+fn thread_counts(flags: u32) -> bool {
+    flags & DISPATCH_THREADS != 0
+}
+
+/// Under [`trace_dispatch_flags`]: the first `DispatchX` with each flags
+/// value, and its bits the host does not know.
+fn trace_dispatch_x(flags: u32, counts: [u32; 3]) {
+    static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    if !trace_dispatch_flags() {
+        return;
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&flags) {
+        seen.push(flags);
+        let unknown = flags & !(DISPATCH_THREADS | DISPATCH_WAVE32);
+        tracing::warn!(
+            flags = format!("{flags:#x}"),
+            unknown = format!("{unknown:#x}"),
+            ?counts,
+            "DispatchX: the first dispatch with these flags"
+        );
+    }
+}
+
+/// `DispatchX(x, y, z, flags)`: a dispatch with console flags (the
+/// ray-tracing builder dispatches this way). With [`DISPATCH_THREADS`] the
+/// host runs whole groups, rounded up, of a translation whose threads past
+/// the counts start with EXEC off (`native::glue::dispatch_threads`).
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    trace_dispatch_x(flags, [x, y, z]);
+    let threads = thread_counts(flags);
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    {
+        // shortcut: the D3D12 host runs the counts as groups, so the threads
+        // past them write where they should not (the native host's crash in
+        // Grand Theft Auto VI's prologue); give it the native host's
+        // translation (`Options::thread_counts`) before relying on it.
+        if threads {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("DispatchX with thread counts runs them as group counts"));
+        }
+        state::dispatch(this, x, y, z);
+    }
     #[cfg(target_os = "macos")]
     {
         count_dispatch();
-        crate::native::glue::dispatch(this, x, y, z);
+        if threads {
+            crate::native::glue::dispatch_threads(this, [x, y, z]);
+        } else {
+            crate::native::glue::dispatch(this, x, y, z);
+        }
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, threads);
         count_dispatch();
     }
 }
@@ -1796,11 +1866,11 @@ mod state {
         this: This,
         start: u32,
         count: u32,
-        views: *const (u64, u32, u32),
+        views: *const glue::VertexBufferView,
     ) {
-        let addresses: Vec<u64> = items(views, count).iter().map(|v| v.0).collect();
-        let strides: Vec<u32> = items(views, count).iter().map(|v| v.2).collect();
-        glue::vertex_buffers(this, start, &addresses, &strides);
+        // D3D12 has 32 input slots. A null views pointer unbinds the requested range.
+        let count = count.min(32u32.saturating_sub(start));
+        glue::vertex_buffers(this, start, count, items(views, count));
     }
 
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
@@ -1910,7 +1980,9 @@ pub(crate) fn indirect_dropped() -> u64 {
 #[cfg(target_os = "macos")]
 fn drop_kind(kind: usize) {
     DROPPED_KINDS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    crate::native::glue::warn_once(["a mesh dispatch", "an indirect mesh dispatch", "an indirect execution", "a texture copy or resolve", "a dropped command of kind 4"][kind.min(4)]);
+    let what = ["a mesh dispatch", "an indirect mesh dispatch", "an indirect execution", "a texture copy or resolve", "a dropped command of kind 4"][kind.min(4)];
+    crate::native::glue::warn_once(what);
+    crate::native::glue::trace_reason(what);
 }
 
 #[cfg(target_os = "macos")]
@@ -1931,7 +2003,9 @@ extern "system" fn dropped_mesh_x(this: This, _x: u32, _flags: u64, indirect: u6
 /// (12), mesh dispatch (12), and the console's single-pass dispatch, type
 /// 105 (stride 12: the three group counts; its flags live in the
 /// signature, the title passes none), run as a plain dispatch. They run
-/// through the host's indirect execution (`State::execute_indirect`).
+/// through the host's indirect execution (`State::execute_indirect`), and
+/// on the native host as Metal indirect draws and dispatches that read the
+/// records in title memory (`native::glue::execute_indirect`).
 /// shortcut: signatures that change root arguments are dropped (logged
 /// once per signature).
 extern "system" fn execute_indirect(
@@ -1947,6 +2021,14 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
+    // The call has no flags and a type-105 record is three counts: whether
+    // the console takes them as threads anywhere is not known.
+    if let [[105, words @ ..]] = args
+        && trace_dispatch_flags()
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(?words, "an indirect dispatch of type 105 runs its counts as group counts"));
+    }
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
@@ -1964,7 +2046,19 @@ extern "system" fn execute_indirect(
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
-    } else {
+    }
+    // A count buffer (D3D12 runs min(count, max) records) is read on the GPU too: each record
+    // past it is turned into one that does nothing first (`victory_metal` gates them).
+    #[cfg(target_os = "macos")]
+    if let (Some(command), Some(address), true) = (
+        crate::signature::command(stride, args),
+        address,
+        count.is_null() || counter.is_some(),
+    ) {
+        ran = crate::native::glue::execute_indirect(this, command, stride, max, address, counter);
+    }
+    #[cfg(windows)]
+    if !ran {
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
@@ -1976,6 +2070,12 @@ extern "system" fn execute_indirect(
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(target_os = "macos")]
+    crate::native::glue::trace_reason("an indirect execution of a signature the host does not run");
+    #[cfg(target_os = "macos")]
+    if crate::native::glue::tracing_targets() {
+        crate::native::glue::trace_drop_pipe(format!("indirect {args:?} under {:?}", bound_pipeline(this)));
+    }
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {
@@ -1986,9 +2086,26 @@ extern "system" fn execute_indirect(
             max,
             address = ?address.map(|a| format!("{a:#x}")),
             counted = !count.is_null(),
+            bound = ?bound_pipeline(this),
             "indirect execution dropped (first time for this signature)"
         );
     }
+}
+
+/// The shaders of the pipeline list `this` has bound (native host), for the drop warning.
+#[cfg(target_os = "macos")]
+fn bound_pipeline(this: This) -> Option<Vec<String>> {
+    let p = crate::native::glue::with_list(this, |_, l| l.pipeline)?;
+    crate::pipeline::native_stages(p as This).map(|(s, g)| {
+        let mut v: Vec<String> = s.iter().map(|(st, sh)| format!("{st} {}", sh.hash)).collect();
+        v.push(format!("graphics state: {}", g.is_some()));
+        v
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bound_pipeline(_: This) -> Option<Vec<String>> {
+    None
 }
 
 /// Indirect executions dropped since the last call.
@@ -2210,6 +2327,15 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tracing::{Event, Metadata, Subscriber, span};
+
+    #[test]
+    fn dispatch_x_flags_say_when_the_counts_are_threads() {
+        // The ray-tracing node writers' flags, with and without the 32-lane wave bit.
+        assert!(thread_counts(0x20));
+        assert!(thread_counts(0x8020));
+        assert!(!thread_counts(0));
+        assert!(!thread_counts(0x8000));
+    }
 
     /// Exercise the title-facing ABI and real descriptor lookup.
     #[cfg(target_os = "macos")]

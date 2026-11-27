@@ -41,15 +41,25 @@ fn track(base: usize, len: usize) {
     crate::host_posix::adopt_region(base, len);
 }
 
+/// What releasing `[base, base + len)` owes the physical pages behind it, whichever call releases
+/// it: the title's `VirtualFree(MEM_RELEASE)` (`host_posix`, which gives the address space back
+/// itself) as well as [`release_reservation`]. Left behind, the pool views kept the old pool
+/// mapped there for the GPU and aliases while the next allocation got the same address: two
+/// memories at one title address.
+pub(crate) fn forget_physical(base: usize, len: usize) {
+    reservations().remove(&base);
+    super::xmem_physical::release_pool_backing(base, len);
+}
+
 /// Gives back a reservation `XMemVirtualAlloc` made (the title's
-/// `VirtualFree(MEM_RELEASE)` does the same through `host_posix`).
+/// `VirtualFree(MEM_RELEASE)` does the same through `host_posix` and [`forget_physical`]).
 pub(super) fn release_reservation(base: usize) {
-    let Some(len) = reservations().remove(&base) else {
+    let Some(len) = reservations().get(&base).copied() else {
         return;
     };
     #[cfg(target_arch = "x86_64")]
     crate::host_posix::forget_region(base);
-    super::xmem_physical::release_pool_backing(base, len);
+    forget_physical(base, len);
     // SAFETY: a reservation we made and no longer track.
     if let Err(error) = unsafe { mem::release(base as *mut u8, len) } {
         tracing::warn!(base, len, %error, "releasing an xmem reservation failed");
@@ -89,6 +99,7 @@ pub extern "system" fn XMemVirtualAlloc(
     let Some(mut prot) = protection(protect & HOST_PROTECTION).filter(|_| size > 0) else {
         return std::ptr::null_mut();
     };
+    let _call = super::xmem_physical::enter("XMemVirtualAlloc");
     // A reservation of 64 KiB pages takes physical pages later
     // (`XMemMapPhysicalPages`): here it is plain reserved address space, which
     // the pages are mapped over, so a placeholder is a reservation.
@@ -102,7 +113,9 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     let commit = kind & MEM_COMMIT != 0;
     let reserve = kind & MEM_RESERVE != 0 || placeholder || base.is_null();
-    let len = size.next_multiple_of(GRANULE);
+    let Some(len) = size.checked_next_multiple_of(GRANULE) else {
+        return std::ptr::null_mut();
+    };
     let at = base as usize;
     let result = if reserve {
         // SAFETY: fresh address space, or exactly the range asked for (which
@@ -123,16 +136,23 @@ pub extern "system" fn XMemVirtualAlloc(
         reserved.and_then(|p| {
             if commit {
                 // Pool-backed where it can be, so the GPU reaches it.
-                // SAFETY: the reservation just made.
                 if super::xmem_physical::back_with_pool(p as usize, len) {
                     if prot != Protect::READ_WRITE {
-                        // SAFETY: as above.
-                        unsafe { mem::protect(p, len, prot) }?;
+                        // SAFETY: the reservation just made.
+                        if let Err(e) = unsafe { mem::protect(p, len, prot) } {
+                            super::xmem_physical::release_pool_backing(p as usize, len);
+                            // SAFETY: as above.
+                            let _ = unsafe { mem::release(p, len) };
+                            return Err(e);
+                        }
                     }
-                } else if let Err(e) = unsafe { mem::commit(p, len, prot) } {
-                    // SAFETY: as above.
-                    unsafe { mem::release(p, len) }?;
-                    return Err(e);
+                } else {
+                    // SAFETY: the reservation just made.
+                    if let Err(e) = unsafe { mem::commit(p, len, prot) } {
+                        // SAFETY: as above.
+                        let _ = unsafe { mem::release(p, len) };
+                        return Err(e);
+                    }
                 }
             }
             track(p as usize, len);
@@ -141,15 +161,14 @@ pub extern "system" fn XMemVirtualAlloc(
     } else if commit {
         let page = mem::page_size();
         let start = at & !(page - 1);
+        let Some(end) = at
+            .checked_add(size)
+            .and_then(|end| end.checked_next_multiple_of(page))
+        else {
+            return std::ptr::null_mut();
+        };
         // SAFETY: the title commits inside a reservation of its own.
-        unsafe {
-            mem::commit(
-                start as *mut u8,
-                (at + size).next_multiple_of(page) - start,
-                prot,
-            )
-        }
-        .map(|()| at as *mut u8)
+        unsafe { mem::commit(start as *mut u8, end - start, prot) }.map(|()| at as *mut u8)
     } else {
         return std::ptr::null_mut();
     };
@@ -214,7 +233,7 @@ pub extern "system" fn XMemVirtualQuery(
     let allocation = reservations()
         .range(..=at)
         .next_back()
-        .map(|(&base, &len)| (base, base + len))
+        .map(|(&base, &len)| (base, base.saturating_add(len)))
         .filter(|&(_, end)| at < end);
     let mut info = BasicInformation {
         base_address: at,
@@ -231,7 +250,8 @@ pub extern "system" fn XMemVirtualQuery(
     };
     match mem::next_region(at) {
         Some(r) if r.base <= at => {
-            let end = allocation.map_or(r.base + r.len, |(_, end)| end.min(r.base + r.len));
+            let r_end = r.base.saturating_add(r.len);
+            let end = allocation.map_or(r_end, |(_, end)| end.min(r_end));
             info.region_size = end - at;
             info.allocation_base = allocation.map_or(r.base, |(base, _)| base);
             info.kind = MEM_PRIVATE;
@@ -336,7 +356,11 @@ mod tests {
         // A query inside reports the rest of the region.
         let inside = query(p.cast::<u8>().wrapping_add(MIB + 5).cast());
         assert_eq!(inside.region_size, 3 * MIB);
+        let pool = super::super::xmem_physical::pool_shown_at(p as usize).expect("pool-backed");
         release_reservation(p as usize);
+        // Another test may take the address again at once, but with a pool of its own.
+        let shown = super::super::xmem_physical::pool_shown_at(p as usize);
+        assert_ne!(shown, Some(pool), "the pool views went with the release");
         let freed = query(p);
         assert_eq!((freed.state, freed.flags), (MEM_FREE, 0));
         // No address field: above the 32-bit range and below 2^40, where the
@@ -352,6 +376,68 @@ mod tests {
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
         let info = query(p);
         assert_eq!((info.state, info.flags), (MEM_RESERVE, 0));
+        release_reservation(p as usize);
+    }
+
+    /// The title's own `VirtualFree(MEM_RELEASE)` of `XMemVirtualAlloc` memory gives the pool
+    /// views back too, as `XMemFreeDefault` does. It used to give back only the address space:
+    /// the old pool stayed mapped there for the GPU and aliases while the next allocation, given
+    /// the same address, wrote other memory (issue #15, pages owned twice).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn virtual_free_gives_the_pool_backing_back_too() {
+        const MEM_RELEASE: u32 = 0x8000;
+        let p = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            GRANULE,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!p.is_null());
+        let pool = super::super::xmem_physical::pool_shown_at(p as usize).expect("pool-backed");
+        assert_eq!(crate::host_posix::VirtualFree(p, 0, MEM_RELEASE), 1);
+        // Another test may take the address again at once, but with a pool of its own.
+        let shown = super::super::xmem_physical::pool_shown_at(p as usize);
+        assert_ne!(shown, Some(pool), "the old pool is still mapped at a freed address");
+        assert!(!reservations().contains_key(&(p as usize)), "the reservation is forgotten");
+    }
+
+    /// `VirtualFree(MEM_DECOMMIT)` of pool-backed `XMemVirtualAlloc` memory keeps the pool there:
+    /// recommitted, a page reads zeros through the title address and the GPU's pool alike, and
+    /// later writes reach both. It used to put anonymous memory in place of the pool's pages
+    /// while the views and the GPU's pool table still showed the pool (issue #15).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn decommitting_pool_backed_memory_zeroes_the_pool() {
+        use super::super::xmem_physical::{pool_shown_at, pools};
+        const MEM_DECOMMIT: u32 = 0x4000;
+        let p = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            GRANULE,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!p.is_null());
+        let pool = pool_shown_at(p as usize).expect("pool-backed");
+        // The view starts the pool: its first byte is the pool's.
+        let gpu = pools().iter().find(|info| info.id == pool).expect("live").base as *const u8;
+        let cpu = p.cast::<u8>();
+        // SAFETY: committed read-write.
+        unsafe { cpu.write(7) };
+        assert_eq!(crate::host_posix::VirtualFree(p, GRANULE, MEM_DECOMMIT), 1);
+        assert_eq!(pool_shown_at(p as usize), Some(pool), "the pool still shows there");
+        assert_eq!(query(p).state, MEM_RESERVE, "decommitted");
+        let again = XMemVirtualAlloc(p, GRANULE, MEM_COMMIT, GRAPHICS, PAGE_READWRITE);
+        assert_eq!(again, p);
+        // SAFETY: recommitted read-write; the pool's own mapping lives as long as the pool.
+        unsafe {
+            assert_eq!(cpu.read(), 0, "a recommitted page reads zeros");
+            assert_eq!(gpu.read(), 0, "the GPU's pool reads zeros too");
+            cpu.write(9);
+            assert_eq!(gpu.read(), 9, "the title's writes reach the GPU's pool");
+        }
         release_reservation(p as usize);
     }
 
@@ -387,6 +473,37 @@ mod tests {
         let null = std::ptr::null_mut();
         assert!(XMemVirtualAlloc(null, 0, MEM_RESERVE, 0, PAGE_READWRITE).is_null());
         assert!(XMemVirtualAlloc(null, GRANULE, MEM_RESERVE, 0, 0x03).is_null());
+        assert!(XMemVirtualAlloc(null, usize::MAX, MEM_RESERVE, 0, PAGE_READWRITE).is_null());
+        assert!(
+            XMemVirtualAlloc(
+                null,
+                usize::MAX - GRANULE + 2,
+                MEM_RESERVE,
+                0,
+                PAGE_READWRITE
+            )
+            .is_null()
+        );
+        assert!(
+            XMemVirtualAlloc(
+                (usize::MAX - 0x100) as *mut c_void,
+                0x200,
+                MEM_COMMIT,
+                0,
+                PAGE_READWRITE
+            )
+            .is_null()
+        );
+        assert!(
+            XMemVirtualAlloc(
+                (usize::MAX - 16) as *mut c_void,
+                16,
+                MEM_COMMIT,
+                0,
+                PAGE_READWRITE
+            )
+            .is_null()
+        );
         assert_eq!(XMemVirtualQuery(null, null, std::ptr::null_mut()), 0);
     }
 

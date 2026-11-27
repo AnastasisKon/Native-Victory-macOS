@@ -111,16 +111,37 @@ fn from_win32(error: &std::io::Error) -> HRESULT {
         .map_or(E_INVALIDARG, |e| (0x8007_0000 | (e as u32 & 0xffff)) as i32)
 }
 
-/// The Win32 error a POSIX one stands for (`ERROR_FILE_NOT_FOUND`,
-/// `ERROR_ACCESS_DENIED`, `ERROR_READ_FAULT` for the rest), as an `HRESULT`.
+/// The Win32 error a POSIX one stands for, as an `HRESULT`: the inverse of the UCRT's
+/// `_dosmaperr` table (Win32 error to `errno`), with `ERROR_READ_FAULT` for `EIO` and the rest.
 #[cfg(not(windows))]
 fn from_win32(error: &std::io::Error) -> HRESULT {
-    let code: u32 = match error.kind() {
-        std::io::ErrorKind::NotFound => 2,
-        std::io::ErrorKind::PermissionDenied => 5,
-        _ => 30,
+    use std::io::ErrorKind;
+    // `errno` values below 35 are the same on every Unix.
+    let code: u32 = match (error.raw_os_error(), error.kind()) {
+        (Some(9), _) => 6,                     // EBADF: ERROR_INVALID_HANDLE
+        (Some(23 | 24), _) => 4,               // ENFILE, EMFILE: ERROR_TOO_MANY_OPEN_FILES
+        (Some(28), _) => 112,                  // ENOSPC: ERROR_DISK_FULL
+        (_, ErrorKind::NotFound) => 2,         // ENOENT: ERROR_FILE_NOT_FOUND
+        (_, ErrorKind::PermissionDenied) => 5, // EACCES, EPERM: ERROR_ACCESS_DENIED
+        (_, ErrorKind::OutOfMemory) => 8,      // ENOMEM: ERROR_NOT_ENOUGH_MEMORY
+        (_, ErrorKind::InvalidInput) => 87,    // EINVAL: ERROR_INVALID_PARAMETER
+        _ => 30,                               // EIO and the rest: ERROR_READ_FAULT
     };
     (0x8007_0000 | code) as i32
+}
+
+/// The `HRESULT` of a failed read: `END_OF_FILE` past the end, else the host's error.
+fn read_hresult(error: &std::io::Error) -> HRESULT {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        END_OF_FILE
+    } else {
+        from_win32(error)
+    }
+}
+
+/// A host error for the log: its text (with the OS error number) and kind.
+fn host_error(error: &std::io::Error) -> String {
+    format!("{error} ({:?})", error.kind())
 }
 
 /// Reads at `offset` without moving a file position (`ReadFile` with an
@@ -142,7 +163,7 @@ type Factory = *const Object;
 
 /// Opens `path` for reading; the file object owns the handle.
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
-    if path.is_null() {
+    if path.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     // SAFETY: the title passes a NUL-terminated path.
@@ -223,6 +244,9 @@ extern "system" fn create_status_array(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     tracing::info!(
         capacity,
         name = text(name),
@@ -254,6 +278,9 @@ extern "system" fn create_queue(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     // SAFETY: the title passes its description (null tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -998,18 +1025,6 @@ extern "system" fn close(this: QueueRef) {
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
-    if std::env::var_os("VICTORY_TRACE_DSTORAGE_FILES").is_some() {
-        static SEEN: Mutex<BTreeMap<String, (u64, u64)>> = Mutex::new(BTreeMap::new());
-        let name = source_name(request).to_owned();
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        let e = seen.entry(name.clone()).or_default();
-        e.0 += 1;
-        e.1 += u64::from(request.source_size);
-        if e.0 == 1 || e.0.is_power_of_two() {
-            tracing::info!(file = name, requests = e.0, bytes = e.1, "dstorage: reads of a file so far");
-        }
-    }
-
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
             options = format_args!("{options:#x}"),
@@ -1030,6 +1045,17 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     if request.source.is_null() || request.destination.is_null() {
         return Err(fail(E_INVALIDARG, "no source or destination"));
     }
+    if std::env::var_os("VICTORY_TRACE_DSTORAGE_FILES").is_some() {
+        static SEEN: Mutex<BTreeMap<String, (u64, u64)>> = Mutex::new(BTreeMap::new());
+        let name = source_name(request).to_owned();
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let e = seen.entry(name.clone()).or_default();
+        e.0 += 1;
+        e.1 += u64::from(request.source_size);
+        if e.0 == 1 || e.0.is_power_of_two() {
+            tracing::info!(file = name, requests = e.0, bytes = e.1, "dstorage: reads of a file so far");
+        }
+    }
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
     if options & (ZLIB | BCPACK) == 0 {
@@ -1037,15 +1063,28 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        let mut read = None;
+        return into_destination(request, size, |out| {
+            read_into(request, out).map(|()| size).map_err(|error| {
+                let hr = read_hresult(&error);
+                read = Some(error);
+                hr
+            })
+        })
+        .map_err(|hr| match &read {
+            Some(error) => fail(hr, &format!("copying: {}", host_error(error))),
+            None => fail(hr, "copying"),
+        });
     }
     let tables = if bc != 0 {
         Some(bcpack_tables()?)
     } else {
         None
     };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let source = read_source(request).map_err(|error| {
+        let why = format!("reading the source: {}", host_error(&error));
+        fail(read_hresult(&error), &why)
+    })?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
@@ -1125,7 +1164,7 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn read_source(request: &Request) -> std::io::Result<Cow<'static, [u8]>> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
@@ -1141,7 +1180,7 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 static READING: AtomicU64 = AtomicU64::new(0);
 
 /// Fills `out` (the source size) from the request's file or memory.
-fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+fn read_into(request: &Request, out: &mut [u8]) -> std::io::Result<()> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe {
@@ -1152,19 +1191,32 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     // SAFETY: a file object we created; the title keeps it open.
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
     let started = std::time::Instant::now();
-    let mut done = 0;
-    let result = loop {
-        if done == out.len() {
-            break Ok(());
-        }
-        match file.read_at(&mut out[done..], request.offset + done as u64) {
-            Ok(0) => break Err(END_OF_FILE),
-            Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
-        }
-    };
+    let result = fill_at(out, request.offset, |buf, at| file.read_at(buf, at));
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
+}
+
+/// Fills `out` with `read(buf, offset)` from `offset` on, as `read_exact` does: short reads go
+/// on, `Interrupted` (EINTR: this process takes many signals) is tried again, and the end of
+/// the file is `UnexpectedEof`.
+fn fill_at(
+    out: &mut [u8],
+    offset: u64,
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    let mut done = 0;
+    while done < out.len() {
+        let Some(at) = offset.checked_add(done as u64) else {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        };
+        match read(&mut out[done..], at) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => done += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1254,6 +1306,9 @@ fn source_name(request: &Request) -> &str {
     if request.options & MEMORY_SOURCE != 0 {
         return "memory";
     }
+    if request.source.is_null() {
+        return "<null>";
+    }
     // SAFETY: a file object we created; the title keeps it open.
     &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
@@ -1299,6 +1354,52 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    /// A read interrupted by a signal is tried again, and short reads go on, until `out` is full.
+    #[test]
+    fn reads_go_on_past_signals_and_short_reads() {
+        let file: Vec<u8> = (0..10).collect();
+        let mut calls = Vec::new();
+        let mut out = [0; 6];
+        let result = fill_at(&mut out, 3, |buf, at| {
+            calls.push(at);
+            if calls.len() == 1 {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = buf.len().min(2);
+            buf[..n].copy_from_slice(&file[at as usize..at as usize + n]);
+            Ok(n)
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(out, [3, 4, 5, 6, 7, 8]);
+        assert_eq!(calls, [3, 3, 5, 7]);
+        let short = fill_at(&mut [0; 4], 0, |_, _| Ok(0)).unwrap_err();
+        assert_eq!(read_hresult(&short), END_OF_FILE);
+    }
+
+    /// Host errors reach the title as the Win32 errors Windows would give (`_dosmaperr`).
+    #[cfg(not(windows))]
+    #[test]
+    fn host_errors_map_to_their_win32_codes() {
+        let hr = |errno| from_win32(&std::io::Error::from_raw_os_error(errno)) as u32;
+        for (errno, win32) in [
+            (2, 2),    // ENOENT: ERROR_FILE_NOT_FOUND
+            (1, 5),    // EPERM: ERROR_ACCESS_DENIED
+            (13, 5),   // EACCES
+            (12, 8),   // ENOMEM: ERROR_NOT_ENOUGH_MEMORY
+            (9, 6),    // EBADF: ERROR_INVALID_HANDLE
+            (24, 4),   // EMFILE: ERROR_TOO_MANY_OPEN_FILES
+            (23, 4),   // ENFILE
+            (22, 87),  // EINVAL: ERROR_INVALID_PARAMETER
+            (28, 112), // ENOSPC: ERROR_DISK_FULL
+            (5, 30),   // EIO: ERROR_READ_FAULT
+            (35, 30),  // anything else
+        ] {
+            assert_eq!(hr(errno), 0x8007_0000 | win32, "errno {errno}");
+        }
+        let eof = std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(read_hresult(&eof), END_OF_FILE);
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
@@ -2121,5 +2222,74 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn null_out_pointers_fail_without_leaking_lanes_or_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let wide: Vec<u16> = path.to_str().unwrap().encode_utf16().chain([0]).collect();
+
+        let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x20);
+        assert_eq!(
+            open(
+                factory(),
+                wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+
+        let create_array: extern "system" fn(
+            *mut c_void,
+            u32,
+            *const c_char,
+            *const Guid,
+            Out,
+        ) -> HRESULT = call(factory(), 0x28);
+        assert_eq!(
+            create_array(
+                factory(),
+                4,
+                c"null-out".as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+
+        let before = scheduler().unwrap().lock().next_id;
+        let create_q: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 0,
+            capacity: 8,
+            priority: 0,
+            name: c"null-out".as_ptr(),
+            unknown: 1,
+        };
+        assert_eq!(
+            create_q(factory(), &desc, std::ptr::null(), std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        assert_eq!(scheduler().unwrap().lock().next_id, before);
+    }
+
+    #[test]
+    fn null_source_and_overflowing_file_offset_fail_safely() {
+        let mut dst = [0u8; 4];
+        let req = request(0, dst.as_mut_ptr().cast(), 4, std::ptr::null(), 0, 4);
+        assert_eq!(source_name(&req), "<null>");
+        assert_eq!(execute(&req), Err(E_INVALIDARG));
+
+        let err = fill_at(&mut dst, u64::MAX - 1, |buf, _| {
+            buf[0] = 1;
+            Ok(2)
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

@@ -13,8 +13,17 @@
 //! the one instance the title-facing objects call, and its [`pool_observer`] is what the runtime's
 //! physical-memory observer forwards to.
 
+/// Whether environment variable `$name` is set, read once per call site (draws ask per draw).
+macro_rules! env_set {
+    ($name:literal) => {{
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 pub mod addr;
 pub mod console_state;
+pub(crate) mod descriptor_trace;
 pub mod descriptors;
 #[cfg(target_os = "macos")]
 pub(crate) mod glue;
@@ -72,3 +81,6 @@ pub fn safe_read(at: *const u8, out: &mut [u8]) -> bool {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
+
+#[cfg(test)]
+mod vertex_tests;

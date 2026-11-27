@@ -296,7 +296,8 @@ fn hex_form(v: f64, prec: Option<usize>, upper: bool, alt: bool) -> String {
             };
         }
         Some(p) => digits.push_str(&"0".repeat(p - 13)),
-        None => digits = digits.trim_end_matches('0').to_string(),
+        // The CRT's default precision is 13, so trailing zeros stay (glibc trims them).
+        None => {}
     }
     let dot = if digits.is_empty() && !alt { "" } else { "." };
     let s = format!(
@@ -491,7 +492,8 @@ pub(super) fn printf(
                 } else {
                     let p = args.u64() as usize;
                     if p == 0 {
-                        "(null)".bytes().map(u32::from).collect()
+                        let n = spec.prec.map_or(6, |p| p.min(6));
+                        "(null)".bytes().take(n).map(u32::from).collect()
                     } else {
                         // SAFETY: the title's string.
                         let src = unsafe { read_string(p, arg_wide, spec.prec) };
@@ -569,10 +571,33 @@ fn skip_space(input: &mut dyn Input, consumed: &mut usize) {
     }
 }
 
-/// Stores a scanned string at `dest`, in the destination's width.
-unsafe fn store_units(dest: usize, units: &[u32], src_wide: bool, dest_wide: bool, nul: bool) {
+/// Stores a scanned string at `dest` in the destination's width if the converted
+/// units fit in `room`. Returns `false` (clearing `dest[0]` when `room > 0`) if
+/// the buffer is too small or null.
+unsafe fn store_units(
+    dest: usize,
+    room: usize,
+    units: &[u32],
+    src_wide: bool,
+    dest_wide: bool,
+    nul: bool,
+) -> bool {
     let u = convert(units, src_wide, dest_wide);
-    // SAFETY: the title's destination buffer.
+    let need = u.len() + usize::from(nul);
+    if dest == 0 || need > room {
+        if dest != 0 && room > 0 {
+            // SAFETY: the title's destination buffer has at least one unit.
+            unsafe {
+                if dest_wide {
+                    (dest as *mut u16).write_unaligned(0);
+                } else {
+                    (dest as *mut u8).write(0);
+                }
+            }
+        }
+        return false;
+    }
+    // SAFETY: the title's destination buffer holds `u` (and NUL when `nul`).
     unsafe {
         if dest_wide {
             let p = dest as *mut u16;
@@ -592,6 +617,7 @@ unsafe fn store_units(dest: usize, units: &[u32], src_wide: bool, dest_wide: boo
             }
         }
     }
+    true
 }
 
 /// Scans `input` by `fmt`: the number of fields stored, or -1 when the
@@ -882,11 +908,10 @@ pub(super) fn scanf(
                     } else {
                         usize::MAX
                     };
-                    if got.len() + 1 > room {
+                    // SAFETY: the title's destination.
+                    if !unsafe { store_units(dest, room, &got, wide, dest_wide, true) } {
                         return stored;
                     }
-                    // SAFETY: the title's destination.
-                    unsafe { store_units(dest, &got, wide, dest_wide, true) };
                     stored += 1;
                 }
             }
@@ -904,11 +929,15 @@ pub(super) fn scanf(
                 consumed += got.len();
                 if !suppress {
                     let dest = args.u64() as usize;
-                    if secure {
-                        args.u64();
-                    }
+                    let room = if secure {
+                        args.u64() as u32 as usize
+                    } else {
+                        usize::MAX
+                    };
                     // SAFETY: the title's destination.
-                    unsafe { store_units(dest, &got, wide, dest_wide, false) };
+                    if !unsafe { store_units(dest, room, &got, wide, dest_wide, false) } {
+                        return stored;
+                    }
                     stored += 1;
                 }
             }
@@ -958,19 +987,26 @@ pub(super) fn scanf(
                     } else {
                         usize::MAX
                     };
-                    if got.len() + 1 > room {
+                    // SAFETY: the title's destination.
+                    if !unsafe { store_units(dest, room, &got, wide, dest_wide, true) } {
                         return stored;
                     }
-                    // SAFETY: the title's destination.
-                    unsafe { store_units(dest, &got, wide, dest_wide, true) };
                     stored += 1;
                 }
             }
             b'n' => {
                 if !suppress {
                     let dest = args.u64() as usize;
-                    // SAFETY: the title's destination.
-                    unsafe { (dest as *mut u32).write_unaligned(consumed as u32) };
+                    let v = consumed as u64;
+                    // SAFETY: the title's destination, sized by the length modifier.
+                    unsafe {
+                        match len {
+                            Len::Hh => (dest as *mut u8).write(v as u8),
+                            Len::H => (dest as *mut u16).write_unaligned(v as u16),
+                            Len::Ll | Len::Wide => (dest as *mut u64).write_unaligned(v),
+                            _ => (dest as *mut u32).write_unaligned(v as u32),
+                        }
+                    }
                 }
             }
             _ => return stored,
@@ -1056,11 +1092,16 @@ mod tests {
         assert_eq!(run("%f %f", &[d(f64::NAN), d(-f64::NAN)]), "nan -nan(ind)");
         assert_eq!(run("%f", &[d(-0.0)]), "-0.000000");
         assert_eq!(run("%f", &[d(1e20)]), "100000000000000000000.000000");
-        assert_eq!(run("%a %A", &[d(1.0), d(0.5)]), "0x1p+0 0X1P-1");
+        // Thirteen digits unless a precision is given.
+        assert_eq!(
+            run("%a %A", &[d(1.0), d(0.5)]),
+            "0x1.0000000000000p+0 0X1.0000000000000P-1"
+        );
         assert_eq!(
             run("%a %.2a %a", &[d(3.0), d(1.0 + 1.0 / 3.0), d(0.0)]),
-            "0x1.8p+1 0x1.55p+0 0x0p+0"
+            "0x1.8000000000000p+1 0x1.55p+0 0x0.0000000000000p+0"
         );
+        assert_eq!(run("%.0a %#.0a", &[d(1.0), d(1.0)]), "0x1p+0 0x1.p+0");
         assert_eq!(run("%a", &[d(5e-324)]), "0x0.0000000000001p-1022");
     }
 
@@ -1182,5 +1223,70 @@ mod tests {
         let args = [v.as_mut_ptr() as u64];
         assert_eq!(scan("ab", "%c", false, &args), (1, 1));
         assert_eq!(v[0], b'a');
+    }
+
+    #[test]
+    fn printf_null_precision_and_scanf_secure_bounds_and_n_widths() {
+        // Precision caps `(null)` just like any other string.
+        assert_eq!(run("%.3s|%.0s|%5.2s", &[0, 0, 0]), "(nu||   (n");
+        let wf: Vec<u32> = "%.3s".encode_utf16().map(u32::from).collect();
+        let wout = printf(&wf, true, 0, &mut SliceArgs(&[0], 0)).unwrap();
+        let wtext =
+            String::from_utf16(&wout.iter().map(|&u| u as u16).collect::<Vec<_>>()).unwrap();
+        assert_eq!(wtext, "(nu");
+
+        // `%n` writes the width named by its length modifier.
+        let mut byte_slot = [0xAAu8; 4];
+        let mut short_slot = [0xBBBBu16; 2];
+        let mut wide_slot = u64::MAX;
+        let args = [
+            byte_slot.as_mut_ptr() as u64,
+            short_slot.as_mut_ptr() as u64,
+            &mut wide_slot as *mut u64 as u64,
+        ];
+        assert_eq!(scan("abcdef", "ab%hhncd%hnef%lln", false, &args).0, 0);
+        assert_eq!(byte_slot, [2, 0xAA, 0xAA, 0xAA]);
+        assert_eq!(short_slot, [4, 0xBBBB]);
+        assert_eq!(wide_slot, 6);
+
+        // `scanf_s` enforces buffer size on `%c` and on converted wide-to-narrow `%hs`.
+        let mut cbuf = [0xCCu8; 6];
+        let args = [cbuf.as_mut_ptr() as u64, 2];
+        assert_eq!(scan("abcd", "%4c", true, &args).0, 0);
+        assert_eq!(cbuf[0], 0);
+        assert_eq!(&cbuf[1..], &[0xCC; 5]);
+
+        let mut cbuf = [0xCCu8; 4];
+        let args = [cbuf.as_mut_ptr() as u64, 2];
+        assert_eq!(scan("abcd", "%2c", true, &args).0, 1);
+        assert_eq!(&cbuf, &[b'a', b'b', 0xCC, 0xCC]);
+
+        // Wide input `"€€"` is 2 UTF-16 units but 6 UTF-8 bytes + NUL (7 > 4).
+        let mut inp = UnitInput {
+            units: "€€".encode_utf16().map(u32::from).collect(),
+            pos: 0,
+        };
+        let fmt: Vec<u32> = "%hs".encode_utf16().map(u32::from).collect();
+        let mut narrow = [0xDDu8; 8];
+        let args = [narrow.as_mut_ptr() as u64, 4];
+        assert_eq!(
+            scanf(
+                &fmt,
+                true,
+                SCANF_SECURECRT,
+                &mut inp,
+                &mut SliceArgs(&args, 0)
+            ),
+            0
+        );
+        assert_eq!(narrow[0], 0);
+        assert_eq!(&narrow[4..], &[0xDD; 4]);
+
+        // `%[` clears `dest[0]` and stops without overflowing when the buffer is too small.
+        let mut sbuf = [0xEEu8; 6];
+        let args = [sbuf.as_mut_ptr() as u64, 3];
+        assert_eq!(scan("abcd", "%[a-d]", true, &args).0, 0);
+        assert_eq!(sbuf[0], 0);
+        assert_eq!(&sbuf[3..], &[0xEE; 3]);
     }
 }

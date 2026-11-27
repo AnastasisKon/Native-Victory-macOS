@@ -21,6 +21,29 @@ type Payload = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type MakeSignature = unsafe extern "C" fn(*const Descriptor, *mut *mut c_void) -> *mut c_void;
 type SetSignature = unsafe extern "C" fn(*mut c_void, *const c_void);
 type SetFlags = unsafe extern "C" fn(*mut c_void, u32);
+type SetDualSource = unsafe extern "C" fn(*mut c_void, u32);
+type GetReflection = unsafe extern "C" fn(*const c_void, i32, *mut c_void) -> bool;
+type CopyMeshInfo = unsafe extern "C" fn(*const c_void, u32, *mut MeshInfo) -> bool;
+type ReleaseMeshInfo = unsafe extern "C" fn(*mut MeshInfo) -> bool;
+
+/// `IRDualSourceBlendingConfigurationForceEnabled`: one target's two sources are shader outputs
+/// 0 and 1, both `[[color(0)]]` (`index(0)` and `index(1)`).
+const DUAL_SOURCE_ON: u32 = 1;
+
+/// `IRShaderStageMesh`.
+pub const STAGE_MESH: i32 = 5;
+
+/// `IRVersionedMSInfo` holding `IRMSInfo_1_0`.
+#[repr(C)]
+#[derive(Default)]
+struct MeshInfo {
+    version: u32,
+    max_vertices: u32,
+    max_primitives: u32,
+    topology: u32,
+    payload: u32,
+    threads: [u32; 3],
+}
 
 /// `IRRootParameter1`: type, a 16-byte union (constants `{register, space, count}`, descriptor
 /// `{register, space, flags}`), shader visibility (all).
@@ -71,8 +94,80 @@ impl Parameter {
     }
 }
 
+/// Logs a slow conversion (and whether the disk cache had it).
+fn note(started: std::time::Instant, dxil: usize, hit: bool) {
+    let ms = started.elapsed().as_millis();
+    if ms >= 20 {
+        eprintln!("metal: library conversion {ms} ms (dxil {dxil} bytes, from the disk cache: {hit})");
+    }
+}
+
+/// `IRResourceLocation`: where the converter puts one resource of a root signature in the
+/// top-level argument buffer.
+#[repr(C)]
+struct Location {
+    kind: u32,
+    space: u32,
+    slot: u32,
+    offset: u32,
+    size: u64,
+    name: *const c_char,
+}
+
+type Count = unsafe extern "C" fn(*const c_void) -> usize;
+type Locations = unsafe extern "C" fn(*const c_void, *mut Location);
+
+/// The converter's root signature for `l` (destroyed with `IRRootSignatureDestroy`), or the code
+/// it refused it with.
+///
+/// # Safety
+/// `h` is the converter's dlopen handle.
+unsafe fn make_signature(h: *mut c_void, l: &RootLayout) -> Result<*mut c_void, u32> {
+    let params: Vec<Parameter> = l.params.iter().map(Parameter::of).collect();
+    // `IRStaticSamplerDescriptor` (`D3D12_STATIC_SAMPLER_DESC`): the layout's ten words,
+    // then register n, space 0, visibility all.
+    let samplers: Vec<[u32; 13]> = l
+        .static_samplers
+        .iter()
+        .enumerate()
+        .map(|(n, w)| {
+            let mut d = [0u32; 13];
+            d[..10].copy_from_slice(w);
+            d[10] = n as u32;
+            d
+        })
+        .collect();
+    let d = Descriptor {
+        version: 2,
+        _pad: 0,
+        count: params.len() as u32,
+        parameters: params.as_ptr(),
+        samplers: samplers.len() as u32,
+        static_samplers: samplers.as_ptr().cast(),
+        flags: HEAPS_DIRECTLY_INDEXED,
+    };
+    let mut err = std::ptr::null_mut();
+    // SAFETY: the converter's documented C API; `d` and what it points at outlive the call.
+    unsafe {
+        let signature =
+            sym::<MakeSignature>(h, "IRRootSignatureCreateFromDescriptor")(&d, &mut err);
+        if signature.is_null() {
+            return Err(if err.is_null() {
+                0
+            } else {
+                let code = sym::<ErrCode>(h, "IRErrorGetCode")(err);
+                sym::<Destroy>(h, "IRErrorDestroy")(err);
+                code
+            });
+        }
+        Ok(signature)
+    }
+}
+
 pub struct Msc {
     h: *mut c_void,
+    /// Which converter this is (its path, size and modification time): part of the library cache's keys.
+    id: String,
 }
 
 // SAFETY: the handle is a dlopen handle; every conversion makes and destroys its own IR objects.
@@ -107,9 +202,14 @@ pub const DEFAULT_DYLIB: &str = "/usr/local/lib/libmetalirconverter.dylib";
 
 impl Msc {
     /// Opens `VICTORY_MSC_DYLIB` if set, else the installed default.
-    pub fn open_default() -> Msc {
+    pub fn try_open_default() -> Result<Msc, String> {
         let path = std::env::var("VICTORY_MSC_DYLIB").unwrap_or_else(|_| DEFAULT_DYLIB.into());
-        Msc::open(&path).unwrap_or_else(|e| panic!("dlopen {path}: {e}"))
+        Msc::open(&path).map_err(|e| format!("dlopen {path}: {e}"))
+    }
+
+    /// Opens `VICTORY_MSC_DYLIB` if set, else the installed default, panicking on failure.
+    pub fn open_default() -> Msc {
+        Self::try_open_default().unwrap_or_else(|e| panic!("{e}"))
     }
 
     pub fn open(path: &str) -> Result<Msc, String> {
@@ -127,66 +227,191 @@ impl Msc {
             };
             return Err(e);
         }
-        Ok(Msc { h })
+        let id = std::fs::metadata(path)
+            .map(|m| format!("{path} {} {:?}", m.len(), m.modified().ok()))
+            .unwrap_or_else(|_| path.to_owned());
+        Ok(Msc { h, id })
     }
 
     /// DXIL (a DXBC-wrapped container) -> (shader stage, metallib bytes). Stage 8 is compute (`IRShaderStage`).
     pub fn convert(&self, dxil: &[u8], entry: Option<&str>) -> Result<(i32, Vec<u8>), ConvError> {
-        self.convert_with(dxil, entry, None)
+        self.convert_with(dxil, entry, None, false)
+    }
+
+    /// Where the converter lays out `l` in the top-level argument buffer: (resource type, space,
+    /// register, byte offset, size) per resource, as `IRRootSignatureGetResourceLocations` gives.
+    pub fn locations(&self, l: &RootLayout) -> Result<Vec<(u32, u32, u32, u32, u64)>, ConvError> {
+        let h = self.h;
+        // SAFETY: the converter's documented C API; the signature is destroyed below.
+        unsafe {
+            let signature = make_signature(h, l).map_err(|code| ConvError {
+                code,
+                msg: "the root signature was refused".into(),
+            })?;
+            let n = sym::<Count>(h, "IRRootSignatureGetResourceCount")(signature);
+            let mut v: Vec<Location> = (0..n)
+                .map(|_| Location {
+                    kind: 0,
+                    space: 0,
+                    slot: 0,
+                    offset: 0,
+                    size: 0,
+                    name: std::ptr::null(),
+                })
+                .collect();
+            sym::<Locations>(h, "IRRootSignatureGetResourceLocations")(signature, v.as_mut_ptr());
+            sym::<Destroy>(h, "IRRootSignatureDestroy")(signature);
+            Ok(v.iter()
+                .map(|l| (l.kind, l.space, l.slot, l.offset, l.size))
+                .collect())
+        }
     }
 
     /// [`Self::convert`] with the top-level argument buffer laid out as `layout` says (for DXIL
     /// that carries no root signature), and out-of-range raw buffer accesses made safe if it asks.
+    /// `dual_source`: the pixel shader's second output is target 0's second blend source, which
+    /// the converter only emits as `[[color(0) index(1)]]` when told.
     pub fn convert_with(
         &self,
         dxil: &[u8],
         entry: Option<&str>,
         layout: Option<&RootLayout>,
+        dual_source: bool,
     ) -> Result<(i32, Vec<u8>), ConvError> {
+        let Some(dir) = crate::disk::dir() else {
+            return self.convert_uncached(dxil, entry, layout, dual_source);
+        };
+        let started = std::time::Instant::now();
+        let layout_text = format!("{layout:?}");
+        // A dual-source conversion is a different shader laid out for the same DXIL, so it gets
+        // an entry of its own; the other case keeps the key it had, so those entries stay warm.
+        let mut parts: Vec<&[u8]> = Vec::new();
+        if dual_source {
+            parts.push(b"dual-source");
+        }
+        parts.extend([
+            dxil,
+            entry.unwrap_or("").as_bytes(),
+            layout_text.as_bytes(),
+            self.id.as_bytes(),
+        ]);
+        let key = crate::disk::key(&parts);
+        if let Some((stage, lib)) = crate::disk::read(dir, &key).and_then(|b| {
+            let (stage, lib) = b.split_at_checked(4)?;
+            Some((i32::from_le_bytes(stage.try_into().ok()?), lib.to_vec()))
+        }) {
+            note(started, dxil.len(), true);
+            return Ok((stage, lib));
+        }
+        let (stage, lib) = self.convert_uncached(dxil, entry, layout, dual_source)?;
+        crate::disk::write(dir, &key, &[&stage.to_le_bytes()[..], &lib].concat());
+        note(started, dxil.len(), false);
+        Ok((stage, lib))
+    }
+
+    /// The thread-group size of a mesh shader, from the converter's reflection of it (cached on
+    /// disk as conversions are).
+    pub fn mesh_threads(&self, dxil: &[u8], layout: Option<&RootLayout>) -> Result<[u32; 3], ConvError> {
+        let layout_text = format!("{layout:?}");
+        let dir = crate::disk::dir();
+        let key = crate::disk::key(&[b"mesh threads", dxil, layout_text.as_bytes(), self.id.as_bytes()]);
+        if let Some(t) = dir.and_then(|d| crate::disk::read(d, &key)).and_then(|b| {
+            let w = |k: usize| Some(u32::from_le_bytes(b.get(k * 4..k * 4 + 4)?.try_into().ok()?));
+            Some([w(0)?, w(1)?, w(2)?])
+        }) {
+            return Ok(t);
+        }
+        let h = self.h;
+        let threads = self.compiled(dxil, None, layout, false, |out| {
+            // SAFETY: the converter's documented C API (`IRShaderReflection*`, `IRObjectGetReflection`,
+            // `IRShaderReflectionCopyMeshInfo` with `IRReflectionVersion_1_0`); the reflection is
+            // destroyed before returning.
+            unsafe {
+                let r = sym::<Create>(h, "IRShaderReflectionCreate")();
+                let mut info = MeshInfo::default();
+                let ok = sym::<GetReflection>(h, "IRObjectGetReflection")(out, STAGE_MESH, r)
+                    && sym::<CopyMeshInfo>(h, "IRShaderReflectionCopyMeshInfo")(r, 1, &mut info);
+                if ok {
+                    sym::<ReleaseMeshInfo>(h, "IRShaderReflectionReleaseMeshInfo")(&mut info);
+                }
+                sym::<Destroy>(h, "IRShaderReflectionDestroy")(r);
+                if ok {
+                    Ok(info.threads)
+                } else {
+                    Err(ConvError { code: u32::MAX, msg: "no mesh reflection".into() })
+                }
+            }
+        })?;
+        if let Some(d) = dir {
+            crate::disk::write(d, &key, &threads.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>());
+        }
+        Ok(threads)
+    }
+
+    fn convert_uncached(
+        &self,
+        dxil: &[u8],
+        entry: Option<&str>,
+        layout: Option<&RootLayout>,
+        dual_source: bool,
+    ) -> Result<(i32, Vec<u8>), ConvError> {
+        let h = self.h;
+        self.compiled(dxil, entry, layout, dual_source, |out| {
+            // SAFETY: the converter's documented C API; the binary is destroyed below.
+            unsafe {
+                let stage = sym::<Stage>(h, "IRObjectGetMetalIRShaderStage")(out);
+                let lib = sym::<Create>(h, "IRMetalLibBinaryCreate")();
+                let r = if sym::<GetLib>(h, "IRObjectGetMetalLibBinary")(out, stage, lib) {
+                    let n = sym::<LibSize>(h, "IRMetalLibGetBytecodeSize")(lib);
+                    let mut v = vec![0u8; n];
+                    sym::<LibBytes>(h, "IRMetalLibGetBytecode")(lib, v.as_mut_ptr());
+                    Ok((stage, v))
+                } else {
+                    Err(ConvError {
+                        code: u32::MAX,
+                        msg: "no metallib for stage".into(),
+                    })
+                };
+                sym::<Destroy>(h, "IRMetalLibBinaryDestroy")(lib);
+                r
+            }
+        })
+    }
+
+    /// Compiles `dxil` and hands the converter's output object to `f`.
+    fn compiled<T>(
+        &self,
+        dxil: &[u8],
+        entry: Option<&str>,
+        layout: Option<&RootLayout>,
+        dual_source: bool,
+        f: impl FnOnce(*mut c_void) -> Result<T, ConvError>,
+    ) -> Result<T, ConvError> {
         let h = self.h;
         // SAFETY: the symbols are the converter's documented C API; every object is destroyed below.
         unsafe {
             let comp = sym::<Create>(h, "IRCompilerCreate")();
-            let params: Vec<Parameter> = layout
-                .map(|l| l.params.iter().map(Parameter::of).collect())
-                .unwrap_or_default();
-            // `IRStaticSamplerDescriptor` (`D3D12_STATIC_SAMPLER_DESC`): the layout's ten words,
-            // then register n, space 0, visibility all.
-            let samplers: Vec<[u32; 13]> = layout
-                .map(|l| {
-                    l.static_samplers
-                        .iter()
-                        .enumerate()
-                        .map(|(n, w)| {
-                            let mut d = [0u32; 13];
-                            d[..10].copy_from_slice(w);
-                            d[10] = n as u32;
-                            d
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Older converters have no dual-source switch; those keep refusing such pipelines.
+            // Every other conversion leaves the option alone, as before.
+            if dual_source {
+                let set = libc::dlsym(h, c"IRCompilerSetDualSourceBlendingConfiguration".as_ptr());
+                if !set.is_null() {
+                    let set: SetDualSource = std::mem::transmute_copy(&set);
+                    set(comp, DUAL_SOURCE_ON);
+                }
+            }
             let mut signature = std::ptr::null_mut();
             if let Some(l) = layout {
-                let d = Descriptor {
-                    version: 2,
-                    _pad: 0,
-                    count: params.len() as u32,
-                    parameters: params.as_ptr(),
-                    samplers: samplers.len() as u32,
-                    static_samplers: samplers.as_ptr().cast(),
-                    flags: HEAPS_DIRECTLY_INDEXED,
+                signature = match make_signature(h, l) {
+                    Ok(s) => s,
+                    Err(code) => {
+                        sym::<Destroy>(h, "IRCompilerDestroy")(comp);
+                        return Err(ConvError {
+                            code,
+                            msg: "the root signature was refused".into(),
+                        });
+                    }
                 };
-                let mut err = std::ptr::null_mut();
-                signature = sym::<MakeSignature>(h, "IRRootSignatureCreateFromDescriptor")(&d, &mut err);
-                if signature.is_null() {
-                    let code = if err.is_null() { 0 } else { sym::<ErrCode>(h, "IRErrorGetCode")(err) };
-                    sym::<Destroy>(h, "IRCompilerDestroy")(comp);
-                    return Err(ConvError {
-                        code,
-                        msg: "the root signature was refused".into(),
-                    });
-                }
                 sym::<SetSignature>(h, "IRCompilerSetGlobalRootSignature")(comp, signature);
                 if l.bounds_checked {
                     sym::<SetFlags>(h, "IRCompilerSetCompatibilityFlags")(comp, BOUNDS_CHECK);
@@ -220,20 +445,7 @@ impl Msc {
                 };
                 Err(ConvError { code, msg })
             } else {
-                let stage = sym::<Stage>(h, "IRObjectGetMetalIRShaderStage")(out);
-                let lib = sym::<Create>(h, "IRMetalLibBinaryCreate")();
-                let r = if sym::<GetLib>(h, "IRObjectGetMetalLibBinary")(out, stage, lib) {
-                    let n = sym::<LibSize>(h, "IRMetalLibGetBytecodeSize")(lib);
-                    let mut v = vec![0u8; n];
-                    sym::<LibBytes>(h, "IRMetalLibGetBytecode")(lib, v.as_mut_ptr());
-                    Ok((stage, v))
-                } else {
-                    Err(ConvError {
-                        code: u32::MAX,
-                        msg: "no metallib for stage".into(),
-                    })
-                };
-                sym::<Destroy>(h, "IRMetalLibBinaryDestroy")(lib);
+                let r = f(out);
                 sym::<Destroy>(h, "IRObjectDestroy")(out);
                 r
             };

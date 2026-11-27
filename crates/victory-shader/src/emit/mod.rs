@@ -226,6 +226,8 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lockstep;
+#[cfg(test)]
+mod lockstep_tests;
 mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};

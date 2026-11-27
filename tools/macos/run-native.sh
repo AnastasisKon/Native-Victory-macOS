@@ -78,7 +78,8 @@ echo "Log: $log"
 pid=$!
 timer=""
 if (( decimal_seconds > 0 )); then
-  ( sleep "$decimal_seconds"; kill "$pid" 2>/dev/null ) &
+  # The marker tells run-summary.sh that the limit, not a crash, ended the run.
+  ( sleep "$decimal_seconds" && { echo "# stopped by --seconds" >> "$log"; kill "$pid" 2>/dev/null; } ) &
   timer=$!
 fi
 # A background job ignores Ctrl-C in a script, so pass it on: stop the game, its
@@ -89,6 +90,8 @@ stop_timer() {
 trap 'pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; stop_timer; wait "$pid"; echo; echo "Stopped. Log: $log"; exit 130' INT TERM
 wait "$pid"
 rc=$?
+# For run-summary.sh: a host crash (139) writes no log line of its own.
+echo "# exit code $rc" >> "$log"
 stop_timer
 
 echo

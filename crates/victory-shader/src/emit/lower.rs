@@ -119,6 +119,10 @@ pub(crate) struct Lowered {
     /// Live f32 multiplies, including the inclusive and cross-wave prefix steps.
     #[cfg(test)]
     pub float_multiplies: usize,
+    /// The output stores (`storeOutput`, `storeVertexOutput`, `storePrimitiveOutput`), with
+    /// where each and the values it stores are written.
+    #[cfg(test)]
+    pub output_stores: Vec<super::bitcode::WrittenCall>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -992,6 +996,9 @@ impl<'a> Lower<'a> {
                 }
                 if halves {
                     once = if one_wave { wave_blocks(p, x.st) } else { once_blocks(p) };
+                    for (o, at_barrier) in once.iter_mut().zip(barrier_blocks(p, x.st)) {
+                        *o |= at_barrier;
+                    }
                     s.xchg_dwords = lanes.next_multiple_of(64);
                 }
             } else if console_lanes || one_wave && s.lds_dwords > 0 && !fits {
@@ -1945,6 +1952,13 @@ impl<'a> Lower<'a> {
             wave_active_calls: self.s.m.written_call_args("dx.op.waveActiveOp"),
             #[cfg(test)]
             float_multiplies: self.s.m.written_bin_ops(self.s.t.f32, Bin::Mul),
+            #[cfg(test)]
+            output_stores: [
+                self.s.m.written_call_places("dx.op.storeOutput."),
+                self.s.m.written_call_places("dx.op.storeVertexOutput."),
+                self.s.m.written_call_places("dx.op.storePrimitiveOutput."),
+            ]
+            .concat(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -13200,6 +13214,13 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // Every component's value is made before the first store, and the stores then follow
+        // each other with nothing between them. Apple's Metal Shader Converter gathers the
+        // component stores of one output into a vector at the first of them: a value made
+        // between two stores (a float cast, an f16 conversion) was then used before its
+        // definition in the converted library, and Metal's compiler failed on the mesh
+        // programs whose outputs a pixel stage reads.
+        let mut ready: Vec<(usize, u8, &'static str, V)> = Vec::with_capacity(stores.len());
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -13282,15 +13303,17 @@ impl<'a> Lower<'a> {
                 }
                 _ => x,
             };
+            ready.push((id, col, suffix, x));
+        }
+        let thread = mesh.then(|| self.mesh_thread());
+        for (id, col, suffix, x) in ready {
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),
                 self.s.m.i8(col),
                 x,
             ];
-            if mesh {
-                args.push(self.mesh_thread());
-            }
+            args.extend(thread);
             let void = self.s.t.void;
             self.s.op(
                 self.cur,
@@ -14185,7 +14208,7 @@ impl<'a> Lower<'a> {
             let uniform = self.uniform_join(b, |_| true);
             let mesh_number = uniform && mesh_branch && {
                 // Each host half can read a different first lane.
-                let split = mesh_split.get_or_insert_with(|| split_scc(p));
+                let split = mesh_split.get_or_insert_with(|| split_scc(p, &Set::default()));
                 !split.contains(&phi.value)
                     && high.is_none_or(|h| !split.contains(&h.value))
                     && self.uniform_join(b, |scc| !split.contains(&scc))
@@ -14310,10 +14333,188 @@ pub(crate) fn once_blocks(p: &Program) -> Vec<bool> {
         .collect()
 }
 
+/// Blocks outside any cycle that hold one of the title's own `s_barrier`s. The console's barrier
+/// waits for every wave of the group that has not ended, so the title brings every live wave
+/// there together, and the host lowers it to a group barrier on that same promise: an exchange
+/// between host waves in such a block is reached by the same threads, once (the G-buffer culling
+/// shaders' whole-wave OR in groups of two console waves, whose culled waves end early).
+///
+/// Not a block reached past a branch on an SCC from [`split_scc`]: the console wave takes such a
+/// branch whole, so the title may put one before its barrier (a wave-uniform early return), but
+/// each host wave computes it from its own first lane, so one half could skip the block while
+/// the other waits at the exchange's group barrier. As in [`wave_blocks`], such an SCC in the
+/// block's reach condition excludes it, unless the first lane read is of an LDS word both halves
+/// read alike after a barrier ([`barrier_reads`]).
+pub(crate) fn barrier_blocks(p: &Program, st: &Structured) -> Vec<bool> {
+    let n = p.blocks.len();
+    let split = split_scc(p, &barrier_reads(p, st));
+    (0..n)
+        .map(|b| {
+            if !p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier") {
+                return false;
+            }
+            let apart = |a: &Atom| matches!(a, Atom::Uniform(v) if split.contains(v));
+            if st.bools.support(st.reach[b]).iter().any(apart) {
+                return false;
+            }
+            let mut seen = vec![false; n];
+            let mut stack = p.blocks[b].exit.successors();
+            while let Some(x) = stack.pop() {
+                if x == b {
+                    return false;
+                }
+                if !std::mem::replace(&mut seen[x], true) {
+                    stack.extend(p.blocks[x].exit.successors());
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+/// Values of `ds_read_b32`s both host waves of a console wave read alike: a constant LDS address
+/// read in one known barrier phase n ≥ 1 (after the title's n-th `s_barrier` on every path,
+/// [`barrier_phases`]), where no LDS write of the program that can run in phase n, on any path
+/// and in any wave, can touch the word (an atomic, `ds_append` or
+/// `ds_consume` counts as a write; one at constant bytes elsewhere is fine). The group barrier
+/// brings every live thread to phase n with the same LDS, a wave that ended writes nothing more,
+/// and a write of another phase is ordered by the barriers around it, so nothing changes the
+/// word while any thread may read it in phase n (the G-buffer cullers' group flag, #182).
+fn barrier_reads(p: &Program, st: &Structured) -> Set<Value> {
+    let phases = barrier_phases(p);
+    let barriers = |b: usize, i: usize| {
+        p.blocks[b].insts[..i].iter().filter(|x| x.name() == "s_barrier").count() as u32
+    };
+    // The possible barrier phases at instruction `i` of block `b`, None: any.
+    let phase = |b: usize, i: usize| phases[b].and_then(|m| shift_phases(m, barriers(b, i)));
+    let mut defs: Map<Value, (usize, usize)> = Map::default();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            defs.extend(inst.writes.iter().map(|w| (w.1, (b, i))));
+        }
+    }
+    // A VGPR value moved from a constant in every lane that holds it.
+    let constant = |mut v: Value| {
+        for _ in 0..8 {
+            let &(b, i) = defs.get(&v)?;
+            let inst = &p.blocks[b].insts[i];
+            let Fields::Valu(f) = &inst.fields else { return None };
+            if inst.name() != "v_mov_b32" || f.dpp.is_some() || f.sdwa.is_some() {
+                return None;
+            }
+            if st.guards[b][i].is_some() {
+                return None;
+            }
+            match *f.src.first()? {
+                Operand::Const(k @ 128..=192) => return Some(u32::from(k) - 128),
+                Operand::Literal(x) => return Some(x),
+                Operand::Vector { reg, .. } => v = inst.read(Reg::V(reg))?,
+                _ => return None,
+            }
+        }
+        None
+    };
+    // The LDS bytes an access of one constant address covers.
+    let bytes = |inst: &Inst| -> Option<(u32, u32)> {
+        let Fields::Ds {
+            addr: Some(Operand::Vector { reg, .. }),
+            offset0,
+            offset1,
+            gds: false,
+            ..
+        } = inst.fields
+        else {
+            return None;
+        };
+        let name = inst.name();
+        if ["write2", "read2", "addtid", "_d16", "_hi"].iter().any(|k| name.contains(k)) {
+            return None;
+        }
+        let size = ["8", "16", "32", "64", "96", "128"]
+            .iter()
+            .zip([1, 2, 4, 8, 12, 16])
+            .find(|(k, _)| ["b", "u", "i", "f"].iter().any(|t| name.ends_with(&format!("_{t}{k}"))))
+            .map(|(_, n)| n)?;
+        let at = constant(inst.read(Reg::V(reg))?)?
+            .checked_add(u32::from(offset0) | u32::from(offset1) << 8)?;
+        Some((at, size))
+    };
+    let writes_lds = |inst: &Inst| {
+        matches!(inst.fields, Fields::Ds { gds: false, .. })
+            && !["ds_read", "ds_swizzle", "ds_permute", "ds_bpermute"]
+                .iter()
+                .any(|k| inst.name().starts_with(k))
+    };
+    let mut out = Set::default();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if inst.name() != "ds_read_b32" || st.guards[b][i].is_some() {
+                continue;
+            }
+            let Some((word, _)) = bytes(inst) else { continue };
+            // One phase, after at least one barrier.
+            let Some(n) = phase(b, i).filter(|m| m.count_ones() == 1 && m & 1 == 0) else {
+                continue;
+            };
+            // Every LDS write that can run in phase n misses the word.
+            let ok = p.blocks.iter().enumerate().all(|(q, other)| {
+                other.insts.iter().enumerate().all(|(j, w)| {
+                    !writes_lds(w)
+                        || phase(q, j).is_some_and(|m| m & n == 0)
+                        || bytes(w).is_some_and(|(at, size)| at + size <= word || word + 4 <= at)
+                })
+            });
+            if ok {
+                out.extend(inst.writes.iter().map(|w| w.1));
+            }
+        }
+    }
+    out
+}
+
+/// `phases` after `n` more barriers; None past 63.
+fn shift_phases(phases: u64, n: u32) -> Option<u64> {
+    (n < 64 && phases.leading_zeros() >= n).then(|| phases << n)
+}
+
+/// Per block: the numbers of `s_barrier`s a path from the entry can have passed on entering it,
+/// as a bit set (bit k: k barriers; 0: not reached), None where it can be any (a loop that holds
+/// a barrier, or more than 63). A group barrier's k-th instance pairs every live wave's k-th
+/// `s_barrier`, whichever instruction it is, so these are the phases a thread can be in there.
+fn barrier_phases(p: &Program) -> Vec<Option<u64>> {
+    let n = p.blocks.len();
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut entry: Vec<Option<u64>> = vec![Some(0); n];
+    loop {
+        let mut changed = false;
+        for &b in &order {
+            let mut m = Some(u64::from(b == 0));
+            for &q in &p.blocks[b].preds {
+                let k = p.blocks[q].insts.iter().filter(|x| x.name() == "s_barrier").count() as u32;
+                let out = entry[q].and_then(|e| shift_phases(e, k));
+                m = m.zip(out).map(|(a, o)| a | o);
+            }
+            if m != entry[b] {
+                entry[b] = m;
+                changed = true;
+            }
+        }
+        if !changed {
+            return entry;
+        }
+    }
+}
+
 /// SCC values that can differ between the host waves of one console wave:
 /// those computed from a `v_readfirstlane_b32` result, which each host wave
-/// reads of its own first lane.
-fn split_scc(p: &Program) -> Set<Value> {
+/// reads of its own first lane, unless what it reads is one of `alike`.
+fn split_scc(p: &Program, alike: &Set<Value>) -> Set<Value> {
+    let first_lane_apart = |i: &Inst| {
+        i.name() == "v_readfirstlane_b32"
+            && !matches!(&i.fields, Fields::Valu(v) if matches!(v.src.first(),
+                Some(&Operand::Vector { reg, .. })
+                    if i.read(Reg::V(reg)).is_some_and(|x| alike.contains(&x))))
+    };
     let mut from = Set::default();
     loop {
         let n = from.len();
@@ -14324,7 +14525,7 @@ fn split_scc(p: &Program) -> Set<Value> {
                 }
             }
             for i in &b.insts {
-                if i.name() == "v_readfirstlane_b32" || i.reads.iter().any(|r| from.contains(&r.1)) {
+                if first_lane_apart(i) || i.reads.iter().any(|r| from.contains(&r.1)) {
                     from.extend(i.writes.iter().map(|w| w.1));
                 }
             }
@@ -14341,7 +14542,7 @@ fn split_scc(p: &Program) -> Set<Value> {
 /// so do its host waves: no SCC from [`split_scc`]).
 pub(crate) fn wave_blocks(p: &Program, st: &Structured) -> Vec<bool> {
     let n = p.blocks.len();
-    let split = split_scc(p);
+    let split = split_scc(p, &Set::default());
     let mut once = once_blocks(p);
     for (b, once) in once.iter_mut().enumerate() {
         let mut seen = vec![false; n];

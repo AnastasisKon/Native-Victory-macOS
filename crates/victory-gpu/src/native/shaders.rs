@@ -63,9 +63,12 @@ pub fn read_kept(file: &std::path::Path) -> Option<Vec<u8>> {
 /// [`victory_shader::emit::translate_with`] through the on-disk cache (`shader_cache::native_shader`):
 /// `o` is part of the key.
 fn translate_cached(container: &[u8], o: Options) -> Result<HostShader, String> {
-    crate::shader_cache::native_shader(container, &format!("{o:?}"), |c| {
+    #[cfg(any(windows, target_os = "macos"))]
+    return crate::shader_cache::native_shader(container, &format!("{o:?}"), |c| {
         victory_shader::emit::translate_with(c, o).map_err(|e| e.to_string())
-    })
+    });
+    #[cfg(not(any(windows, target_os = "macos")))]
+    return victory_shader::emit::translate_with(container, o).map_err(|e| e.to_string());
 }
 
 /// A compute shader's container translated for dispatches of thread counts
@@ -88,7 +91,13 @@ pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u
 /// Whether [`translate_extra`]'s translation is in the disk cache already.
 pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> bool {
     let o = Options { rect_list: rect, extra_params: extra, copy_params, ..options() };
-    crate::shader_cache::native_present(container, &format!("{o:?}"))
+    #[cfg(any(windows, target_os = "macos"))]
+    return crate::shader_cache::native_present(container, &format!("{o:?}"));
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (container, rect, extra, copy_params, o);
+        false
+    }
 }
 
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
@@ -310,15 +319,19 @@ impl<B: PresentBackend> Title<B> {
         if env_set!("VICTORY_TRACE_PIPES") {
             tracing::info!(name, stencil = ?g.stencil(), depth = ?g.depth_test(), ?color_state, "guessed pipeline state");
         }
-        let vs_binding = Binding { name: name.into(), ..Binding::of(vs) };
-        let ps_binding = ps
-            .map(|ps| Binding { name: name.into(), ..Binding::of(ps) })
-            .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
+        let ps_full = ps.map(|ps| Binding { name: name.into(), ..Binding::of(ps) });
+        let mut vs_binding = Binding { name: name.into(), ..Binding::of(vs) };
+        if let Some(p) = &ps_full {
+            vs_binding.typed_buffers |= p.typed_buffers;
+            vs_binding.heap_typed_buffers |= p.heap_typed_buffers;
+        }
         // As for compute: without the host's layout the converter makes the user-data block a
         // root CBV (a pointer), while the host writes its dwords inline, so the shader reads its
         // user data (descriptor table offsets, root constants) from address 0.
         let vs_layout = vs_binding.layout();
-        let ps_layout = ps.map(Binding::of).and_then(|b| b.layout());
+        let ps_layout = ps_full.as_ref().and_then(Binding::layout);
+        let ps_binding = ps_full
+            .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
         let desc = RenderPipelineDesc {
             vs: &vs.dxil,
             ps: ps.map(|p| &p.dxil[..]),

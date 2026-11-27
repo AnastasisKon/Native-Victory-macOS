@@ -125,6 +125,42 @@ pub fn format(dxgi: u32) -> Option<Format> {
     })
 }
 
+/// The view-stride table's dword for `view` (`victory_shader::emit`, "Buffer views at computed
+/// heap indices"; what `descriptor::host::view_stride` and `view_kind` give the D3D12 host): a
+/// buffer view's element size in bytes (its structure stride, 4 for a raw view or a constant
+/// buffer, else its format's element size; at least 1), with `VIEW_INTEGER` (and `VIEW_SIGNED`)
+/// for a typed view of an integer format. 0 for anything [`decode`] makes no buffer of: a shader
+/// that takes a buffer at a heap index it computes reads the null view there.
+pub(super) fn stride_word<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> u32 {
+    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS};
+    let buffer = |r: &usize| matches!(resources.get(r), Some(Res::Buffer(..)));
+    let (format, stride, flags) = match view {
+        View::Constant(..) => return 4,
+        View::Shader(r, Some(d)) if d[1] == BUFFER && buffer(r) => (d[0], d[7], d[8]),
+        View::Unordered(r, _, Some(d)) if d[1] == BUFFER && buffer(r) => (d[0], d[5], d[8]),
+        View::Placed(true, res, d) if res[0] == BUFFER => (d[0], d[5], d[8]),
+        View::Placed(false, res, d) if res[0] == BUFFER => (d[0], d[7], d[8]),
+        // A whole buffer: raw.
+        View::Shader(r, None) | View::Unordered(r, _, None) if buffer(r) => return 4,
+        _ => return 0,
+    };
+    if stride > 0 {
+        return stride & VIEW_STRIDE_BITS;
+    }
+    if flags & FLAG_RAW != 0 {
+        return 4;
+    }
+    let format = crate::resource::pc_format(format);
+    let element = crate::resource::element(format).map_or(0, |(bytes, _)| bytes).max(1) as u32;
+    // `UINT` and `SINT` formats (the D3D12 host's `integer_format`).
+    let kind = match format {
+        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => VIEW_INTEGER,
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => VIEW_INTEGER | VIEW_SIGNED,
+        _ => 0,
+    };
+    element | kind
+}
+
 /// Object and placed views have the same SRV/UAV union layout.
 fn texture_view(resource: usize, unordered: bool, d: &[u32]) -> Option<Decoded> {
     let (mips, layers) = if unordered {
@@ -277,8 +313,101 @@ fn sampler(f: &crate::sampler::Fields) -> Decoded {
     }
 }
 
+/// The `texture_buffer` `(format, writable, explicit)` of `view` when shaders may access it with
+/// `buffer_load_format_*` / `buffer_store_format_*` (`explicit` is `true` for typed buffer views
+/// with `stride == 0`, `false` for 4-, 8-, and 16-byte structured buffer views).
+pub(super) fn typed_buffer<T>(
+    view: &View,
+    resources: &HashMap<usize, Res<T>>,
+) -> Option<(Format, bool, bool)> {
+    let buffer = |r: &usize| matches!(resources.get(r), Some(Res::Buffer(..)));
+    let (dxgi, stride, flags, writable) = match view {
+        View::Shader(r, Some(d)) if d[1] == BUFFER && buffer(r) => (d[0], d[7], d[8], false),
+        View::Unordered(r, _, Some(d)) if d[1] == BUFFER && buffer(r) => (d[0], d[5], d[8], true),
+        View::Placed(true, res, d) if res[0] == BUFFER => (d[0], d[5], d[8], true),
+        View::Placed(false, res, d) if res[0] == BUFFER => (d[0], d[7], d[8], false),
+        _ => return None,
+    };
+    if flags & FLAG_RAW != 0 {
+        return None;
+    }
+    if stride > 0 {
+        // Guess: on RDNA2 a structured buffer V# of 4-, 8-, or 16-byte elements carries a 1-, 2-,
+        // or 4-dword 32-bit data format, so shaders may access it with `buffer_load_format_*` or
+        // `buffer_store_format_*` as well as `buffer_load_dword*` / `buffer_store_dword*`.
+        // Materialized lazily only when a bound shader uses DXIL `TypedBuffer` operations.
+        let fmt = match stride {
+            4 => Format::R32Float,
+            8 => Format::Rg32Float,
+            16 => Format::Rgba32Float,
+            _ => return None,
+        };
+        return Some((fmt, writable, false));
+    }
+    let fmt = match crate::resource::pc_format(dxgi) {
+        // `victory-shader` lowers all formatted buffer loads and stores through float-typed DXIL
+        // handles (`TypedBuffer<float4>`, `bitcast i32 <-> float`), while Metal's texture hardware
+        // unpacks/packs according to the `MTLTexture` view's `MTLPixelFormat`. For 32-bit `SINT`
+        // (`4`, `18`, `43`) there is no sub-32-bit sign extension or clamping, so `Uint` transfers
+        // all 32 two's-complement bits identically; 8- and 16-bit `SINT` stay out because `Uint`
+        // would zero-extend instead of sign-extending.
+        4 => Format::Rgba32Uint,
+        12 => Format::Rgba16Uint,
+        18 => Format::Rg32Uint,
+        25 => Format::Rgb10a2Uint,
+        31 => Format::Rgba8Snorm,
+        37 => Format::Rg16Snorm,
+        43 => Format::R32Uint,
+        58 => Format::R16Snorm,
+        63 => Format::R8Snorm,
+        _ => format(dxgi)?,
+    };
+    Some((fmt, writable, true))
+}
+
 #[cfg(test)]
 mod tests {
+    /// The view-stride table's dwords: a structured view's stride, 4 for raw and constant
+    /// views, a typed view's element size with its integer kind, and 0 for what is no buffer view
+    /// (a texture view, a view of an object the host has no buffer for).
+    #[test]
+    fn stride_words_of_buffer_views() {
+        use super::{BUFFER, FLAG_RAW, Res, TEXTURE_2D, stride_word};
+        use crate::descriptor::View;
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        let resources: std::collections::HashMap<usize, Res<()>> = [(7, Res::Buffer(0x1000, 0x1000)), (9, Res::Texture(()))].into();
+        let word = |view: View| stride_word(&view, &resources);
+        let srv = |format: u32, dimension: u32, stride: u32, flags: u32| {
+            let mut d = [0u32; 10];
+            (d[0], d[1], d[6], d[7], d[8]) = (format, dimension, 16, stride, flags);
+            d
+        };
+        let uav = |format: u32, stride: u32, flags: u32| {
+            let mut d = [0u32; 10];
+            (d[0], d[1], d[4], d[5], d[8]) = (format, BUFFER, 16, stride, flags);
+            d
+        };
+        assert_eq!(word(View::Constant(0x1000, 256)), 4);
+        assert_eq!(word(View::Shader(7, Some(srv(0, BUFFER, 48, 0)))), 48);
+        assert_eq!(word(View::Shader(7, Some(srv(39, BUFFER, 0, FLAG_RAW)))), 4);
+        assert_eq!(word(View::Shader(7, None)), 4);
+        assert_eq!(word(View::Unordered(7, 0, Some(uav(42, 0, 0)))), 4 | VIEW_INTEGER, "R32_UINT");
+        assert_eq!(word(View::Unordered(7, 0, Some(uav(59, 0, 0)))), 2 | VIEW_INTEGER | VIEW_SIGNED, "R16_SINT");
+        assert_eq!(word(View::Unordered(7, 0, Some(uav(2, 0, 0)))), 16, "R32G32B32A32_FLOAT");
+        // Not buffer views: a texture view, a whole texture, a buffer view of an object the host
+        // does not know.
+        assert_eq!(word(View::Shader(7, Some(srv(28, TEXTURE_2D, 0, 0)))), 0);
+        assert_eq!(word(View::Shader(9, None)), 0);
+        assert_eq!(word(View::Shader(8, Some(srv(0, BUFFER, 48, 0)))), 0);
+        let mut resource = [0u32; 14];
+        resource[0] = BUFFER;
+        let mut placed = [0u32; 16];
+        placed[..10].copy_from_slice(&uav(0, 12, 0));
+        assert_eq!(word(View::Placed(true, resource, placed)), 12);
+        resource[0] = 3;
+        assert_eq!(word(View::Placed(true, resource, placed)), 0);
+    }
+
     #[test]
     fn host_formats_have_the_title_formats_element_size() {
         for dxgi in [2, 3, 10, 11, 13, 16, 17, 24, 26, 28, 30, 34, 35, 36, 41, 42, 49, 50, 51, 53, 54, 55, 56, 57, 61, 62, 65, 67, 71, 72, 77, 78, 86, 91, 98, 99, 115] {
@@ -560,5 +689,56 @@ mod tests {
             desc.address,
             [Address::Wrap, Address::Mirror, Address::Clamp]
         );
+    }
+
+    #[test]
+    fn typed_and_structured_buffer_views_carry_texture_buffer_formats() {
+        let resources = Resources::from([(8, Res::Buffer(0x1000, 4096))]);
+        let srv = |fmt, stride, flags| {
+            let mut d = [0u32; 10];
+            (d[0], d[1], d[6], d[7], d[8]) = (fmt, BUFFER, 8, stride, flags);
+            View::Shader(8, Some(d))
+        };
+        let uav = |fmt, stride, flags| {
+            let mut d = [0u32; 10];
+            (d[0], d[1], d[4], d[5], d[8]) = (fmt, BUFFER, 8, stride, flags);
+            View::Unordered(8, 0, Some(d))
+        };
+        assert_eq!(
+            super::typed_buffer(&srv(0, 16, 0), &resources),
+            Some((Format::Rgba32Float, false, false))
+        );
+        assert_eq!(
+            super::typed_buffer(&uav(0, 8, 0), &resources),
+            Some((Format::Rg32Float, true, false))
+        );
+        assert_eq!(
+            super::typed_buffer(&srv(0, 4, 0), &resources),
+            Some((Format::R32Float, false, false))
+        );
+        assert_eq!(super::typed_buffer(&uav(0, 12, 0), &resources), None);
+        assert_eq!(super::typed_buffer(&uav(41, 0, FLAG_RAW), &resources), None);
+        assert_eq!(super::typed_buffer(&View::Constant(0x1000, 256), &resources), None);
+        // Typed-buffer-only DXGI formats decode on buffers without turning into texture formats.
+        assert_eq!(super::format(12), None);
+        assert_eq!(
+            super::typed_buffer(&uav(12, 0, 0), &resources),
+            Some((Format::Rgba16Uint, true, true))
+        );
+        assert_eq!(
+            super::typed_buffer(&srv(4, 0, 0), &resources),
+            Some((Format::Rgba32Uint, false, true))
+        );
+        // Sub-32-bit SINT formats stay unmapped so Uint does not zero-extend signed channels.
+        for sint in [14, 32, 38, 52, 59, 64] {
+            assert_eq!(super::typed_buffer(&srv(sint, 0, 0), &resources), None, "DXGI {sint}");
+        }
+        for dxgi in [12, 25, 31, 37, 58, 63] {
+            let (fmt, _, explicit) =
+                super::typed_buffer(&srv(dxgi, 0, 0), &resources).expect("typed buffer format");
+            assert!(explicit, "DXGI {dxgi}");
+            let (bytes, block) = crate::resource::element(dxgi).expect("title element");
+            assert_eq!(fmt.block(), (block as usize, bytes as usize), "DXGI {dxgi}");
+        }
     }
 }

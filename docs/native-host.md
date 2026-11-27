@@ -52,7 +52,7 @@ Setup prerequisites and its build are stubbed; no game or SDK files are needed.
 | Media Foundation (`host_posix/mf.rs`) | `MFStartup`/`MFShutdown`/`MFGetSystemTime` work; `MFCreateAttributes`, `MFCreateMediaType`, `MFCreateSourceResolver` and the source readers fail with `MF_E_UNSUPPORTED_BYTESTREAM_TYPE` and a null object, so a title skips its video paths. No COM objects; AVFoundation is the way to a real reader |
 | Audio decoder (`xapu.dll`, `modules::apu`) | Done on macOS: the same module as on Windows, its result event is a `host_posix` event handle |
 | Spatial audio (`host_posix/wasapi/spatial.rs`, over `wasapi.rs`) | `ISpatialAudioClient` on the default render device: the title's objects are mixed to stereo in 10 ms passes into the queue the CoreAudio `AudioQueue` plays. The title's event is set by a clock of the stream's own (`Shared::tick`): a period apart, half a period apart while fewer than three periods are queued, and not at all while five are. The device does not set it: CoreAudio takes frames in cycles of its own (512 frames at 48 kHz on the Mac measured), so it asks for 10 ms buffers 10.7 ms apart with two back to back every 160 ms, and one event for those two left a period of silence. Panning is by azimuth only. |
-| XAudio2 (`host_posix/xaudio2.rs`, `mixer.rs`, `coreaudio.rs`) | `XAudio2Create` (ordinal 1) returns a bridged `extern "win64"` `IXAudio2`. The bridge follows the Windows SDK’s one-byte packing. On x64, a 44-byte source buffer carries its callback context at byte 36, and a 20-byte voice state returns the sample count at byte 12. PCM and float source voices support buffer queues, loops, volume, channel volumes, output matrices and frequency ratios. The float mixer runs roughly 10 ms passes on the CoreAudio `AudioQueue` thread or the silent clock. Each pass calls registered engine start callbacks in order, source voice start callbacks with the byte shortfall, then voice and engine end callbacks after mixing. `StopEngine` pauses passes and `StartEngine` resumes them. Buffer, loop and stream notices still use the callback worker. A runtime queue enqueue failure raises `OnCriticalError`. `OnVoiceError` awaits a decoder that can fail during mixing. Effects, filters, full submix mixing and ADPCM/XMA/xWMA sources remain future work. |
+| XAudio2 (`host_posix/xaudio2.rs`, `mixer.rs`, `coreaudio.rs`) | `XAudio2Create` (ordinal 1) returns a bridged `extern "win64"` `IXAudio2`. The bridge follows the Windows SDK’s one-byte packing. On x64, a 44-byte source buffer carries its callback context at byte 36, and a 20-byte voice state returns the sample count at byte 12. PCM and float source voices support buffer queues, loops, volume, channel volumes, output matrices and frequency ratios. The float mixer runs roughly 10 ms passes on the CoreAudio `AudioQueue` thread or the silent clock (`AudioQueueStart` is tried three times, 250 ms apart, before the silent clock takes over: a mid-run re-creation of the engine failed it once with OSStatus 'what' while the output device was changing, and the sound went silent for the rest of the run, #140). Each pass calls registered engine start callbacks in order, source voice start callbacks with the byte shortfall, then voice and engine end callbacks after mixing. `StopEngine` pauses passes and `StartEngine` resumes them. Buffer, loop and stream notices still use the callback worker. A runtime queue enqueue failure raises `OnCriticalError`. `OnVoiceError` awaits a decoder that can fail during mixing. Effects, filters, full submix mixing and ADPCM/XMA/xWMA sources remain future work. |
 | Graphics objects and window on macOS | Done (`victory-gpu` native host on Metal, see `docs/metal-backend.md`): every object `D3D12XboxCreateDevice` and its methods hand out passes `object::answer`, which gives it a bridged method table (`object::set_bridge`, set by `apps/victory/src/native_run.rs` from `victory_loader::native`; the table's length sits just before its first slot, `ClearDepthStencilView` is `extern "win64"` for its float). Slots nobody wrote log once and answer `E_NOTIMPL`. The runtime's physical-memory observer forwards to `native::pool_observer()`, fence events to `posix::set_event`. `victory run --execute` opens an `NSWindow` (1920x1080, "VIctory") over the host's `CAMetalLayer` on the main thread (`apps/victory/src/window.rs`, AppKit through `objc2::msg_send!`, a hand-driven event loop) while the title runs on its own threads; closing it exits the process. `--headless` presents into an offscreen layer instead |
 | Remaining Win32 call sites in `victory-hle` and `victory-gpu` moved to the seam | Not started |
 
@@ -66,6 +66,8 @@ WINE=... tools/macos/test-wine.sh -p victory-platform # the same conformance tes
 ```
 
 `crates/victory-hle/tests/native_probe.rs` builds `tests/fixtures/native-probe/probe.c` with `tools/macos/build-native-probe.sh` (the gnullvm clang and lld, no CRT), maps it, binds it, runs it, and checks 16 things the probe reports in its exit code. The probe also imports a second fixture, `probe_dll.c` (built beside it as `victory-probe-dll.dll`): the test maps it with `native::dll`, and `probe_dll` checks its `DllMain` and TLS callback order, per-thread static TLS, thread notices, an exception raised in the DLL unwinding through its `__finally` to a handler in the exe (and from the exe to a handler in the DLL), and `GetModuleHandle`/`GetProcAddress` by name. The C++ runtime is not ours to build, so the throw is a Windows exception through `__C_specific_handler`, not `_CxxThrowException` through `__CxxFrameHandler`.
+
+`victory-gpu`'s `memory` module and its tests are `#[cfg(windows)]` (`src/lib.rs`), so on macOS `cargo test -p victory-gpu memory::` runs 0 tests and passes; only CI's Windows job (`cargo test --workspace` on WARP) checks them. The two that compile pipelines and submit through the registered copies (`lists_share_a_table_and_copies_keep_their_views`, `a_submission_that_missed_leaves_the_copies_at_once`) hold one test lock, since together they once failed in `CreateRootSignature` and they share the copies' registry and frame counter.
 
 The native probe's waits check must run as `x86_64-apple-darwin` (under Rosetta
 on Apple Silicon); the arm64 binary only runs its two image-mapping tests.
@@ -314,7 +316,7 @@ Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread 
 
 ### The C runtime (`host_posix/ucrt`)
 
-`api-ms-win-crt-*.dll` and `ucrtbase.dll` resolve to Rust functions over libSystem, tried before kernel32's table. `vcruntime140*` and `msvcp140*` are not served by name: the title's own copies (C++ runtime, `__CxxFrameHandler`) are loaded from its folder; only `vcruntime140`'s kernel-table functions (`__C_specific_handler`) fall back to the host when the title ships none. The HLE `exit` runs the `atexit`/`onexit` handlers and flushes streams before ending the process on this path (`abort`/`terminate` do not). A title linked against the dynamic UCRT needs nothing else of it. The rules that matter:
+`api-ms-win-crt-*.dll` and `ucrtbase.dll` resolve to Rust functions over libSystem, tried before kernel32's table. `msvcp140*` is not served by name: the title's own copy (C++ runtime, `__CxxFrameHandler`) is loaded from its folder. `vcruntime140`'s own copy is loaded the same way when it ships one; when it ships none, the host falls back to `vcruntime140`'s kernel-table functions (`__C_specific_handler`) and, since the ucrt serves it then, its memory and string functions (`memset`, `memcpy`, ...; #104) too. The HLE `exit` runs the `atexit`/`onexit` handlers and flushes streams before ending the process on this path (`abort`/`terminate` do not). A title linked against the dynamic UCRT needs nothing else of it. The rules that matter:
 
 - `wchar_t` is two bytes: wide strings are UTF-16 and the host's `wcs*` is never called. Narrow strings are UTF-8; `mbstowcs` and `wcstombs` convert, and fail with `EILSEQ` on a bad sequence or a lone surrogate.
 - The counted copies (`strncpy`, `strncat`, their `wcs` and `_s` forms) read no further than their count: a counted source need not hold a NUL within it, such as a fixed-size field. The `_s` forms also stop at the room left in the destination (that many units without a NUL is already `ERANGE`), and an error empties the whole destination, as the CRT does, so a failed `strcat_s` leaves no old string.
@@ -330,7 +332,7 @@ Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread 
 - `rand` is the CRT's linear generator, per thread, seed 1: `srand(1)` gives 41, 18467, 6334 as on Windows.
 - `argv`, `argc`, the command line and the environment come from the host process, or from `victory_hle::posix::set_command_line` (call it before the title's start-up code runs).
 
-Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C locale's). A failed invalid-parameter check calls the title's handler if it set one and returns the error; it does not terminate. `_endthread(ex)` is not served (it needs an exit primitive in the loader's thread spawn); `_get_osfhandle`/`_open_osfhandle`, `_ecvt`/`_fcvt`/`_gcvt`, positional `%1$d` formats and the `_mbs*` multibyte-string family are not either. `ucrt::tests::every_ucrt_import_of_a_dry_run_is_served` checks a `--list-imports` output when `VICTORY_UCRT_IMPORTS` names it. The probe (`probe_ucrt` in `tests/fixtures/native-probe/probe.c`) links `ucrtbase.dll` and `api-ms-win-crt-math-l1-1-0.dll` and runs 17 checks under Rosetta.
+Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C locale's). `vcruntime140*.dll` is served from the ucrt too when the title ships no DLL of that name, so its `memcpy`, `memset` and friends run (they came back as no-op stubs in a failed load, #104); what the ucrt has not still falls through to the host's kernel table (`__C_specific_handler` and the exception functions). A failed invalid-parameter check calls the title's handler if it set one and returns the error; it does not terminate. `_endthread(ex)` is not served (it needs an exit primitive in the loader's thread spawn); `_get_osfhandle`/`_open_osfhandle`, `_ecvt`/`_fcvt`/`_gcvt`, positional `%1$d` formats and the `_mbs*` multibyte-string family are not either. `ucrt::tests::every_ucrt_import_of_a_dry_run_is_served` checks a `--list-imports` output when `VICTORY_UCRT_IMPORTS` names it. The probe (`probe_ucrt` in `tests/fixtures/native-probe/probe.c`) links `ucrtbase.dll` and `api-ms-win-crt-math-l1-1-0.dll` and runs 17 checks under Rosetta.
 
 ## Descriptors changed after loading
 
@@ -426,8 +428,9 @@ A lane mask read as a number is the ballot of its lanes' bits where it is writte
 
 On by default; `VICTORY_NO_SHADER_CACHE=1` turns it off (an empty value or `0` leaves it on). Everything lives under the cache folder (`cache_subdir("native-shaders")`, for example `~/.cache/victory/native-shaders/<translator>/`), never in the repo, and is never sent anywhere. Three layers, each written to a temporary name and renamed:
 
-- **Translations** (`translated/`, `victory_gpu::shader_cache::native_shader`): the `HostShader` of a console container, including `table_entries` and `splits`, keyed by the container's bytes, the translation `Options` (rectangle lists, extra and copied parameters), and the build key (`victory_shader::SOURCE_HASH`, the text of `shader_cache.rs` which defines the encoding, the loop limit). The folder is named by the start of the build key, so a changed translator reads nothing old and old folders can be deleted whole. It is the same store and encoding as the Wine path's (`use_shader_cache`), in its own folder; the encoding now carries `table_entries` and `splits` too. A refusal is stored with its reason.
+- **Translations** (`translated/`, `victory_gpu::shader_cache::native_shader`): the `HostShader` of a console container, including `table_entries` and `splits`, keyed by the container's bytes, the translation `Options` (rectangle lists, extra and copied parameters), and the build key (`victory_shader::SOURCE_HASH`, the text of `shader_cache.rs` which defines the encoding, the loop limit, and the translator's environment switches that are set, `victory_shader::emit::TRANSLATION_SWITCHES`: `VICTORY_DEBUG_*` and `VICTORY_NO_LOCKSTEP`). Before the switches were in the key, a debug switch did nothing on a warm cache, and a translation made with one was served to later runs without it. The folder is named by the start of the build key, so a changed translator reads nothing old and old folders can be deleted whole. It is the same store and encoding as the Wine path's (`use_shader_cache`), in its own folder; the encoding now carries `table_entries` and `splits` too. A refusal is stored with its reason.
 - **Libraries** (`metal/`, `victory_metal::disk`): the converter's metallib and shader stage, keyed by the DXIL, the root layout, the entry name, the format and the converter itself (its path, size and modification time). Each file has a magic and a checksum; a damaged file is a miss and is converted again.
+- **Which converter.** At start-up the log names the converter it loaded (`metal: shader converter <path> <size> <mtime> (from VICTORY_MSC_DYLIB | the installed default)`, `msc::load_note`) and warns when it is not `/usr/local/lib/libmetalirconverter.dylib`. A tester's run with the copy bundled with Unreal Engine 5.6 (strings say `D3DRendererMetal-30.2`) drew the loading screen's panels but no logo or art, with no refusal or GPU error; Apple's 4.0 beta 3 package drew it (#295; which draws differ is not known). No version is logged because the library gives none: its Mach-O current version is 0.0.0, and the C API (`metal_irconverter.h`) has no version call. Because the library cache's keys hold the converter's path, size and modification time, two converters never share cached metallibs. Tests: `msc::tests`.
 - **Pipeline states** (`metal/pipelines-<gpu>.metalarchive`, `victory_metal::archive`): an `MTLBinaryArchive` of the compiled compute, render and mesh pipelines. A pipeline is looked up with `FailOnBinaryArchiveMiss`; on a miss it is compiled as before and added. A `pipeline-archive` thread serialises the archive every 5 s while pipelines are added (a write takes about half a second, and a cold world frame's thread waited for 21 of them, 10 s), and the backend does when it drops. Metal refuses an archive from another GPU or OS version; it is then replaced by an empty one. Limit: a run killed within 5 s of its last new pipeline loses those pipelines. Guess, marked in the code: Apple does not say an archive may be added to while another thread reads it, so adds hold a lock that lookups and the write share (`Archive::changing`), and a compile after a miss does not name the archive.
 - **Pipelines off the frame** (`Metal::create_compute_pipeline_within`, `create_render_pipeline_within`, `metal::within`, `Title::compile_wait`): a cold first world frame made about 210 compute pipelines one after another on the render thread, 97 s of Metal compiles and 10 s of library conversions in a 122 s pause; with only those moved off it, the same frame still ran into the title's 30 s watchdog on the library conversions and compiles of some 800 render and mesh pipelines. Every compute, render and mesh pipeline is now converted and compiled on a `pipeline-compile` thread (as many as cores, taking the pipeline asked for last first: that is the one a frame may be waiting for), and the device has `shouldMaximizeConcurrentCompilation` on. The frame that first asks for a pipeline waits for it only while it has budget left (`prewarm::FrameBudget`, the 10 s of the translations above); past it, it waits 20 ms a pipeline, which is enough for one the disk cache and the archive hold, so a warm frame that outlasts its budget still puts none off, until one is not made in that time; then not at all (`glue::compile_wait`; 20 ms each for 800 would be 16 s, and a fixed 2 s of them made each later cold frame 12 s instead of 10). A guessed pipeline is logged (`guessed pipeline`) once it is made, not at each draw that asks for it meanwhile. Past that the draw or dispatch is dropped that time, nothing is cached (`ShaderStats::put_off`), and a later one picks the pipeline up once it is made, without waiting (a first version waited again inside each later frame's budget, and the frames after the first stalled 10 s each in turn); the ones put off compile side by side meanwhile. The log says `pipelines put off for their compiles so far put_off=<n>` at each power of two. As with translations this is a host policy, not console behaviour: a pass the title runs once in such a frame stays undone. The 10 s compile deadline and crash memory of render pipelines cover compute and mesh pipelines too (#243); the deadline is 60 s now that compiles run side by side off the frame (a cold world frame's took up to 15 s each), and the slow-compile and at-submission archive writes of #243 are the `pipeline-archive` thread's. Tests: `metal::tests::a_pipeline_still_compiling_is_picked_up_later`, `shader_tests::a_compute_pipeline_put_off_is_made_by_a_later_use`, `shader_tests::render_pipelines_come_from_the_translated_shaders_and_the_streams_state`.
 - **Old builds** are deleted: each run stamps its build folder (`last-used`), and a background thread at start-up deletes all but the three used last, its own always kept, and never one stamped within the hour (both `game-run.sh` slots share one cache folder, so another run may still be using it) (`shader_cache::prune`; each is about 400 MB). Only folders named by 16 hex digits are touched. The Wine path's folders are not pruned, since asking Wine for file times has hung its workers (#50). Test: `shader_cache::tests::old_build_folders_are_pruned`.
@@ -498,6 +501,7 @@ Off by default, environment variables of the host process. The native host's swi
 - `VICTORY_COUNT_GREEN=1`: each presented frame has nine pixels copied out after it is drawn (`victory_metal::present`); a frame whose pixels are mostly pure green (zero YCbCr planes, a movie frame sampled blank) is counted. Once a second stderr gets `present pacing t=<s> presents=<n> longest_ms=<gap> green=<n> partly_green=<n> green_total=<n>`: presents in that second, the longest gap between two, and green frames. Costs one small blit a frame.
 - `VICTORY_TRACE_FAILS=1`: every title-to-host call of a bridged method table (the COM-style objects) whose result in `eax` is negative is logged with the object area, the slot offset, `this` and the title's calling address as an offset into the image (`from`). A method returning a pointer or a count shows up as noise. `=2` logs every such call.
 - `VICTORY_PROFILE=<secs>`: times every title-to-host call (imports and the methods of bridged objects: count, total and longest, by `rdtsc` in the bridge) and logs the 40 with the longest total every that many seconds. Time inside a call includes waiting for the host's locks and any title code it calls back, so methods that are long everywhere (all of `0x118`, `0x428`, `0xc0` at about 150 ms) point at a lock someone else holds (here the native host's `TITLE` lock, held by `sync_textures`).
+- `VICTORY_TRACE_HEAP_SET=<frames>`: every 64 frames, with the native-draws line, what the descriptor heaps' residency sets hold: textures and buffers apart, each allocation counted once over all heaps: all of them, those no table a draw or dispatch bound has named for that many frames (`idle_*`; each entry's last use is noted where tables are remirrored, `NativeHeap::used`), and those never named by one (`never_*`). Entries a shader reaches by indexing the heap itself are never seen, so `idle` and `never` are upper bounds. Measures what an eviction of idle allocations from the sets could save (#79).
 - `VICTORY_TRACE_GPU_FAILS=1`: on macOS, command buffers are made with encoder execution status, labelled (`q<queue> #<serial> t=<secs> waits signals passes`) and so are their encoders (compute: pipeline name and group counts per dispatch; render: draw count; blit: op count), and a command buffer the GPU fails is logged with `tracing::warn!` (timestamped, up to 200) with each encoder's label and state (Completed, Pending, Faulted, Affected). Without it the first 20 failures are an untimestamped `eprintln!`. It also logs each command buffer that took over 1 s to complete (`metal: slow command buffer`, with GPU and kernel times) and, at each submission, each one still in flight after 3 s (`metal: command buffer in flight`, once each; both capped at 100 lines). While work stays held (the `work held for a wait that does not hold` warning, when nothing is submitted any more) the same in-flight report is made, with a line giving how many command buffers are in flight, each queue whose order event is behind the command buffers encoded with it (`queue <title queue> at <reached> of <encoded>`), and the commands dropped so far at unmapped memory.
 - `VICTORY_TRACE_WRITES=1`: on macOS, a warning for every bottom-of-pipe value write a list records (value, address, whether a pool holds it, the list), every memory-value wait (address, comparison, reference, the list) and every `ExecuteCommandLists` (queue and lists): which list of which queue owes the word another queue waits for. About 100 lines a world frame. Without it, a value write the host has to drop (its address in no mapped pool, or not preparable) is still a warning, once per page (`native host drops a value write`): a queue may wait for that word for good.
 - `VICTORY_TRACE_TEXTURE_SYNC=1`: on macOS, once a second, what keeping the host's textures in step with title memory cost (`texture sync in the last ..`): the submissions that read textures (batches), the textures and MiB they read (those never uploaded before, those read and found unchanged, the blank ones, those with memory that could not be read at once), the time under the host's lock (probing the hot textures, with how many of them went to be read whole; probing the blank ones; uploading), the time the submitting thread spent reading without the lock and the reading threads' time by step (read, hash, detile), and the placements that replaced another at their address (with how many of those had been at that address before). See "Texture sync without the host's lock".
@@ -506,11 +510,12 @@ Off by default, environment variables of the host process. The native host's swi
 - `VICTORY_TRACE_IMPORTS=1`: the same for every import bound to a host function (name and DLL), whatever the result. Slow (millions of lines in a title's startup).
 - `VICTORY_KEYS=<seconds>:<key>,...`: on macOS, scripted input next to the live keyboard (below; the two are OR-ed): each key is held for 0.2 s that long after `GameInputCreate`, and drives the stand-in pad (`Enter` is A, `Esc` is B, `Tab` is Menu; letters, digits, `Tab`, `Back` and the arrows as in the README). **Live keys (windowed run):** `window.rs` takes key-down and key-up events (macOS key codes, not characters; Cmd shortcuts are left to AppKit) and calls `gameinput::set_live_key` with the Windows virtual key; the macOS `Source::keys` returns them with the scripted ones, so the stand-in pad (`FALLBACK_BUTTONS`, shared with Windows) sees both. Held while down, released on key-up or when the window loses key status. Enter or Space is A, Esc or Backspace B, X, Y, arrows the D-pad, W/A/S/D the left stick (I/J/K/L the right, F/H the stick clicks), Tab Menu, V View, Q/E the shoulders, Z/C the triggers. **Controllers (windowed run):** while the window has key status, each loop turn `window.rs` reads one `GCController`: `GCController.current` (the one used last) when it has an `extendedGamepad`, otherwise the first connected one that has. The Xbox layout comes from the extended gamepad's elements, so a DualShock 4 (`GCDualShockGamepad`) and a DualSense (`GCDualSenseGamepad`) are read like an Xbox pad: Cross/Circle/Square/Triangle are A/B/X/Y, Options (`buttonMenu`) is Menu, Share (`buttonOptions`) is View. Those two profiles also have `touchpadButton` (found with `respondsToSelector:`), and its click is View too: our choice, as PlayStation titles use the touchpad for back and map. The PS button (`buttonHome`) is not mapped: GameInput has no Guide bit for titles, and macOS keeps it for its own overlay. `gameinput::set_live_pad` OR-s the result with the keyboard's stand-in pad. Each change of controller is logged once at info level (`controller: drives the pad`, with `vendor`, `category` such as `DualShock 4`, and `touchpad`). The window tests read a software gamepad (`+[GCController controllerWithExtendedGamepad]`, whose elements take `setValue:`), so the read path is checked without hardware. A headless run needs it to get past the title's engagement screen (below); `VICTORY_KEYS=$(seq 4 2 80 | sed 's/$/:Enter/' | paste -sd, -)` presses Enter every 2 s.
 - `VICTORY_HOLD_BYTE=<hex address>:<hex byte>`: keeps one byte of title memory at that value, rewritten every 250 ms. Off unless set. For the build we test, `1471b6330:1` holds the pause flag of the title's init watchdog: when init takes over 30 s (game files on a network share or a slow disk), the watchdog otherwise ends the run before the start screen. The address is for that build only.
+- `VICTORY_READ_CACHE=<dir>:<prefix>`: on macOS, keeps every 64 KiB block that DirectStorage reads from a file under `<prefix>` (checked after resolving links) in `<dir>`, as `<name>-<length>-<mtime>.data` (sparse) plus a `.map` with one byte per block, so a patched file gets a fresh entry, and a later run reads those blocks from local disk. For game files on a slow network share, where the first boot can spend minutes on reads. A missing block is fetched together with the missing blocks after it that the same read covers (up to 64). A run adds at most 12 GB; past that, reads go straight to the source. Each fetched run of blocks is synced before its map bytes are written, so a crash can lose blocks but never leave one marked present with no data. Nothing is evicted: delete `<dir>` to reclaim the space.
 - `VICTORY_DUMP_THREADS=0`: the thread dump (and `VICTORY_DUMP_MEM`, `VICTORY_FIND_QWORD`) is taken once, instead of after a time: when the title first hits an `int3` (its asserts, at the first chance), or at its first access violation that no handler takes (its fatal-error path writes to address 0), just before the unhandled-exception filter. An access violation that a title handler takes does not use the dump up. A thread of its own writes the dump while the faulting thread waits for it, for at most 60 s (a long `VICTORY_FIND_QWORD` scan may be cut short by a fatal fault). The faulting thread shows in it as in host code; its registers are in the first-chance log line. Each thread is stopped only while its registers and up to 1 MiB of its stack are copied, and is unwound from the copy once it runs again, so a thread stopped inside a lock (the unwind tables', the allocator's) cannot hang the dump; this holds for the timed dump too.
 - `VICTORY_FIND_QWORD=<hex>,<hex>,...` (with `VICTORY_DUMP_THREADS`): logs every aligned qword of resident readable memory equal to one of the values, with the 0x100 bytes from it; `@<hex>` stands for the qword at that address. Finds heap objects by their method table (data only).
 - `VICTORY_PEEK=rva,rva,...`: at the first-chance exception log, prints those qwords of the faulting image (an operand above `0x10000000` is an absolute address), the qwords `rcx` points at, and a call chain by the unwind tables. Use it with `llvm-objdump` on the title (analysis only).
 - `VICTORY_TRACE_OWNERS=1`: who made the memory that comes to share pages (#15), logged as a warning (`VICTORY_TRACE_OWNERS`) with both owners when it happens: a new physical page view over another view (`xmem_physical::record`; the mapping paths unmap first, so it should not happen), page numbers past the 25 bits Grand Theft Auto VI keeps (`number >> 4` in 21 bits) with the page whose number it would rebuild, `VirtualFree(MEM_DECOMMIT)` of a range that still shows views (`MEM_RELEASE` gives them back first, `forget_physical`), and a title mapping (`XMemMapPhysicalPages`, its scatter form, the GPU's `map_alias`) outside every region `VirtualAlloc` or `XMemVirtualAlloc` made (macOS only). Each owner is the public call that made it (the outermost one on that thread), its range, pool id and page index, a sequence number and the title's return address from the host call (`image+offset`; on other threads 0 or a stale one). Off, nothing is recorded: the cost is one read of the switch per view, allocation and free.
-- `VICTORY_TRACE_ROOT_SPAN[=<bytes>]`: root SRVs and UAVs whose title range stops being linear in its pool within `<bytes>` (default 1 MiB) of the root address (#15). A shader that does not read title memory reaches a root view through a view pair (`addr::root_view`): the pool from the mapping holding the address on, linearly, so past that mapping's end it reads and writes whatever the pool has next, not the title's next mapping. At each draw and dispatch a translated shader's root views are measured (`addr::linear_run`: following mappings that start where the last ended, in the same pool, at the next pool offset), and each one whose run is shorter is logged once per pipeline, root parameter and mapping (`a root view's range leaves its pool's linear run`, at most 2000): the pipeline's shader hashes, SRV or UAV, the dispatch's groups, the run, the first mapping, the mapping the title has where the run ends (`title_next`) and the title address of the pool bytes a pair view reaches there (`pool_next_is`). Root views of programs that read title memory (`through = "table"`) look each access up in the page table; they are logged too. Heap buffer views need no check: `PoolTable::resolve` refuses a range that is not linear in one pool. Off, the cost is one read of the switch per draw and dispatch. Run of 2026-11-26 (M5 Pro, Series S, crash at frame 2682): the 117 lines are all vertex shaders' root SRVs (root parameter 3, vertex fetch), and 30 of them do have a next title page elsewhere in pool 10 (pages mapped in descending pool order); no dispatch and no root UAV has a run under 1 MiB, so root views do not write the empty BVH nodes over other resources. Those vertex shaders read the wrong vertices past the first page, though: vertex and pixel programs now read root SRVs and UAVs through the page table (`root_memory` in `emit::lower`, with `zero_copy_memory`), one lookup per access, so they log as `through = "table"`; compute programs keep the views (no short run seen there). Tested by `a_vertex_root_view_follows_the_title_across_pages_apart_in_the_pool` (`addr_tests.rs`): a triangle whose first vertex ends one 64 KiB page and whose others start the next one, mapped elsewhere in the pool, was not drawn. Limit: the table has 64 KiB pages, so a page not wholly inside one mapping (mappings of 16 KiB) reads as zeros through it, where a view read it.
+- `VICTORY_TRACE_ROOT_SPAN[=<bytes>]`: root SRVs and UAVs whose title range stops being linear in its pool within `<bytes>` (default 1 MiB) of the root address (#15). A shader that does not read title memory reaches a root view through a view pair (`addr::root_view`): the pool from the mapping holding the address on, linearly, so past that mapping's end it reads and writes whatever the pool has next, not the title's next mapping. At each draw and dispatch a translated shader's root views are measured (`addr::linear_run`: following mappings that start where the last ended, in the same pool, at the next pool offset), and each one whose run is shorter is logged once per pipeline, root parameter and mapping (`a root view's range leaves its pool's linear run`, at most 2000): the pipeline's shader hashes, SRV or UAV, the dispatch's groups, the run, the first mapping, the mapping the title has where the run ends (`title_next`) and the title address of the pool bytes a pair view reaches there (`pool_next_is`). Root views of programs that read title memory (`through = "table"`) look each access up in the page table; they are logged too. Heap buffer views need no check: a range that is not linear in one pool wraps the title's own mapping instead (see "Heap buffer views not linear in one pool"). Off, the cost is one read of the switch per draw and dispatch. Run of 2026-11-26 (M5 Pro, Series S, crash at frame 2682): the 117 lines are all vertex shaders' root SRVs (root parameter 3, vertex fetch), and 30 of them do have a next title page elsewhere in pool 10 (pages mapped in descending pool order); no dispatch and no root UAV has a run under 1 MiB, so root views do not write the empty BVH nodes over other resources. Those vertex shaders read the wrong vertices past the first page, though: vertex and pixel programs now read root SRVs and UAVs through the page table (`root_memory` in `emit::lower`, with `zero_copy_memory`), one lookup per access, so they log as `through = "table"`; compute programs keep the views (no short run seen there). Tested by `a_vertex_root_view_follows_the_title_across_pages_apart_in_the_pool` (`addr_tests.rs`): a triangle whose first vertex ends one 64 KiB page and whose others start the next one, mapped elsewhere in the pool, was not drawn. Limit: the table has 64 KiB pages, so a page not wholly inside one mapping (mappings of 16 KiB) reads as zeros through it, where a view read it.
 - `VICTORY_TRACE_DESCRIPTORS=1`: how many descriptor records the title rewrites with plain stores, which no device call reports (#43). `NativeHost::remirror_tables` compares each bound table's records with those it last mirrored at every draw and dispatch; with the switch on, the frame log (`native draws so far`, every 64 frames) is followed by a `descriptor remirror` line with the records changed and checked since the previous one, per frame, per heap (by its first descriptor address, most changed first), and the most changed in one submission (`NativeHost::execute`). It counts only what that check sees: the first 16 entries of each bound table (more when the shader's metadata says so), at the draws that bind them; it does not say which code wrote the records. Off, the cost is one read of the switch per table and per submission. `VICTORY_TRACE_DESCRIPTORS=sites` also finds which title instructions store the records, for the choice between patching those store sites and remirroring: at each `ExecuteCommandLists` the pages of every descriptor heap's records (the title's own view, not the GPU's) are made read-only (`victory_platform::watch`). The loader's signal handler hands every write fault to the watch first, whoever wrote: a fault in a watched page makes that page writable again and the store runs again. It counts as a site (the instruction as an image offset) only when the instruction lies in the title image and the address in a heap's records, so the device's own view calls and title stores that only share the page go on unseen. The handler takes no lock and allocates nothing: a fixed table of 4096 sites (overflow counted), and the watched ranges (64 at most) in two tables behind sequence counts, so that a store faulting while a submission replaces the ranges is still the watch's: the handler reads the table in use and the one before it, and pages are opened only once neither holds them. Opened pages become read-write, which descriptor records' pages always are (the device's view calls write them). The frame log then adds a `descriptor store sites` line: the distinct sites so far and the 64 with the most stores, most first. Limit: a page stays writable until the next submission, so what is counted is the first store into each page per submission, not every store; a site that only stores after another one opened the page is seen less often, or not at all. A kernel write into a watched page (a `read` into it) would fail with `EFAULT` instead of faulting. Off, the handler's cost is one relaxed load per fault.
 - `VICTORY_WASAPI_WAV=<file>`: the audio device (`host_posix/wasapi.rs`) writes everything that reaches it as a float WAV — hearing exactly what the title's mixer produced, dry sound and (until #17 lands) silent reverb alike.
 - `VICTORY_SHADER_LOOP_LIMIT=<n>`: a translated loop stops after this many iterations per entry, and a lane that reaches the limit leaves the program as killed (a pixel discards; a genuine loop of more iterations is cut short too). The default is 2^14 (a lane doing 2^20 passes took 60 to 195 ms on an Apple M5 GPU, where 2^14 take 1 to 3 ms). A lower limit shows whether such a loop is what makes a frame slow, a higher one whether the limit cut a genuine loop short. The value is part of the translation, so the shader cache keys on it.
@@ -739,6 +744,7 @@ Residency itself: what a descriptor heap names is resident through the heap's ow
 * A texture whose whole read met an unmapped or protected range (`Tracked::partial`, `Watch::partial`) skips the initial whole-span `mach_vm_read_overwrite` on later whole reads and scanner rounds, walking readable `mach_vm_region` spans directly and zeroing only the unmapped gaps instead of failing the full-range read, zeroing the whole buffer, and reading the mapped prefix a second time; once every page in its range is readable again, `partial` clears.
 * Shortcut: an atlas whose first glyphs reach a sampled page gets its next ones up to 8 probes late, once (per-sample hashes would tell a partial write from a whole one); after repeated unchanged whole checks, a solitary write that misses every sampled page waits for the backed-off periodic check or the scanner round. Guesses, marked in the code: `WHOLE_BUDGET` (8 MiB) and `WHOLE_SPARE` (1 MiB) of whole reads a submission, `WHOLE_BACKOFF_MAX` (5 doubling steps, up to 256 probes), `SYNC_THREADS` (6), `SYNC_BATCH` (256 MiB read and detiled at a time).
 * Measured on warm runs with `VICTORY_HOLD_BYTE` on the init watchdog's flag: world frames presented from 30 to 150 s after the world starts (its first indirect rectangle-list draw). 0.38 a second before (46 frames), 1.17 with the reads off the lock (140), 1.73 with the whole-check rule and the scanner's baseline as well (208; that build also has main's G-buffer and upscale fixes). A second of world in the last one's trace: 45 submissions read 1,670 textures and 840 MiB (290 for the first time, 680 unchanged, 780 with memory that could not be read at once) in 0.41 s without the lock (the reading threads: 0.5 s reading, 0.44 s hashing, 0.24 s detiling); under the lock, 28 ms probing the hot textures (18,900 of them at most), 81 ms probing the blank ones, 94 ms uploading. Whole checks: 790 and 410 MiB a second, 1,630 and 330 MiB before the rule (17 and 9 MiB a submission, 44 and 9 MiB before). `WHOLE_BUDGET` bounds both: the rule halved their number, not their bytes, and what is still read at every probe are textures whose last write their samples did not show.
+* `victory_formats::texture::Layout::walk` precomputes column block offsets and low-bit contiguous micro-runs (`1` to `32` bytes) for XOR swizzle modes (`_X`, `_T`) and hoists the per-slice and per-row address/XOR terms out of the inner column loop, cutting a `2048x2048` `SW_64KB_S_X` detile to ~1.3 ms at 4 B/element and ~5.6 ms at 16 B/element (`texture::xor_tests::walk_matches_per_element_xor_address_across_modes`, `texture::xor_tests::partial_xor_runs_with_pipe_bank_xor_round_trip_every_element_size`).
 * The suspect that two descriptions placed at one address release each other in turn ("Placed textures are released" below): the trace counts the placements that replace another at their address, and those of them that had been at that address before. In 260 s of world, 32,291 were replaced and 5,715 of them (18%) were returns, against 62,656 first uploads. It happens, but it is under a tenth of the first uploads and not what makes the world slow.
 * Still open: whole checks of textures whose writes the samples miss fill `WHOLE_BUDGET` at every submission and mostly find nothing (the scanner reads the same textures on its own thread); nearly half the textures read have memory that cannot be read at once and are read page by page; the submitting thread waits for its reads; the probes are budgets a submission (2 ms for the hot textures, 2 ms for the blank ones, at least 32 of each), which at 30 submissions a frame is over 100 ms a frame; hot textures cool one probe at a time, so thousands stay hot for minutes; `mach_vm_read_overwrite` on 6 threads reads about twice as fast as on one, not six times.
 
@@ -750,6 +756,18 @@ Residency itself: what a descriptor heap names is resident through the heap's ow
 * **Dual-source blending** (`f1010f01` above, 27 November). Target 0's blend can name `SRC1_*` / `INV_SRC1_*` factors: the pixel shader then gives the target two outputs, the second (`SV_Target1`) a blend source only, so it writes one more output than the pipeline has targets. Metal writes that as `[[color(0) index(1)]]`, which its converter only emits when `IRCompilerSetDualSourceBlendingConfiguration` enables it; without that, Metal refuses the pipeline with "Fragment shader does not write to render target color(0), index(1) that is required for blending" and every draw with it is dropped (two such pipelines, every run, before the fix; their pixel shaders write targets 0 and 1 into one `Rgba16Float` target). `state::dual_source` decides per pipeline (one more shader output than targets, in order, and target 0's blend reads it), and the converter's cache is keyed by the answer: the same shader converts differently for the two cases.
 * Two fixes found on the way: title threads get at least 8 MiB of stack (`host_posix::MIN_STACK`; the title's 1 MiB overflowed while the host built a Metal pipeline at the first guessed draw), and a released pipeline object's host pipelines are forgotten (`glue::pipeline_released`), as a new object at a freed one's address got the old one's pipeline.
 * `VICTORY_DUMP_DESC_DIR=<dir>` (with `VICTORY_GUESS_GRAPHICS=1`) writes each guessed pipeline's register image as `regs_<vs>_<ps>_<address>.bin`.
+
+#### Indirect mesh dispatches (`DispatchMeshX`)
+
+`DispatchMeshX(x, flags, indirect, payload)` (list method 0x310) with a non-zero `indirect`
+runs as a one-record `ExecuteIndirect` of a mesh dispatch: on the native host through
+`glue::execute_indirect` (a Metal indirect mesh draw reading the record in title memory), on the
+D3D12 host through `State::execute_indirect` (kind 10). GPU addresses are title addresses, so
+`indirect` is used as it is. Guesses, not confirmed on a console: the record is
+`D3D12_DISPATCH_MESH_ARGUMENTS` (three 32-bit group counts, 12 bytes), `x` is unused when
+`indirect` is set, and `flags` and `payload` change nothing the host needs. "indirect mesh
+dispatches dropped" (D3D12) and "an indirect mesh dispatch" (native) now mean the host could not
+run it. Direct mesh dispatches are still dropped on the native host, counted and warned once.
 
 #### Dropped work is logged loudly
 
@@ -774,12 +792,38 @@ into the same targets with a dropped dispatch between them stay two render
 passes (likewise two dispatches around a dropped draw, and blits), so the
 backend still orders their pool-buffer accesses; a dropped command of the same
 kind as both its neighbours parts nothing, as before. These two are counted
-per host (`NativeHost::unset_roots`, `NativeHost::no_targets`), not in the
-"native draws so far" line, and they warn (once each, "native host drops work:
-...") only with `VICTORY_TRACE_TARGETS=1`. Unknown: what the console gives a
-shader in a root slot the title set nothing in. A title shader's metadata can
-name such a slot (255 observed); the host draws nothing for it, which is a
-fallback, not the console's behaviour.
+per host (`NativeHost::unset_roots`, `NativeHost::no_targets`). The unset-root
+drops are in the "native draws so far" line as `dropped_unset_root` (with
+`dropped_unmapped` and `dropped_failed` for the kinds below) and warn without
+a switch, the first time for each root parameter (at most 16); the no-target
+drops warn once with `VICTORY_TRACE_TARGETS=1`. Unknown: what the console
+gives a shader in a root slot the title set nothing in; the host draws nothing
+for it, which is a fallback, not the console's behaviour.
+
+Root parameter 255 was not such a slot (#258). It is the translator's own
+view-stride table (`victory_shader::emit::VIEW_STRIDES`, root SRV `t255`): a
+shader that takes a buffer view from the resource heap itself looks up the
+entry's stride there before it reads the entry, and reads the host's null
+buffer view where the table holds 0 (`emit`, "Buffer views at computed heap
+indices"). The native host bound no such table, so every draw and dispatch of
+such a shader was dropped at submission, counted only in `unset_roots` and
+warned about only with `VICTORY_TRACE_TARGETS=1`; the title's culling shaders
+are among them. Now each resource heap has a stride table
+(`NativeHost::view_strides`: a dword per heap index up to `HEAP_VIEWS`, 8 MiB,
+from `descriptors::stride_word`, made the first time such a shader is bound
+with the heap, from the title's records, and kept current by
+`NativeHost::mirror`), bound where the shader's layout has `t255`. A resource
+heap is as long as the translator's index clamp (`HEAP_VIEWS` entries of 24
+bytes, 48 MiB of zeroed host memory a heap, as the D3D12 host's heaps are),
+with null buffer views at `NULL_BUFFER_VIEW` and below it: a shader's clamped
+index and its null view must be entries the heap has. shortcut: an entry the
+title copies as bytes outside a bound table keeps its old stride until it is
+mirrored, and a record the title zeroes keeps its stride (the table check
+skips empty records). Not measured: how much of the longer heap and of the
+table becomes resident. Tests:
+`heap_tests::a_compute_shader_stores_through_a_buffer_view_it_takes_from_the_heap`
+(a compute program stores through a buffer view it loads from the heap by
+index, on Metal) and `descriptors::tests::stride_words_of_buffer_views`.
 
 A third kind is dropped the same way: any command (draw, dispatch, copy, fill
 or value write) that names title memory outside every mapped pool ("title
@@ -835,6 +879,44 @@ A 2D shader resource view with `MipLevels = UINT_MAX` exposes every mip from
 views so Metal clamps it to the remaining levels. Previously the decoder returned zero and
 the host bound the whole texture, so a shader reading level 0 saw the base mip even when
 the view started farther down the chain.
+
+#### Typed and structured buffer views lazily carry a Metal `texture_buffer`
+
+`victory-shader` lowers MUBUF `buffer_load_format_*`, `buffer_store_format_*`, and their
+`getDimensions` size queries to DXIL `TypedBuffer` (`bufferLoad.f32` / `bufferStore.f32`), which the
+Metal Shader Converter compiles (tested on a small synthetic DXIL shader) to
+`air.read_texture_buffer_1d.v4f32`, `air.write_texture_buffer_1d.v4f32`, and
+`air.get_width_texture_buffer_1d` reading `textureViewID` (word 1) of the 24-byte
+`IRDescriptorTableEntry`. `Metal::write_buffer` previously left word 1 at `0` (null
+`MTLResourceID`) for every buffer view, so formatted buffer stores wrote nothing and formatted
+buffer loads and size queries returned `0` (`#255`).
+
+To keep `NativeHost::mirror` free of Metal texture allocations across ~40,000-entry world heaps,
+`mirror` continues to write `[gpu, 0, size]` via `write_buffer` and marks two pending bits per
+entry (`list::PendingTyped`, ~10 KiB for 40,000 entries, `descriptors::typed_buffer`) for typed
+buffer SRVs/UAVs and for 4-, 8-, and 16-byte structured buffer SRVs/UAVs (guess, marked in
+`descriptors.rs`: on RDNA2 a structured `V#` of 4-, 8-, or 16-byte elements carries a 1-, 2-, or
+4-dword 32-bit data format, so shaders may access the same descriptor with both
+`buffer_store_format_*` / `buffer_load_format_*` and `buffer_store_dword*` / `buffer_load_dword*`).
+`Binding::of` scans the module's DXIL symbol and constant tables once
+(`list::dxil_uses_typed_buffers`) to flag shaders that use `bufferLoad`, `bufferStore`, or
+`TypedBuffer` `getDimensions`. At draw/dispatch submission, `NativeHost::materialize_typed_buffers`
+is a no-op unless a bound stage sets `typed_buffers`; when set, it calls `Metal::write_typed_buffer`
+only for pending bits inside the draw or dispatch's bound `Root::Table` ranges (plus explicit
+`stride == 0` typed buffer views in the bound heap if the shader also indexes
+`ResourceDescriptorHeap` directly), leaving unbound structured buffers unmaterialized. If a view's pool offset is not a multiple of
+`minimumTextureBufferAlignmentForPixelFormat` (16 bytes on Apple Silicon), `write_typed_buffer`
+warns once and falls back to `write_buffer` so raw accesses in word 0 still work without tripping
+Metal validation. 32-bit `SINT` views (`4`, `18`, `43`) map to `Uint` because `victory-shader`
+passes raw 32-bit lane bits through `TypedBuffer<float4>` (`bitcast i32 <-> float`) while Metal's
+texture unit unpacks/packs by the view's `MTLPixelFormat` with no sub-32-bit extension; 8- and
+16-bit `SINT` stay unmapped so `Uint` does not zero-extend signed channels. Tested on the GPU in
+`native::tests::heap_tests::formatted_buffer_stores_and_loads_through_structured_and_typed_uavs` and
+`victory-metal` `gfx::heap_set_tests::a_heaps_set_follows_its_entries`.
+The "native draws so far" line counts the promotions so far as `typed_views`
+(an entry mirrored again and promoted again counts twice) and the title's
+resource heaps as `resource_heaps`, to weigh what the typed views and the
+longer heaps cost.
 
 #### A command buffer the GPU fails still pays its signals and value writes
 
@@ -933,7 +1015,7 @@ In each of five runs the prologue presented exactly one world frame (about 80 ta
 * Every colour target of the 3D passes reads zero: the G-buffer (three 1280x720 RGBA8 targets and an RG16F, cleared, no draw encoded), the HDR scene colour (1280x720 RGBA16F, 3 draws encoded, 209 dropped), the 1920x1080 R10G10B10A2 target after it, and the presented 3840x2160 image. Only small targets written by compute (two 256x256 lookup tables) hold data. So the image is black from its first link, the geometry, not at tonemap or present.
 * Dropped in that frame: about 5,200 indirect executions of the title's mesh signature (stride 12, argument type 10), 960 to 1,140 dispatches without a host compute pipeline, about 300 draws without a host render pipeline, 25 indirect rectangle-list draws, and about 270 texture copies.
 * The type-10 executions run under graphics pipelines described by the console's register image whose "vertex" stage is an NGG program (`s_sendmsg MSG_GS_ALLOC_REQ`, `exp prim`, the group id read from LDS): the world's opaque geometry is mesh shading in console pipelines, which the native host has no path for (no mesh pipelines in `victory-metal`, and the translator is never asked for a mesh program from a guessed pipeline). Apple's converter does convert the translator's mesh output (the synthetic `triangle_mesh` of `emit` tests: stage 5, loads).
-* The draws without a pipeline, by refusal (one run): 117 "a cross-lane operation outside compute" (pixel shaders into RGBA16F + R32_UINT), 43 "a descriptor changed after loading", 60 "indexes the descriptor heap itself" (34 of them G-buffer draws, 21 a D16 shadow pass), 47 lane-mask joins, 19 `v_ldexp_f32` (now lowered). "A cross-lane operation outside compute" now names the operation and the stage after its prefix (for example `...: ds_bpermute_b32 in a pixel program`, `...: DPP row_shl, row_shr or row_ror in a pixel program`), since which one the title uses decides how to lower it: 127 of the 639 refusals in the M5 Ultra log of [#147](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/147), all in graphics pipelines.
+* The draws without a pipeline, by refusal (one run): 117 "a cross-lane operation outside compute" (pixel shaders into RGBA16F + R32_UINT), 43 "a descriptor changed after loading", 60 "indexes the descriptor heap itself" (34 of them G-buffer draws, 21 a D16 shadow pass), 47 lane-mask joins, 19 `v_ldexp_f32` (now lowered). "A cross-lane operation outside compute" now names the operation and the stage after its prefix (for example `...: ds_bpermute_b32 in a pixel program`, `...: DPP row_shl, row_shr or row_ror in a pixel program`), since which one the title uses decides how to lower it: 127 of the 639 refusals in the M5 Ultra log of [#147](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/147), all in graphics pipelines. That log is from 57b7ebd, before the names, and at that commit a constant-lane `v_readlane_b32` of an SGPR spill (a VGPR lane that only `v_writelane_b32` fills, on two paths into a join) counted under this cause. `Lower::spill_slot` (269e7d5) now makes that read a phi of the spilled SGPRs in a pixel program too, so part of the 127 may already translate on main. A tally on #4 (27 November, c1b9587 plus #253, #267 and #264, none of which touch graphics cross-lane lowering; Series S, one cold and one warm run to frame 2560) found no pixel refusal of this cause left: the only cross-lane refusals were 10 "between host waves in divergent code", all compute. So nothing in the pixel shape is lowered for now. Tests: `emit::gfx_refusal_tests::a_pixel_program_reads_back_an_sgpr_spilled_on_two_paths` (fails with the old refusal when the spill rule is off) and `a_pixel_program_with_dpp8_is_refused_by_name`.
 * With mesh pipelines (guessed vertex programs that export primitives run as mesh shaders, type-10 records as `drawMeshThreadgroupsWithIndirectBuffer`; 27 November, one run that reached the world frame and one that tripped the watchdog): no type-10 execution drops as an unrun signature any more, but the world frame is still black (G-buffer and HDR targets read zero, 0 draws encoded into the G-buffer). Every type-10 record now drops at its pipeline instead: of the frame's 5,178 draws without a host pipeline, 4,924 are mesh pipelines, refused because the mesh program indexes the descriptor heap itself (2,962, the D16 and D32 depth passes), reads a lane mask as data (944, the G-buffer passes: a VALU compare of a uniform SGPR ANDed with EXEC and kept in an SGPR) or reads a hardware SGPR input (824). Those three are the next blockers.
 * With heap-indexing graphics shaders accepted (`heap_tests`, 27 November, Series S headless, `VICTORY_TRACE_TARGETS=1`, one run each before and after, both reaching the world frame): "indexes the descriptor heap itself" refusals went from 62 shaders to 0, and the world frame's draws without a host render pipeline from 5,143 to 2,238. The 22 D16 shadow targets (DXGI 53, 256x256 to 640x2560) went from 326 draws encoded and 2,725 dropped to 2,633 encoded and 456 dropped; the 1280x720 D32S8 scene depth (DXGI 19) from 8 encoded and 2,229 dropped to 675 and 1,593; two G-buffer targets now get 52 draws each and an RG16F one 54 (were 0 and 2), still with about 1,500 dropped each. The G-buffer colour and the presented image still read zero: what remains dropped there is the lane-mask and hardware-SGPR mesh refusals.
 
@@ -1210,15 +1292,123 @@ were refused, so their dispatches were dropped and every count stayed 0.
   the value at the gather went through the write's block. All three translate. In game they run, and
   the first non-zero group counts appear (`[1, 1, 1]`, `[5, 1, 1]`, `[24, 1, 1]`). Test:
   `sample_tests::gathers_at_a_level_whole_in_the_lanes_that_gather_translate`.
-- The second of each pair is still refused: "a cross-lane operation between host waves in divergent
+- The second of each pair was refused as "a cross-lane operation between host waves in divergent
   code". Each is a group of 128 threads (two console waves, so not the lockstep fallback) that ORs a
   flag over its wave (a whole-wave section: `s_or_saveexec_b64 -1`, DPP, `v_permlanex16_b32`,
   `v_readlane_b32` of lane 0). It then reads lane 63 with EXEC set to lane 0 alone, ORs the result
-  into LDS word 0, and reads it back after a group barrier. Until these run, the G-buffer stays almost
-  black (0-0.8% in the same run).
+  into LDS word 0, and reads it back after the title's own `s_barrier`. Those reads cross the host
+  waves, so they need group barriers, which went only in blocks every thread runs once. This block
+  is reached by uniform branches, and a culled wave ends early (`s_cbranch_scc1` to `s_endpgm`). But
+  the title's barrier in the same block already needs every live wave there together (the console's
+  waits for each wave that has not ended, and the host's group barrier for it relies on the same).
+  So a block outside any loop that holds one of the title's `s_barrier`s is now an exchange site too
+  (`barrier_blocks`). All three translate. Over the same 3,338 dumped containers, four more compute
+  shaders translate and no other outcome changes. Test, on the GPU:
+  `split_wave_tests::a_whole_wave_or_one_lane_puts_in_lds_reaches_the_group_at_its_barrier` (a
+  synthetic program of the culler's shape, the second console wave ending early, flags in both host
+  halves). Not a block reached past a branch on an SCC computed from a `v_readfirstlane`
+  (`split_scc`), which `wave_blocks` already excludes: the console wave takes such a branch whole,
+  so a title may put one before its barrier, but each host wave reads its own first lane, so one
+  half could skip the block while the other waits at the exchange's group barrier, a hang (test
+  `wave32_tests::a_barrier_block_behind_a_first_lane_branch_is_no_exchange_site`). Once the first
+  lane read is the console wave's (#254), the exclusion is only conservative for compute. But the
+  culling shaders branch exactly this way: after the title's barrier, every lane reads LDS word 0
+  (the group flag) and the branch is on its first lane. A first lane read of a `ds_read_b32`
+  therefore splits nothing when its address is a constant, it runs in one known barrier phase n ≥ 1
+  (after the title's n-th `s_barrier` on every path: `barrier_phases`, a bit set per block, any
+  where a loop holds a barrier), and no LDS write of the program that can run in phase n, on any
+  path, can touch the word. Atomics, `ds_append` and `ds_consume` count as writes (the last two at
+  no known address; a split wave refuses them first anyway), and one at constant bytes elsewhere is
+  fine. A group barrier's k-th instance pairs every live wave's k-th `s_barrier`, whichever
+  instruction it is, so a write of another phase is ordered against the read, and a wave that leaves
+  the read's path (or passes a barrier instruction of its own) still has its phase-n writes checked.
+  A wave that ends early writes nothing more, and the console's barrier does not wait for it;
+  whatever it wrote before ending is in some phase and checked the same way (`barrier_reads`; test
+  `wave32_tests::a_barrier_block_behind_a_branch_on_an_lds_word_read_after_a_barrier`: accepted with
+  a write to another word or to the word in an earlier phase; refused with a write or an atomic to
+  the word in the read's phase, before or after the read, or on another wave's path that ends). Over
+  the 4,129 refused compute and graphics containers of a boot run (Series S, offline, both with and
+  without thread counts), `4e2edbd69fe414f1` and `f44473ebe75e0047` now translate and nothing else
+  changes; `898d9c1a5605ad81` stays refused, as two LDS writes at computed addresses can run in its
+  read's phase.
 
 `VICTORY_TRACE_TARGETS=1` cannot show this: an indirect draw counts as drawn when it is encoded,
 whatever the GPU later reads as its count.
+
+## Heap buffer views not linear in one pool (#258)
+
+A buffer view in a descriptor heap is written as a view of the pool buffer that holds its range
+(`NativeHost::mirror`, through `PoolTable::resolve`), which needs the range to be one linear run
+of one pool. The title maps its physical pages one 64 KiB page at a time, often in descending pool
+order, so a large buffer is seldom one run. Such a view used to be written as the null view, and
+the shader read zeros through it (the "a descriptor was not mirrored ... is not in a mapped pool"
+lines, about 500 to 3,000 a run).
+
+The culling shaders of the world's G-buffer read their instances that way. With
+`VICTORY_TRACE_DISPATCH_INPUTS` (a local diagnostic) on culler `ff826810673a0198`, its root constants
+`[32, 17]` name heap entry 17, a buffer of 182,452,224 bytes (174 MB) the title had filled (a third
+of its first 64 KiB non-zero). The host nulled it, so the culler read all-zero instances. Heap entry
+9936 (52 MB) was nulled too.
+
+Title memory is mapped at its own addresses in this process. A view whose range the title maps
+without a gap, but not as one run of a pool, now wraps those addresses (`NativeHost::title_alias`:
+the backend's `wrap_title_memory` over whole 16 KiB host pages, the alignment the no-copy wrap
+needs). The wrap is an allocation the heap entry names, so it is resident as the pool buffers are,
+with residency sets or by per-encoder naming (`heap_entry`). A wrap is reused while the mappings
+under it are the same (`PoolTable::signature`, a hash of the mappings the range crosses), made
+again when they change. Every wrap a heap entry shows stays in that cache, with 64 others at most,
+and the wraps over a released pool's pages are dropped from it (the heap entries that show one keep
+it alive themselves). Dropping the whole cache at each pool release, as the first version did, made
+a new wrap of the same range each time the entry was mirrored again, while the old ones stayed
+alive in heap entries and work in flight: in the 80 s after the world loaded, the 174 MiB view was
+wrapped 5 times with the same signature, the 50 MiB one 10 times and a 24 MiB one 17 times (the
+log stops at 32), and that run ended in GPU timeouts and an out-of-memory error. A view with a real gap (part of its range not
+mapped) stays the null view, logged at info level (`a buffer view over title memory with a gap
+stays the null view`, first 64). Test: `tests::a_buffer_view_across_title_pages_out_of_pool_order_reads_the_title_mapping`.
+Two title pages, mapped for real at a title address from pool pages 2 then 1, hold 64 words across
+the page boundary. A compute shader reads them through a heap view: it now gets them, and was
+refused the view before.
+
+What a wrap costs: it shows the title's own physical pages, so it adds no memory to the process
+and takes no process address space (Metal gives it a GPU address range of its size). Measured on a
+174 MiB view of title pages mapped in descending pool order (a local test): the process footprint
+(`phys_footprint`) stayed at 241 MiB through the wrap and two dispatches that read through it.
+Metal's `currentAllocatedSize` counts the wrap once more (+174 MiB), as it counts each pool buffer
+over the same pages. In game (M5 Pro, Series S), each large wrap is logged with both numbers
+before and after (`a large buffer view wraps the title's own pages`, views from 16 MiB, first 32):
+the 174 MiB view (entry 17) at +4 s, footprint 769,473,040 bytes before and after, Metal's count
++182,452,224; the 50 MiB view (entry 9936) at +29 s, footprint 4,156,533,456 before and after,
+Metal's count +52,428,800.
+
+What a wrap reads once the title changes its pages: the no-copy wrap keeps the physical pages it
+was made over. After the title maps other pool pages at those addresses, or unmaps them, the GPU
+still reads and writes the old pages through it, with no fault and no zeros (M5 Pro, macOS 27).
+So the host follows the title's pages (`NativeHost::follow_title_pages`): at each submission, if the
+pool table changed since it last looked (one comparison otherwise), every heap entry that shows a
+wrap, or that was left null for a gap, is mirrored again when the signature of the mappings under
+it has changed (`NativeHeap::title_views` keeps each one's range and signature). A remapped range
+gets a new wrap, a range with a page unmapped becomes the null view, and a gap the title maps later
+is wrapped then (logged: `a heap buffer view's title pages changed: mirrored again`, the first 64
+of views from 16 MiB and of smaller ones each). An entry the title has since filled with another
+record (plain stores) is dropped from the list. It
+matters for entries a shader loads from the heap itself, which no bound table brings back to
+`remirror_tables` (the cullers' entry 17), and for an entry the title writes once while it keeps
+mapping pages into the range (Ketan-Kapse's fork saw that, #258). Here the title does not remap
+entry 17: in a 300 s world run its signature was the same at the 1st, 10th, 100th and 1,000th look
+(`following the title's pages under heap buffer views`, logged at those looks with the views from
+16 MiB; pool-table generation 6,742 to 321,276), and each of the three large views was wrapped once.
+The pool table changed about 2,600 times a second in that run, so a look runs at most once per
+submission. Test:
+`tests::a_wrapped_view_follows_title_pages_remapped_or_unmapped_under_it` maps a view's second
+page to another pool page, then unmaps it: the view reads the new page, then zeros. Without the
+step it read the old page both times. Limits: work submitted before the change still reads the old
+pages; a range partly unmapped reads zeros as a whole, where a reserved resource reads zeros only
+at its unmapped tiles (marked shortcut in `title_alias`).
+
+In game, the G-buffer's mesh records stayed zero after the GPU ran the frame with this change
+alone, as read from the CPU (a read the reset pass makes meaningless, #258). With #253 and the
+view-stride table (#264) as well, the G-buffer's targets are 11 to 15 % covered in a warm world
+run, against 0 to 8 % before.
 
 ## Descriptor dwords read as data
 
@@ -1288,6 +1478,14 @@ activation (`trace_ir`). It exists to let a future run with the real game settle
 data is actually in (time-domain samples, in which case `ir_floats` for a given `ir_seconds` would
 land near `ir_seconds * 48000`, or something else) and replace this guess with the real thing.
 
+`VICTORY_DUMP_DSP=<dir>` goes further: at activation it writes a convolution stream's whole own
+`StreamDesc::ir` to `<dir>/stream<n>_ir.f32` (the title's bytes, not the synthetic tail; capped at
+16 Mi floats, logged as truncated if longer), and each `XDspSubmitCommand` appends the command's
+gains and input block to `<dir>/stream<n>_blocks.f32` and the block the stream wrote — silence, or
+the `VICTORY_GUESS_DSP` result — to `<dir>/stream<n>_out.f32`. A run with both set captures what
+the title sends and hears, to validate the guess against the real effect once the hardware's
+partitioned IR layout is known.
+
 Tests (`modules::dsp::tests`): `convolve_merged_is_a_causal_fir_per_channel_scaled_by_gain` and
 `convolve_merged_reads_history_as_the_frames_before_the_block` (the convolution math against
 hand-computed values), `a_block_split_matches_one_convolution_over_the_whole_signal` (splitting one
@@ -1295,7 +1493,8 @@ signal into two blocks and carrying history gives the same result as convolving 
 property that stops the tail from clicking at block boundaries), and
 `convolution_stream_as_the_title_drives_it` (the exported `XDspSubmitCommand` path, with
 `VICTORY_GUESS_DSP` set, no longer returns digital silence for a convolution stream with real
-input).
+input), and `dump_captures_the_titles_ir_blocks_and_output` (`VICTORY_DUMP_DSP` writes the title's
+own IR, and every command's gains, input and output blocks, in order).
 
 ## Depth-stencil textures are not watched or uploaded from CPU memory
 
@@ -1379,3 +1578,19 @@ Tests (`victory-gpu`, `native::texture_tests`, each failing before): `copy_resou
 (and its destination keeps the copy when its title memory changes),
 `copy_texture_region_moves_plain_texels_into_compressed_blocks`,
 `resolve_subresource_copies_what_both_hold`, `depth_stencil_rows_go_in_and_out_as_the_depth_plane`.
+
+## Output stores follow their values (#181)
+
+The export lowering (`Lower::export`) makes every channel's value first and then emits the
+`storeOutput`, `storeVertexOutput` or `storePrimitiveOutput` calls of the export back to back. It
+used to store each channel as soon as its value was made, so a float cast or a 16-bit conversion
+of the next channel sat between two stores of one output. Apple's Metal Shader Converter gathers
+the component stores of one output into a vector at the first of them, and the library it wrote
+then used that later value before its definition: `metal-as` refuses such a module ("Instruction
+does not dominate all uses"), and Metal's compiler failed on mesh programs whose outputs a pixel
+stage reads. Only the order of instructions inside the export's block changes, so the DXIL of
+most programs with exports differs byte for byte from before while what they compute does not.
+Tests: `emit::export_tests` (the order, for pixel, vertex and mesh programs) and
+`native::mesh_tests::a_converted_mesh_program_with_run_time_parameters_is_valid_ir` (a converted
+mesh program listed with `metal-objdump` and assembled again with `metal-as`; skipped without the
+converter or the Metal toolchain).

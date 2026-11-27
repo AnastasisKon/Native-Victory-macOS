@@ -58,6 +58,8 @@ pub struct Heap {
     /// Residency set holding the heap buffer and everything its entries name.
     set: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     dirty: Cell<bool>,
+    /// The set asked to stay resident (`VICTORY_METAL_REQUEST_RESIDENCY`): it ends that when dropped.
+    requested: bool,
 }
 
 impl Drop for Heap {
@@ -65,6 +67,9 @@ impl Drop for Heap {
         // MTLResidencySet does not retain allocations: detach everything and commit before
         // `buf` and `refs` are dropped.
         if let Some(set) = self.set.take() {
+            if self.requested {
+                set.endResidency();
+            }
             set.removeAllAllocations();
             set.commit();
         }
@@ -619,6 +624,19 @@ impl Metal {
         Ok(cb)
     }
 
+    /// With `VICTORY_METAL_REQUEST_RESIDENCY`, asks that a heap's set, as last committed, stay
+    /// resident between the command buffers that use it. Without it the system may make the
+    /// set's allocations non-resident whenever no command buffer in flight uses the set, and
+    /// make them resident again for the next one: in a run on a 48 GB Mac the wired memory fell
+    /// from about 22 GB to 6 GB and came back within 10 s in the world, then command buffers
+    /// timed out (#79). Guess, not measured: that making the set resident again is the stall.
+    fn request(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
+        if self.request_residency {
+            set.requestResidency();
+            self.count(|c| c.requests += 1);
+        }
+    }
+
     /// A set covers all passes in the command buffer. Later uses can still commit new entries.
     fn use_heap_cb(
         &self,
@@ -629,6 +647,7 @@ impl Metal {
         if let Some(set) = &heap.set {
             if heap.dirty.replace(false) {
                 set.commit();
+                self.request(set);
                 self.count(|c| {
                     c.heap_entries = c.heap_entries.max(heap.refs.borrow().len() as u64);
                     c.heap_allocations = c.heap_allocations.max(heap.alloc_counts.borrow().len() as u64);
@@ -841,6 +860,7 @@ impl ResourceBackend for Metal {
                 .map_err(|e| e.localizedDescription().to_string())?;
             s.addAllocation(ProtocolObject::from_ref(&*buf));
             s.commit();
+            self.request(&s);
             Some(track_residency_set(s))
         } else {
             None
@@ -852,6 +872,7 @@ impl ResourceBackend for Metal {
             refs: RefCell::default(),
             typed_views: Cell::new(0),
             alloc_counts: RefCell::default(),
+            requested: set.is_some() && self.request_residency,
             set,
             dirty: Cell::new(false),
         })
@@ -3885,6 +3906,30 @@ mod heap_set_tests {
         assert!(!attaches(&mut attached), "once per command buffer");
         let _next = m.next_piece(&q, &[], &mut attached, None).unwrap();
         assert!(attaches(&mut attached), "the next piece is given the heap's set too");
+    }
+
+    /// With `VICTORY_METAL_REQUEST_RESIDENCY` a heap's set asks to stay resident when it is made
+    /// and after each commit a use makes; without it, never.
+    #[test]
+    fn a_heaps_set_asks_to_stay_resident_only_when_switched_on() {
+        for on in [false, true] {
+            let m = Metal::new().unwrap().with_heap_sets().with_requested_residency(on);
+            let heap = m.create_heap(HeapKind::Resource, 4).unwrap();
+            if heap.set.is_none() {
+                eprintln!("skipped: no residency sets on this system");
+                return;
+            }
+            let before = m.residency_counts().requests;
+            let t = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+            m.write_texture(&heap, 0, &t, 0.0);
+            let mut attached = Vec::new();
+            m.use_heap_cb(&heap, &mut attached, |_| {});
+            m.use_heap_cb(&heap, &mut attached, |_| {});
+            let made = u64::from(on);
+            assert_eq!(before, made, "on={on}: when the set is made");
+            assert_eq!(m.residency_counts().requests, 2 * made, "on={on}: again after the one commit");
+            drop(heap); // ends the residency it asked for
+        }
     }
 
     /// A heap's residency set holds the heap buffer and each allocation its entries name, once,

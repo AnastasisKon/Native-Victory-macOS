@@ -1719,3 +1719,23 @@ Tests: `emit::export_tests` (the order, for pixel, vertex and mesh programs) and
 `native::mesh_tests::a_converted_mesh_program_with_run_time_parameters_is_valid_ir` (a converted
 mesh program listed with `metal-objdump` and assembled again with `metal-as`; skipped without the
 converter or the Metal toolchain).
+
+## Vertex-ID rectangle lists (#360)
+
+When `Options::rect_list` translates a guessed vertex program whose `Reg::V(0)` (`SV_VertexID`)
+input is read outside the ignored vertex-index operand of a `VERTEX_TABLE` stage-in fetch
+(`Lower::rect_vertex_id`, `emit/lower/rect.rs`), the program has no fetched position from which
+`Lower::vertex_fetch` alone can extrapolate the fourth corner, and strip instances past the first
+would otherwise see `SV_VertexID = 0..3` again. `Lower::run_rect_by_id` lowers the program body
+three times in one invocation — with `v0 = 3 * SV_InstanceID + 0..2` and `v3` (`SV_InstanceID`)
+fixed at `0` as on the console's non-instanced rectangle list — finds the right-angle corner
+opposite the longest `SV_Position.xy` side, extrapolates the missing fourth corner `p + q - r`
+across every exported float channel (keeping bitwise-equal shared corner values exact), and emits
+the `storeOutput` calls back to back after all values are computed. Programs with unordered-access
+writes are refused rather than replaying side effects.
+
+Tests: `victory-shader` `emit::export_tests::a_vertex_id_rect_list_export_makes_every_value_before_its_first_store`,
+`victory-gpu` `native::tests::mesh_tests::a_rectangle_of_a_vertex_id_program_covers_half_its_rectangle`
+(64 of 64 texels) and `vertex_id_rectangle_lists_draw_half_tiles_multiple_rects_and_interpolated_params`
+(32 of 64 half-tile, multi-rectangle direct and indirect draws, and interpolated `TEXCOORD` across
+the fourth corner).

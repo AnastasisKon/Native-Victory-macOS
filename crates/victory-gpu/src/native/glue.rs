@@ -1242,7 +1242,9 @@ fn pass_present(resource: This) {
             let Some(info) = crate::resource::texture_info(key as This) else { continue };
             let (w, h) = (info.width as usize, info.height as usize);
             let bpp = match info.format { 2 => 16, 10 | 11 | 16 => 8, 24 | 26 | 28 | 29 | 34 | 41 | 42 | 67 | 87 | 91 => 4, 49 | 54 | 56 | 57 => 2, 61 | 62 | 65 => 1, _ => 0 };
-            if bpp == 0 || w * h == 0 || w * h > 3840 * 2160 || info.depth_or_layers > 1 && info.format != 28 {
+            // A 3D texture (a colour grading table) is read whole; arrays are skipped.
+            let d = if info.dimension == victory_formats::texture::Dimension::Tex3d { info.depth_or_layers.max(1) as usize } else { 1 };
+            if bpp == 0 || w * h == 0 || w * h > 3840 * 2160 || d == 1 && info.depth_or_layers > 1 && info.format != 28 {
                 eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} layers={} skipped", info.format, info.depth_or_layers);
                 continue;
             }
@@ -1250,11 +1252,17 @@ fn pass_present(resource: This) {
                 eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} no host texture", info.format);
                 continue;
             };
-            let mut raw = vec![0u8; w * h * bpp];
+            let mut raw = vec![0u8; w * h * d * bpp];
             victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut raw, w * bpp, w * h * bpp);
-            let nonzero = raw.chunks_exact(bpp).filter(|p| p.iter().any(|&b| b != 0)).count() as f64 / (w * h) as f64;
+            let nonzero = raw.chunks_exact(bpp).filter(|p| p.iter().any(|&b| b != 0)).count() as f64 / (w * h * d) as f64;
+            let mut slices = String::new();
+            if d > 1 {
+                let lit = raw.chunks_exact(w * h * bpp).filter(|s| s.iter().any(|&b| b != 0)).count();
+                let distinct = raw.chunks_exact(bpp).collect::<std::collections::HashSet<_>>().len();
+                slices = format!(" depth={d} slices_nonzero={lit} distinct_texels={distinct}");
+            }
             let name = format!("p{num}_{key:x}_f{}_{w}x{h}.ppm", info.format);
-            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            let mut out = format!("P6\n{w} {}\n255\n", h * d).into_bytes();
             let mut extra = String::new();
             match info.format {
                 2 | 10 | 24 | 26 => {
@@ -1270,6 +1278,11 @@ fn pass_present(resource: This) {
                         nan16 = raw.chunks_exact(2).filter(|p| u16::from_le_bytes([p[0], p[1]]) & 0x7c00 == 0x7c00).count();
                     }
                     extra = format!(" max={max} min={min} mean={} notfinite={bad} infnan16={nan16} negative={neg}", sum / (rgb.len() * 3).max(1) as f64);
+                    // A few texels of 32-bit floats (exposure and histogram results): every channel, alpha too.
+                    if info.format == 2 && w * h <= 16 {
+                        let v: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                        extra += &format!(" values={v:?}");
+                    }
                     out.extend(rgb.iter().flat_map(|c| c.map(|v| if v.is_finite() && v > 0.0 { ((v / (1.0 + v)).sqrt() * 255.0) as u8 } else { 0 })));
                 }
                 28 | 29 | 87 | 91 => {
@@ -1282,7 +1295,7 @@ fn pass_present(resource: This) {
                 }
             }
             let _ = std::fs::write(std::path::Path::new(dir).join(&name), out);
-            eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} at={:#x} nonzero={nonzero:.4}{extra} file={name}", info.format, info.memory as usize);
+            eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} at={:#x} nonzero={nonzero:.4}{slices}{extra} file={name}", info.format, info.memory as usize);
         }
     });
 }

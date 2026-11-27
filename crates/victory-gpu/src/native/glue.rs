@@ -61,6 +61,21 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Shared>> {
 
 use super::textures::{lock_traced, SYNC_PHASES};
 
+/// With [`lock_traced`]: `ExecuteIndirect` executions recorded, their records, and microseconds
+/// under the lock finding the pipeline (`graphics`, `pipe`) and recording the records.
+static INDIRECT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Adds one `ExecuteIndirect` of `records` to [`INDIRECT`]: begun at `start`, its pipeline found
+/// at `found`, its records recorded now.
+fn note_indirect(records: u32, start: std::time::Instant, found: std::time::Instant) {
+    if lock_traced() {
+        INDIRECT[0].fetch_add(1, Ordering::Relaxed);
+        INDIRECT[1].fetch_add(u64::from(records), Ordering::Relaxed);
+        INDIRECT[2].fetch_add((found - start).as_micros() as u64, Ordering::Relaxed);
+        INDIRECT[3].fetch_add(found.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
 /// Adds one taking of `TITLE` at `at` (file, line) to the trace, and logs it once a second.
 fn note_lock(at: (&'static str, u32), wait: std::time::Duration, hold: std::time::Duration) {
     type Stats = std::collections::HashMap<(&'static str, u32), [u64; 4]>;
@@ -87,14 +102,19 @@ fn note_lock(at: (&'static str, u32), wait: std::time::Duration, hold: std::time
         })
         .collect();
     let phase = |i: usize| SYNC_PHASES[i].swap(0, Ordering::Relaxed) / 1000;
+    let indirect = |i: usize| INDIRECT[i].swap(0, Ordering::Relaxed);
     tracing::info!(
-        "title lock in the last {secs:.1} s: held {} ms, waited {} ms; at submissions: keep_named {} ms, keep_to_budget {} ms, give_up_covered {} ms, probes {} ms; {}",
+        "title lock in the last {secs:.1} s: held {} ms, waited {} ms; at submissions: keep_named {} ms, keep_to_budget {} ms, give_up_covered {} ms, probes {} ms; ExecuteIndirect: {} executions, {} records, pipelines {} ms, records {} ms; {}",
         held / 1000,
         waited / 1000,
         phase(0),
         phase(1),
         phase(2),
         phase(3),
+        indirect(0),
+        indirect(1),
+        indirect(2) / 1000,
+        indirect(3) / 1000,
         top.join("; ")
     );
     *stats = None;
@@ -2041,9 +2061,12 @@ pub(crate) fn execute_indirect(
         Command::DispatchMesh => {
             RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
             with_list(this, |t, l| {
+                let start = std::time::Instant::now();
                 if graphics(t, l, true).is_none() {
                     return;
                 }
+                let found = std::time::Instant::now();
+                let _timed = Defer(|| note_indirect(max, start, found));
                 if pass_on() {
                     pass_note_op(l, &format!("mesh-records n={max} counted={}", count.is_some()), None, None);
                 }
@@ -2056,22 +2079,23 @@ pub(crate) fn execute_indirect(
                     n[0] += u64::from(max);
                     n[1] += zero;
                 }
-                for i in 0..max {
-                    match l.list.dispatch_mesh_indirect(at(i), count.map(|c| (c, i))) {
-                        Ok(()) => {
-                            ENCODED.fetch_add(1, Ordering::Relaxed);
-                            l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
-                        }
-                        Err(e) => tracing::warn!(error = %e, "indirect mesh dispatch"),
+                match l.list.indirect_records(at(0), stride, max, count, |l, r, c| l.dispatch_mesh_indirect(r, c)) {
+                    Ok(()) => {
+                        ENCODED.fetch_add(u64::from(max), Ordering::Relaxed);
+                        l.target_keys.iter().for_each(|&k| (0..max).for_each(|_| trace_bump(k, 0)));
                     }
+                    Err(e) => tracing::warn!(error = %e, "indirect mesh dispatch"),
                 }
                 trace_present_draw(t, l);
             });
             true
         }
         Command::Dispatch => {
-            with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
+            let mut start = std::time::Instant::now();
+            with_list(this, |t, l| match (start = std::time::Instant::now(), pipe(t, l.pipeline, &TargetFormats::default())).1 {
                 Pipe::Compute(pso) => {
+                    let found = std::time::Instant::now();
+                    let _timed = Defer(|| note_indirect(max, start, found));
                     trace_record_dispatch(t, l, "ran");
                     if pass_on() {
                         pass_note(t, l, "dispatch-indirect", "ran", true, max);
@@ -2101,13 +2125,13 @@ pub(crate) fn execute_indirect(
                                 tracing::warn!(shader = ?stage_hashes(l.pipeline), ?command, counted = count.is_some(), stride, record = format_args!("{:#x}", at(i)), ?now, "an indirect dispatch (the first three of each pipeline)");
                             }
                         }
-                        let r = match count {
-                            Some(c) => l.list.dispatch_indirect_counted(at(i), c, i),
-                            None => l.list.dispatch_indirect(at(i)),
-                        };
-                        if let Err(e) = r {
-                            tracing::warn!(error = %e, "indirect dispatch");
-                        }
+                    }
+                    let r = l.list.indirect_records(at(0), stride, max, count, |l, r, c| match c {
+                        Some((c, i)) => l.dispatch_indirect_counted(r, c, i),
+                        None => l.dispatch_indirect(r),
+                    });
+                    if let Err(e) = r {
+                        tracing::warn!(error = %e, "indirect dispatch");
                     }
                 }
                 _ => dropped_dispatch(t, l, "indirect"),
@@ -2116,7 +2140,8 @@ pub(crate) fn execute_indirect(
         }
         Command::Draw | Command::DrawIndexed => {
             RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
-            with_list(this, |t, l| match graphics(t, l, false) {
+            let mut start = std::time::Instant::now();
+            with_list(this, |t, l| match (start = std::time::Instant::now(), graphics(t, l, false)).1 {
                 // shortcut: an indexed rectangle list is not drawn, as directly.
                 Some(true) if command == Command::DrawIndexed => {
                     dropped("an indirect rectangle-list draw");
@@ -2127,21 +2152,21 @@ pub(crate) fn execute_indirect(
                     true
                 }
                 Some(rect) => {
-                    for i in 0..max {
-                        let indexed = command == Command::DrawIndexed;
-                        let r = match count {
-                            // As a direct one: four-vertex instances, the record rewritten on the GPU.
-                            _ if rect => l.list.draw_rects_indirect(at(i), count.map(|c| (c, i))),
-                            Some(c) => l.list.draw_indirect_counted(at(i), indexed, c, i),
-                            None => l.list.draw_indirect(at(i), indexed),
-                        };
-                        match r {
-                            Ok(()) => {
-                                ENCODED.fetch_add(1, Ordering::Relaxed);
-                                l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
-                            }
-                            Err(e) => tracing::warn!(error = %e, "indirect draw"),
+                    let found = std::time::Instant::now();
+                    let _timed = Defer(|| note_indirect(max, start, found));
+                    let indexed = command == Command::DrawIndexed;
+                    let r = l.list.indirect_records(at(0), stride, max, count, |l, r, c| match c {
+                        // As a direct one: four-vertex instances, the record rewritten on the GPU.
+                        _ if rect => l.draw_rects_indirect(r, c),
+                        Some((c, i)) => l.draw_indirect_counted(r, indexed, c, i),
+                        None => l.draw_indirect(r, indexed),
+                    });
+                    match r {
+                        Ok(()) => {
+                            ENCODED.fetch_add(u64::from(max), Ordering::Relaxed);
+                            l.target_keys.iter().for_each(|&k| (0..max).for_each(|_| trace_bump(k, 0)));
                         }
+                        Err(e) => tracing::warn!(error = %e, "indirect draw"),
                     }
                     true
                 }
@@ -2621,4 +2646,13 @@ pub(crate) fn locked<R>(f: impl FnOnce() -> R) -> R {
 /// Counters of the host for tests and the frame line.
 pub fn stats() -> Option<super::title::Stats> {
     with_title(|t| t.stats.clone())
+}
+
+/// Runs its closure when dropped (the end of a scope).
+struct Defer<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
 }

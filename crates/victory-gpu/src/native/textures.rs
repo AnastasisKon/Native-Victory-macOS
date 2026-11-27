@@ -836,6 +836,15 @@ impl<B: PresentBackend> Title<B> {
                 return;
             }
         }
+        // With VICTORY_TRACE_FREED=1, a copy-back into a range the title's allocator freed is
+        // logged and skipped (#339): writing over a freed block corrupts whatever holds it now.
+        if crate::native::freed::overlaps(address, info.size as u64) {
+            crate::native::freed::check(address, info.size as u64, "texture copy-back");
+            if self.back.logged.insert(key) {
+                tracing::warn!(texture = key, ?described, "a GPU-written texture's copy-back was skipped: its title memory is in a freed range (#339)");
+            }
+            return;
+        }
         // SAFETY: `resolve` gives `size` mapped, writable bytes of the pool; the buffer is kept.
         unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), at.cast_mut(), tiled.len()) };
         // What the host texture holds, so the scanner's sighting of this write uploads nothing.

@@ -209,8 +209,9 @@ impl Shader {
                 {
                     let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}_{}.bin", self.stage, self.hash)), &*container);
                 }
-                // A vertex shader keeps its container: a rectangle-list draw translates it again.
-                if self.stage != "vertex" {
+                // A vertex shader keeps its container (a rectangle-list draw translates it again),
+                // and a pixel shader its (integer colour targets do: the title may have freed it).
+                if self.stage != "vertex" && self.stage != "pixel" {
                     *container = Vec::new();
                 }
                 made
@@ -242,17 +243,41 @@ impl Shader {
         self.threads
             .get_or_init(|| {
                 self.native()?;
-                let mut container = vec![0; self.size];
-                let at = self.at.load(std::sync::atomic::Ordering::Relaxed);
-                if at == 0 || !crate::queue::read_bytes(at, &mut container) {
-                    return Err("its container is no longer in title memory".into());
-                }
-                if blake3::hash(&container).to_hex()[..16] != *self.hash {
-                    return Err("its container changed since the pipeline was made".into());
-                }
-                crate::native::shaders::translate_threads(&container).map(Arc::new)
+                crate::native::shaders::translate_threads(&self.container_again()?).map(Arc::new)
             })
             .clone()
+    }
+
+    /// The container: kept (vertex and pixel shaders), or read again from where the title held
+    /// it (a compute shader's is let go once translated).
+    fn container_again(&self) -> Result<Vec<u8>, String> {
+        let kept = self.container.lock().unwrap_or_else(|e| e.into_inner());
+        if !kept.is_empty() {
+            return Ok(kept.clone());
+        }
+        drop(kept);
+        let mut container = vec![0; self.size];
+        let at = self.at.load(std::sync::atomic::Ordering::Relaxed);
+        if at == 0 || !crate::queue::read_bytes(at, &mut container) {
+            return Err("its container is no longer in title memory".into());
+        }
+        if blake3::hash(&container).to_hex()[..16] != *self.hash {
+            return Err("its container changed since the pipeline was made".into());
+        }
+        Ok(container)
+    }
+
+    /// A pixel shader's translation for integer colour targets (`Options::integer_targets`);
+    /// not kept here (the disk cache and the pipeline caches keep it). Made from the kept
+    /// container, so it does not need the title to hold the container still (pixel containers
+    /// cost ~110 MB of host memory).
+    pub(crate) fn translate_targets(&self, integer: u8) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+        crate::native::shaders::translate_targets(&self.container_again()?, integer).map(Arc::new)
+    }
+
+    /// Whether [`Self::translate_targets`] would find its translation on disk.
+    pub(crate) fn targets_cached(&self, integer: u8) -> bool {
+        self.container_again().is_ok_and(|c| crate::native::shaders::targets_cached(&c, integer))
     }
 
     /// Whether [`Self::translate_extra`] would find its translation on disk.
@@ -1770,5 +1795,23 @@ mod pieces_tests {
         pipeline(p).shaders[0].at.store(0x10, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(native_threads(p).1.err().as_deref(), Some("its container is no longer in title memory"));
         release(p);
+    }
+
+    /// A pixel shader keeps its container once translated: its integer-target translation is
+    /// made when the title holds the container nowhere any more (`at` 0).
+    #[test]
+    fn a_pixel_shader_translates_for_integer_targets_after_the_title_freed_its_container() {
+        // `exp mrt0 v0, v1, v1, v0 vm; exp mrt1 v2, off, off, off done vm; s_endpgm`.
+        let code: Vec<u8> = [0xF800_100Fu32, 0x0001_0100, 0xF800_1811, 0x0000_0002, 0xBF81_0000]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let mut meta = [0; 0x10];
+        meta[12] = 0x40;
+        let c = victory_shader::emit::graphics::container(victory_shader::native::HwStage::Ps, &code, &meta).unwrap();
+        let s = shader("pixel", &c);
+        assert_eq!(s.at.load(std::sync::atomic::Ordering::Relaxed), 0, "not in title memory");
+        s.native().expect("translates");
+        s.translate_targets(0b10).expect("translated for an integer mrt1");
     }
 }

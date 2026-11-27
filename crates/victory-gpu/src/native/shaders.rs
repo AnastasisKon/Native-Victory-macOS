@@ -74,6 +74,21 @@ pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 
     }
 }
 
+/// A pixel shader's container translated for colour targets of integer formats (bit n: target n).
+pub fn translate_targets(container: &[u8], integer: u8) -> Result<HostShader, String> {
+    translate_cached(container, Options { integer_targets: integer, ..options() })
+}
+
+/// Whether [`translate_targets`]'s translation is in the disk cache already.
+pub fn targets_cached(container: &[u8], integer: u8) -> bool {
+    crate::shader_cache::native_present(container, &format!("{:?}", Options { integer_targets: integer, ..options() }))
+}
+
+/// Bit n set: colour target n has an integer format.
+pub fn integer_targets(color: &[Format]) -> u8 {
+    color.iter().enumerate().filter(|(n, f)| *n < 8 && f.is_integer()).fold(0, |m, (n, _)| m | 1 << n)
+}
+
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
 /// give the page table (compute and guessed graphics shaders). A shader that indexes the resource
 /// heap itself is not refused here: the bound heaps are at the converter's heap slots for every
@@ -279,9 +294,19 @@ impl<B: PresentBackend> Title<B> {
                 attributes.insert(at, next);
             }
         }
-        let (Some(color), Ok(depth)) = (g.color_formats(), g.depth_format()) else {
-            self.shaders.refuse(name, "a target format the host does not know".into());
-            return Pipe::Refused;
+        // Resolve colour and depth formats, reporting unknown formats as refusals.
+        let (color, depth) = match (g.color_formats(), g.depth_format()) {
+            (Ok(c), Ok(d)) => (c, d),
+            (Err(dxgi), _) => {
+                self.shaders
+                    .refuse(name, format!("unknown target format {}", dxgi));
+                return Pipe::Refused;
+            }
+            (_, Err(dxgi)) => {
+                self.shaders
+                    .refuse(name, format!("unknown depth format {}", dxgi));
+                return Pipe::Refused;
+            }
         };
         if g.samples > 1 {
             self.shaders.refuse(name, "multisampled targets".into());

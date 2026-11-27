@@ -470,3 +470,148 @@ fn a_converted_mesh_program_with_run_time_parameters_is_valid_ir() {
     let assembled = Command::new(assembler).arg(path("mesh.ll")).arg("-o").arg(path("mesh.air")).output().unwrap();
     assert!(assembled.status.success(), "{}", String::from_utf8_lossy(&assembled.stderr));
 }
+
+/// A legacy vertex program that takes its position from the vertex id alone (no vertex fetch):
+/// id 1 is (1, -1), id 2 (-1, 1), any other (-1, -1). As a rectangle list's three corners
+/// (0, 1, 2), the rectangle is the whole target.
+const RECT_BY_ID: &[u32] = &[
+    0x7E14_02F3, // v_mov_b32 v10, -1.0
+    0x7E16_02F2, // v_mov_b32 v11, 1.0
+    0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+    0x0204_170A, // v_cndmask_b32 v2, v10, v11, vcc
+    0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
+    0x0206_170A, // v_cndmask_b32 v3, v10, v11, vcc
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0x7E0C_02F2, // v_mov_b32 v6, 1.0
+    0xF800_08CF, 0x0604_0302, // exp pos0 v2, v3, v4, v6 done
+    0xBF81_0000, // s_endpgm
+];
+
+/// A rectangle-list pipeline of [`RECT_BY_ID`] translated as `guess` does (`Options::rect_list`),
+/// and a list into a black 8x8 target with it set as a strip.
+fn rect_list_into(t: &mut Title<Metal>) -> (Rc<Texture>, NativeList<Metal>) {
+    let mut meta = [0; 0x10];
+    meta[12] = 0x40;
+    let bytes: Vec<_> = RECT_BY_ID.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let c = victory_shader::emit::graphics::container(HwStage::Vs, &bytes, &meta).unwrap();
+    let vs = shaders::translate_rect(&c).unwrap();
+    assert_eq!(vs.stage, HwStage::Vs);
+    let ps = translate(HwStage::Ps, RED);
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], true);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "rect") else {
+        panic!("{:?}", t.shaders);
+    };
+    let (color, mut list) = list_into(t, &pso, binding);
+    list.set_graphics_pipeline(&pso, Topology::TriangleStrip);
+    (color, list)
+}
+
+fn lit(t: &Title<Metal>, color: &Texture) -> usize {
+    pixels(t, color).iter().filter(|p| **p == [255, 128, 128, 255]).count()
+}
+
+/// The contributor lead "a rectangle list whose vertex program takes everything from the vertex
+/// id covers half of each rectangle": so here too. The direct path (`glue::draw`, 3 vertices: one
+/// instance of 4) runs the program for ids 0 to 3, and the rectangle translation only builds the
+/// fourth corner from fetched attributes, so id 3 is the program's own (-1, -1): the second
+/// triangle repeats the first, and only the lower-left half of the target is drawn (28 texels:
+/// those strictly below the diagonal). With more rectangles every instance sees ids 0 to 3 again,
+/// so each draws this half of the first one (from the code; not drawn here).
+/// shortcut: recorded as it is; the fourth corner of such a program needs its position for ids
+/// 0 to 2 in one invocation (the program run three times), not a small change.
+#[test]
+fn a_rectangle_of_a_vertex_id_program_covers_half_its_rectangle() {
+    let Some(mut t) = title() else { return };
+    let (color, mut list) = rect_list_into(&mut t);
+    list.draw_instanced(4, 1, 0, 0).unwrap();
+    super::run(&t.host, &[&list]);
+    let n = lit(&t, &color);
+    assert_eq!(n, 28, "{n} of 64 lit");
+}
+
+/// `ExecuteIndirect` of a rectangle list draws each record as the direct path draws its arguments
+/// (the record rewritten on the GPU to four-vertex instances): a record of 3 vertices lights what
+/// the direct draw does, one of 0 vertices, an instanced one, or one past the count, nothing.
+#[test]
+fn an_indirect_rectangle_list_draws_its_records_as_a_direct_one() {
+    let Some(mut t) = title() else { return };
+    let direct = {
+        let (color, mut list) = rect_list_into(&mut t);
+        list.draw_instanced(4, 1, 0, 0).unwrap();
+        super::run(&t.host, &[&list]);
+        pixels(&t, &color)
+    };
+    let pool = super::Pool::new(&t.host, 1);
+    let count = 64;
+    // Records: 3 vertices; 0 vertices; 3 vertices of 2 instances.
+    pool.write(0, &[3u32, 1, 0, 0, 0, 1, 0, 0, 3, 2, 0, 0]);
+    pool.write(count, &[1u32]);
+    for (record, counted, draws) in [(0, None, true), (1, None, false), (2, None, false), (0, Some(0), true), (0, Some(1), false)] {
+        let (color, mut list) = rect_list_into(&mut t);
+        list.draw_rects_indirect(pool.va(16 * record), counted.map(|i| (pool.va(count), i))).unwrap();
+        super::run(&t.host, &[&list]);
+        let got = pixels(&t, &color);
+        if draws {
+            assert_eq!(got, direct, "record {record} {counted:?}");
+        } else {
+            assert!(got.iter().all(|p| *p == [0; 4]), "record {record} {counted:?}");
+        }
+    }
+}
+
+/// The deferred-lighting shape: a pixel program writing a float colour to mrt0 and, in mrt1.x,
+/// the bits of a float it made (pi, 0x40490fdb) into an R32Uint target. Translated for the
+/// integer target (`Options::integer_targets`, the mask `glue::make_host_pipe` computes from the
+/// formats), Metal makes the pipeline and the target holds the bits, not 3 (a conversion).
+#[test]
+fn a_pixel_program_writes_exact_bits_to_an_r32uint_target() {
+    const BITS: &[u32] = &[
+        0x7E00_02F2, // v_mov_b32 v0, 1.0
+        0x7E02_02F0, // v_mov_b32 v1, 0.5
+        0x7E06_02FF, 0x4049_0FDB, // v_mov_b32 v3, pi
+        0x0604_0680, // v_add_f32 v2, 0, v3
+        0xF800_100F, 0x0001_0100, // exp mrt0 v0, v1, v1, v0 vm
+        0xF800_1811, 0x0000_0002, // exp mrt1 v2, off, off, off done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let formats = [Format::Rgba16Float, Format::R32Uint];
+    let integer = shaders::integer_targets(&formats);
+    assert_eq!(integer, 0b10);
+    let bytes: Vec<_> = BITS.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut meta = [0; 0x10];
+    meta[12] = 0x40;
+    let c = victory_shader::emit::graphics::container(HwStage::Ps, &bytes, &meta).unwrap();
+    let ms = translate(HwStage::Vs, TRIANGLE);
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(formats.to_vec(), None, vec![], &[], false);
+    // Translated as today (float outputs), Metal refuses it.
+    let float = shaders::translate(&c).unwrap();
+    assert!(matches!(t.render_pipe(&ms, Some(&float), &state, "float"), Pipe::Refused));
+    assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("color attachment")), "{:?}", t.shaders.refused);
+    let ps = shaders::translate_targets(&c, integer).unwrap();
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "integer") else {
+        panic!("{:?}", t.shaders);
+    };
+    let target = |f| {
+        let mut desc = TextureDesc::d2(f, 8, 8);
+        desc.render_target = true;
+        t.host.texture(&desc).unwrap()
+    };
+    let (color, ids) = (target(Format::Rgba16Float), target(Format::R32Uint));
+    let mut list = NativeList::default();
+    list.set_render_targets(&[color.clone(), ids.clone()], None);
+    list.clear_render_target(&color, [0.0; 4]);
+    list.clear_render_target(&ids, [0.0; 4]);
+    list.set_graphics_pipeline(&pso, Topology::Triangles);
+    list.set_graphics_binding(binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    let mut p = [0u8; 8 * 8 * 4];
+    t.host.backend.read_texture(&ids, 0, 0, &mut p, 8 * 4, 0);
+    let words: Vec<u32> = p.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    assert!(words.iter().all(|&w| w == 0x4049_0FDB), "{words:x?}");
+    let mut h = [0u8; 8 * 8 * 8];
+    t.host.backend.read_texture(&color, 0, 0, &mut h, 8 * 8, 0);
+    // 1.0, 0.5, 0.5, 1.0 as halves.
+    assert_eq!(&h[..8], &[0x00, 0x3c, 0x00, 0x38, 0x00, 0x38, 0x00, 0x3c]);
+}

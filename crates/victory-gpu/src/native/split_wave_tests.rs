@@ -1448,3 +1448,295 @@ fn mask_number_bfm_brev_bitset_wqm_saveexec_and_wrexec_run_on_the_gpu() {
     );
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
+
+#[test]
+fn wave64_lane63_writelane_and_salu_or_reductions_run_on_the_gpu() {
+    // 1. Sum `v0 + 1` across each 64-lane console wave with lower-half `v_readlane_b32 s6, v1, 0`
+    //    written into lane 63 only (`v_writelane_b32 v2, s6, 63; v_add_nc_u32 v1, v2, v1`), then
+    //    narrow `EXEC` to lane 0 (`s_mov_b64 exec, 1`) and read lane 63 (`v_readlane_b32 s7, v1, 63`).
+    //    Tested for 1-wave (64-lane) and 2-wave (128-lane) groups.
+    let lane63_sum = [
+        0x4A08_0081u32, // v_add_nc_u32 v4, 1, v0
+        0xBE88_25C1,    // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0001,
+        0x0022_0880, // v_cndmask_b32_e64 v1, 0, v4, s[8:9]
+        0x4A02_02FA,
+        0xFF00_B101, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
+        0x4A02_02FA,
+        0xFF00_4E01, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
+        0x4A02_02FA,
+        0xFF01_4101, // v_add_nc_u32_dpp v1, v1, v1 row_half_mirror
+        0x4A02_02FA,
+        0xFF01_4001, // v_add_nc_u32_dpp v1, v1, v1 row_mirror
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0xD760_0006,
+        0x0001_0101, // v_readlane_b32 s6, v1, 0
+        0xD761_0002,
+        0x0001_7E06, // v_writelane_b32 v2, s6, 63
+        0x4A02_0302, // v_add_nc_u32_e32 v1, v2, v1
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0xBEFE_0481, // s_mov_b64 exec, 1
+        0xD760_0007,
+        0x0001_7F01, // v_readlane_b32 s7, v1, 63
+        0x7E04_0207, // v_mov_b32 v2, s7
+        V_LSHLREV_V1_2_V0,
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        S_ENDPGM,
+    ];
+    let got64 = run_io(&lane63_sum, 0, 64, 0);
+    if got64.is_empty() {
+        return;
+    }
+    assert_eq!(got64[0], 2080, "sum(1..=64)");
+    assert_eq!(&got64[1..64], &[CANARY; 63]);
+
+    let got128 = run_io(&lane63_sum, 0, 128, 0);
+    assert_eq!(got128[0], 2080, "wave 0 sum(1..=64)");
+    assert_eq!(&got128[1..64], &[CANARY; 63]);
+    assert_eq!(got128[64], 6176, "wave 1 sum(65..=128)");
+    assert_eq!(&got128[65..128], &[CANARY; 63]);
+
+    // 2. Divergent `EXEC` (`v0 % 4 == 0` active) bitwise-OR reduction combining `v_readlane_b32` of
+    //    lanes 0 and 32 via `s_or_b32 s6, s4, s5` inside the whole-wave section:
+    //    Active lanes in wave 0 (`0, 4, ..., 60`) set bits `0..7` in the lower half and `8..15` in
+    //    the upper half (`0x0000_FFFF`), while wave 1 (`64, 68, ..., 124`) sets bits `16..23` and
+    //    `24..31` (`0xFFFF_0000`).
+    let salu_or = [
+        0x360A_0083u32, // v_and_b32 v5, 3, v0
+        0x7DA4_0A80,    // v_cmpx_eq_u32 0, v5 (only lanes `v0 % 4 == 0` stay active)
+        0x2C08_0082,    // v_lshrrev_b32 v4, 2, v0 (`0..15` in wave 0, `16..31` in wave 1)
+        0x7E0A_0281,    // v_mov_b32 v5, 1
+        0x3408_0B04,    // v_lshlrev_b32 v4, v4, v5 (`1 << (v0 / 4)`)
+        0xBE88_25C1,    // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0001,
+        0x0022_0880, // v_cndmask_b32_e64 v1, 0, v4, s[8:9]
+        0x3802_02FA,
+        0xFF00_B101, // v_or_b32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
+        0x3802_02FA,
+        0xFF00_4E01, // v_or_b32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
+        0x3802_02FA,
+        0xFF01_4101, // v_or_b32_dpp v1, v1, v1 row_half_mirror
+        0x3802_02FA,
+        0xFF01_4001, // v_or_b32_dpp v1, v1, v1 row_mirror
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x3802_0501, // v_or_b32_e32 v1, v1, v2
+        0xD760_0006,
+        0x0001_0101, // v_readlane_b32 s6, v1, 0
+        0xD760_0007,
+        0x0001_4101, // v_readlane_b32 s7, v1, 32
+        0x880A_0706, // s_or_b32 s10, s6, s7
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0x7E04_020A, // v_mov_b32 v2, s10
+        V_LSHLREV_V1_2_V0,
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        S_ENDPGM,
+    ];
+    let or64 = run_io(&salu_or, 0, 64, 0);
+    for (i, &got) in or64.iter().enumerate() {
+        let want = if i % 4 == 0 { 0x0000_FFFF } else { CANARY };
+        assert_eq!(got, want, "64-lane salu_or lane {i}");
+    }
+    let or128 = run_io(&salu_or, 0, 128, 0);
+    for (i, &got) in or128.iter().enumerate() {
+        let want = if i % 4 != 0 {
+            CANARY
+        } else if i < 64 {
+            0x0000_FFFF
+        } else {
+            0xFFFF_0000
+        };
+        assert_eq!(got, want, "128-lane salu_or lane {i}");
+    }
+
+    // 3. Single-wave (64-lane) compute programs that previously failed `emit_fast` fell back to
+    //    `lockstep::retry`; verify `emit_fast` produces the exact same GPU output as `lockstep`
+    //    (forced by appending a `v_readlane_b32` behind an `EXEC` branch that `emit_fast` refuses).
+    for (fast_out, src) in [(&got64, &lane63_sum[..]), (&or64, &salu_or[..])] {
+        let mut lockstep_words = src[..src.len() - 1].to_vec();
+        lockstep_words.extend([
+            0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+            0xBE90_246A, // s_and_saveexec_b64 s[16:17], vcc
+            0xBF88_0005, // s_cbranch_execz +5
+            0xD760_0012,
+            0x0001_4700, // v_readlane_b32 s18, v0, 35 (behind EXEC branch -> forces lockstep)
+            0x7E0C_0212, // v_mov_b32 v6, s18
+            0xDC70_8200,
+            0x0002_0601, // global_store_dword v1, v6, s[2:3] offset:512
+            0x88FE_107E, // s_or_b64 exec, exec, s[16:17]
+            S_ENDPGM,
+        ]);
+        assert!(
+            refusal(&lockstep_words).is_some(),
+            "readlane behind EXEC branch must refuse emit_fast"
+        );
+        assert_eq!(&run_io(&lockstep_words, 0, 64, 0), fast_out);
+    }
+}
+
+#[test]
+fn a_mask_joined_with_data_on_an_exec_skips_edge_is_its_lanes_in_lockstep() {
+    // Lanes below the flag enter a region that `s_cbranch_execz` skips when none do; `s[10:11]` is
+    // a mask in it (the lanes below 8) and data on the skip's edge (5, and a mask's high dword),
+    // read at the join only ANDed with EXEC. A lane read makes it run in lockstep, where the skip
+    // is `s_cmp_eq_u64 exec, 0; s_cbranch_scc1` and its edge brings an empty EXEC: the data is not
+    // needed (was refused: "data whose high dword is not known").
+    let w = [
+        0xD4C4_000A, 0x0202_0090, // v_cmp_gt_u32 s[10:11], 16, v0
+        0xBE8A_0385, // s_mov_b32 s10, 5
+        V_LSHLREV_V1_2_V0,
+        0x4A06_00FF, 0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D88_0004, // v_cmp_gt_u32 vcc, s4, v0
+        0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+        skip_execz(5),
+        0xD760_0008, 0x0201_4703, // v_readlane_b32 s8, v3, 35
+        0x7E04_0208, // v_mov_b32 v2, s8
+        0xD4C4_000A, 0x0202_0088, // v_cmp_gt_u32 s[10:11], 8, v0
+        0x878C_7E0A, // join: s_and_b64 s[12:13], s[10:11], exec
+        0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+        0x87FE_7E0C, // s_and_b64 exec, s[12:13], exec
+        0x4A04_0487, // v_add_nc_u32 v2, 7, v2
+        0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+        GLOBAL_STORE_V2_AT_V1[0], GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let got = run(&w, 0, 40);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..8], [1042; 8]);
+    assert_eq!(got[8..40], [1035; 32]);
+    assert_eq!(got[40..], [0; 24]);
+    // No lane enters: the skip's edge is the one taken.
+    assert_eq!(run(&w, 0, 0), [0; 64]);
+}
+
+#[test]
+fn a_loop_register_that_is_exec_on_every_edge_counts_the_lanes_still_looping() {
+    // Two nested loops keeping the lanes still looping in an SGPR beside EXEC (a copy of EXEC
+    // before the loop, `s_andn2_b64 s, s, exec` at the head, `s_andn2_wrexec_b64 s, s` at the back
+    // edge). At the inner head `s[4:5]` is EXEC: each lane adds its bit count there to v6. Lanes
+    // 1..39 run the inner loop once (39 looping), lane 6 twice (then alone), lane 10 runs the
+    // outer loop twice (alone the second time); lane 0 and lanes 40 and up never get there.
+    // Stored: v6 << 16 | v1 (inner iterations) << 8 | v2 (7 per inner loop left).
+    let w = [
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0x7DA8_00A8, // v_cmpx_gt_u32 40, v0
+        0xBE8A_047E, // s_mov_b64 s[10:11], exec
+        0xBE8E_0480, // s_mov_b64 s[14:15], 0
+        0x7E08_0300, // v_mov_b32 v4, v0
+        0x7DA4_0880, // O: v_cmpx_eq_u32 0, v4
+        0x8A8A_7E0A, // s_andn2_b64 s[10:11], s[10:11], exec
+        0xBF84_0020, // s_cbranch_scc0 OEND
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+        0xBE84_047E, // s_mov_b64 s[4:5], exec
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+        0xBE88_0480, // s_mov_b64 s[8:9], 0
+        0x7E06_0304, // v_mov_b32 v3, v4
+        0xBE92_1004, // L: s_bcnt1_i32_b64 s18, s[4:5]
+        0x4A0C_0C12, // v_add_nc_u32 v6, s18, v6
+        0x7DA4_0680, // v_cmpx_eq_u32 0, v3
+        0x8A84_7E04, // s_andn2_b64 s[4:5], s[4:5], exec
+        0xBF84_000A, // s_cbranch_scc0 END
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0x4A06_06C1, // v_add_nc_u32 v3, -1, v3
+        0xD4C2_000C, 0x0202_0685, // v_cmp_eq_u32 s[12:13], 5, v3
+        0xBE8C_080C, // s_not_b64 s[12:13], s[12:13]
+        0x87FE_7E0C, // s_and_b64 exec, s[12:13], exec
+        0x8888_7E08, // s_or_b64 s[8:9], s[8:9], exec
+        0xBE84_3A04, // s_andn2_wrexec_b64 s[4:5], s[4:5]
+        0xBF85_FFF1, // s_cbranch_scc1 L
+        0xBEFE_0406, // END: s_mov_b64 exec, s[6:7]
+        0x87FE_7E08, // s_and_b64 exec, s[8:9], exec
+        0x4A04_0487, // v_add_nc_u32 v2, 7, v2
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0x4A08_08C1, // v_add_nc_u32 v4, -1, v4
+        0xD4C2_0010, 0x0202_0889, // v_cmp_eq_u32 s[16:17], 9, v4
+        0xBE90_0810, // s_not_b64 s[16:17], s[16:17]
+        0x87FE_7E10, // s_and_b64 exec, s[16:17], exec
+        0x888E_7E0E, // s_or_b64 s[14:15], s[14:15], exec
+        0xBE8A_3A0A, // s_andn2_wrexec_b64 s[10:11], s[10:11]
+        0xBF85_FFDD, // s_cbranch_scc1 O
+        0xBEFE_04C1, // OEND: s_mov_b64 exec, -1
+        0x3402_0288, // v_lshlrev_b32 v1, 8, v1
+        0x340C_0C90, // v_lshlrev_b32 v6, 16, v6
+        0x4A04_0501, // v_add_nc_u32 v2, v1, v2
+        0x4A04_0506, // v_add_nc_u32 v2, v6, v2
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0], GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    let lane = |n: u32| match n {
+        0 | 40.. => 0,
+        6 => 40 << 16 | 2 << 8 | 7,
+        10 => 40 << 16 | 2 << 8 | 14,
+        _ => 39 << 16 | 1 << 8 | 7,
+    };
+    assert_eq!(got, (0..64).map(lane).collect::<Vec<_>>());
+}
+
+/// A wave maximum the compiler finishes only in the upper half (lanes 32..63 take lane 0's half
+/// maximum), read at lane 63 by a later whole-wave section that shifts it with a scalar step
+/// inside the section, and again after it. Lanes 0..39 are on: every read is 39, the shift 19.
+fn max_read_at_lane(lane_after: u32) -> Vec<u32> {
+    vec![
+        0x7D88_00A8, // v_cmp_gt_u32_e32 vcc, 40, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0001, 0x0022_0080, // v_cndmask_b32_e64 v1, 0, v0, s[8:9]
+        0x2802_02FA, 0xFF04_B101, // v_max_u32_dpp v1, v1, v1 quad_perm:[1,0,3,2] fi:1
+        0x2802_02FA, 0xFF04_4E01, // v_max_u32_dpp v1, v1, v1 quad_perm:[2,3,0,1] fi:1
+        0x2802_02FA, 0xFF05_4101, // v_max_u32_dpp v1, v1, v1 row_half_mirror fi:1
+        0x2802_02FA, 0xFF05_4001, // v_max_u32_dpp v1, v1, v1 row_mirror fi:1
+        0xD778_0002, 0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0x2802_0501, // v_max_u32_e32 v1, v1, v2
+        0xD760_000A, 0x0201_0101, // v_readlane_b32 s10, v1, 0
+        0x2802_020A, // v_max_u32_e32 v1, s10, v1
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD760_000E, 0x0201_7F01, // v_readlane_b32 s14, v1, 63
+        0x900F_810E, // s_lshr_b32 s15, s14, 1
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xD760_0010, 0x0200_0101 | (128 + lane_after) << 9, // v_readlane_b32 s16, v1, lane_after
+        0x8F10_8810, // s_lshl_b32 s16, s16, 8
+        0x880F_100F, // s_or_b32 s15, s15, s16
+        0x7E06_020F, // v_mov_b32_e32 v3, s15
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        0x0002_0301, // global_store_dword v1, v3, s[2:3]
+        S_ENDPGM,
+    ]
+}
+
+#[test]
+fn a_wave_maximum_read_at_its_last_lane_after_its_section_is_the_maximum() {
+    let w = max_read_at_lane(63);
+    assert_eq!(refusal(&w), None);
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..40], [19 | 39 << 8; 40]);
+    assert_eq!(got[40..64], [CANARY; 24]);
+}
+
+/// Lane 0 holds only the lower half's maximum: no wave operation gives it, so it stays refused.
+#[test]
+fn a_lane_holding_half_a_wave_maximum_is_refused() {
+    let why = refusal(&max_read_at_lane(0));
+    assert!(why.as_deref().is_some_and(|w| w.contains("no reduction or prefix")), "{why:?}");
+}

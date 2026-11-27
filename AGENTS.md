@@ -38,6 +38,13 @@ You need your own copy of the game. Windowed, for a person: `tools/macos/run-nat
 - Keep builds polite: `-j6` or fewer, under `nice`.
 - The game saves its setup choices in `~/.cache/victory/data/7952987A/storage`. Once setup has been completed, runs skip the setup screens; delete that folder to see them again.
 
+## Checking a translator change on a shader corpus
+
+A change under `crates/victory-shader` can be checked against every shader the game registers, without running it. In the tree before the change and in the tree after it: `cargo run --release -p victory-shader --example sweep -- <corpus folder> -j 4 > <outside the repo>/<name>.tsv`. Then `tools/corpus/compare.sh <before>.tsv <after>.tsv` lists the shaders newly translated, the regressions, those whose output changed and those refused for another reason (`--self-test` checks the script). No regression is the bar; explain every changed output.
+
+- The corpus is your own dump (`VICTORY_DUMP_ALL_SHADERS=1 VICTORY_DUMP_REFUSED=<folder>` on a run): game data. It and the sweep files stay outside the repo and are never committed, attached or sent anywhere; quote counts, shader hashes and refusal messages.
+- One target directory per tree, and `-j 4` or fewer for a whole corpus on a shared machine. Details: `docs/native-host.md`, "Sweeping a shader corpus".
+
 ## Where things are
 
 | Area | Code |

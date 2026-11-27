@@ -878,6 +878,9 @@ struct State<B: GraphicsBackend> {
 
 pub struct NativeList<B: GraphicsBackend> {
     pub(super) cmds: Vec<Cmd<B>>,
+    /// Pass-trace lines (`VICTORY_TRACE_PASSES`), each with the command count when it was recorded;
+    /// empty unless the trace's window is open.
+    pub(super) notes: Vec<(usize, String)>,
     state: State<B>,
 }
 
@@ -892,6 +895,7 @@ impl<B: GraphicsBackend> Default for NativeList<B> {
     fn default() -> Self {
         NativeList {
             cmds: Vec::new(),
+            notes: Vec::new(),
             state: State {
                 compute: None,
                 graphics: None,
@@ -938,6 +942,7 @@ impl<B: GraphicsBackend> NativeList<B> {
     pub fn cut(&mut self) -> NativeList<B> {
         NativeList {
             cmds: std::mem::take(&mut self.cmds),
+            notes: std::mem::take(&mut self.notes),
             ..NativeList::default()
         }
     }
@@ -946,6 +951,7 @@ impl<B: GraphicsBackend> NativeList<B> {
     pub fn snapshot(&self) -> NativeList<B> {
         NativeList {
             cmds: self.cmds.clone(),
+            notes: self.notes.clone(),
             ..NativeList::default()
         }
     }
@@ -1312,6 +1318,7 @@ impl<B: GraphicsBackend> NativeList<B> {
                 index_count == 0 || instance_count == 0
             }
             DrawCall::Mesh { groups } => groups.contains(&0),
+            DrawCall::Rects => false,
         };
         if empty {
             self.state
@@ -1339,6 +1346,12 @@ impl<B: GraphicsBackend> NativeList<B> {
         index: u32,
     ) -> Result<(), String> {
         self.draw_indirect_from(record, indexed, Some((count, index)))
+    }
+
+    /// One rectangle-list draw of `ExecuteIndirect` (`DrawCall::Rects`): the record at title
+    /// address `record`, with `count` as [`Self::draw_indirect_counted`]'s.
+    pub fn draw_rects_indirect(&mut self, record: u64, count: Option<(u64, u32)>) -> Result<(), String> {
+        self.draw_from(DrawCall::Rects, Some(record), count)
     }
 
     fn draw_indirect_from(

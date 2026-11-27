@@ -490,13 +490,13 @@ pub struct Tracked<B: ResourceBackend> {
     /// Render-target views already made, kept so the same attachment keeps its identity.
     #[cfg(target_os = "macos")]
     target_views: Vec<(ViewDesc, Rc<B::Texture>)>,
-    /// A GPU copy wrote it: its host texture holds what title memory does not, and is never
-    /// filled from that memory again.
+    /// The GPU wrote it (a copy, draw, clear or dispatch): its host texture holds what title
+    /// memory does not, and is never filled from that memory again.
     gpu_written: bool,
 }
 
 impl<B: ResourceBackend> Tracked<B> {
-    /// Whether the host texture is no longer filled from title memory: a GPU copy wrote it
+    /// Whether the host texture is no longer filled from title memory: the GPU wrote it
     /// ([`Title::gpu_written`]). One never uploaded and not a render target takes its first upload.
     fn kept_from_memory(&self) -> bool {
         self.gpu_written && (self.uploads > 0 || self.info.render_target())
@@ -966,13 +966,17 @@ impl<B: PresentBackend> Title<B> {
         None
     }
 
-    /// A GPU copy writes title texture `key` (made already): from now on the host texture is the
-    /// GPU's, as a render target's is, and the CPU-side sync no longer fills it from title memory.
+    /// The GPU writes title texture `key` (made already): a copy, draw or clear recorded into it,
+    /// or a prepared dispatch's unordered-access view of it. From now on the host texture is the
+    /// GPU's and the CPU-side sync no longer fills it from title memory (which titles change under
+    /// their render targets: uploaded, that was block noise over what the GPU drew).
     /// A sampled texture not uploaded yet still takes its first upload, at the submission and so
-    /// before the copy runs (a copy of a region keeps the rest).
+    /// before the write runs (a copy of a region keeps the rest).
     /// shortcut: what the title writes into its memory afterwards is not seen; when a title is
-    /// found to refill a copy's destination from the CPU, upload a change again.
+    /// found to refill a GPU-written texture from the CPU, upload a change again.
     pub fn gpu_written(&mut self, key: usize) {
+        // A placed view sharing an object's texture ([`Self::alias_placed`]) writes the object's.
+        let key = self.shared.iter().find(|(_, (_, placed))| *placed == key).map_or(key, |(&object, _)| object);
         if let Some(t) = self.textures.get_mut(&key) {
             t.gpu_written = true;
             (t.hot_until, t.blank) = (0, false);
@@ -986,6 +990,13 @@ impl<B: PresentBackend> Title<B> {
 
     pub fn texture_released(&mut self, key: usize) {
         self.textures.remove(&key);
+        // A placed view that shares this texture ([`Self::alias_placed`]) goes with it.
+        if let Some((address, placed)) = self.shared.remove(&key)
+            && self.placed.get(&address).is_some_and(|&(k, _)| k == placed)
+        {
+            self.placed.remove(&address);
+            self.host.release_resource(placed);
+        }
         self.pending.remove(&key);
         self.unloaded.remove(&key);
         self.hot_keys.retain(|&k| k != key);
@@ -1013,6 +1024,40 @@ impl<B: PresentBackend> Title<B> {
             self.host.forget_resource(old);
             self.texture_released(old);
         }
+    }
+
+    /// A placed R9G9B9E5 texture `key` laid out exactly as a live R32_UINT resource object at the
+    /// same memory (the title reads as floats what compute wrote as integers): `key` names the
+    /// object's host texture, which its views cast, instead of a copy only title memory fills.
+    /// `false` (nothing done) for any other placed texture.
+    pub fn alias_placed(&mut self, address: u64, key: usize, info: &TextureInfo) -> bool {
+        let over = |o: &TextureInfo| {
+            o.format == 42 && o.memory == info.memory && o.size == info.size && o.layout == info.layout
+        };
+        // Object keys are addresses; placed keys have the top bit set ([`placed_key`]).
+        let object = |k: usize| k >> 63 == 0;
+        if info.format != 67 {
+            return false;
+        }
+        let Some(obj) = self
+            .textures
+            .iter()
+            .map(|(&k, t)| (k, &t.info))
+            .chain(self.pending.iter().map(|(&k, i)| (k, i)))
+            .find(|&(k, i)| object(k) && over(i))
+            .map(|(k, _)| k)
+        else {
+            return false;
+        };
+        let Some(texture) = self.texture_of(obj) else { return false };
+        self.host.register_texture(key, &texture);
+        self.shared.insert(obj, (address, key));
+        static ALIASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = ALIASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 1000 {
+            tracing::info!(placed = format!("{key:#x}"), object = format!("{obj:#x}"), aliased = n, "a placed R9G9B9E5 view shares an R32_UINT texture");
+        }
+        true
     }
 
     /// Releases the textures placed in pools the title released since the last call.
@@ -1181,6 +1226,10 @@ impl<B: PresentBackend> Title<B> {
                     t.hot_until = sync_serial.wrapping_add(u64::from(HOT));
                 }
                 t.blank = r.blank;
+            }
+            // Pass trace: uploads from title memory into textures the GPU writes (targets, UAVs).
+            if super::pass_on() && (t.info.render_target() || t.info.flags & UNORDERED_ACCESS != 0) {
+                eprintln!("PASSUPLOAD key={key:#x} fmt={} {}x{} at={:#x} rt={} uav={} uploads={} blank={} unreadable={}", t.info.format, t.info.width, t.info.height, t.info.memory as usize, t.info.render_target(), t.info.flags & UNORDERED_ACCESS != 0, t.uploads, r.blank, r.unreadable);
             }
             upload_levels(&host.backend, &t.texture, &levels);
             t.last = Some(r.hash);

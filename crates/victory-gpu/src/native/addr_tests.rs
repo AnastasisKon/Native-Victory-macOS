@@ -497,16 +497,7 @@ fn compares_with_16bit_dpp_vcmpx_and_class_run_on_the_gpu() {
 
 #[test]
 fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
-    let vertex = [
-        0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
-        0xD501_0001, 0x01A9_FEF3, 0x4040_0000, // v_cndmask_b32 v1, -1.0, 3.0, vcc
-        0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
-        0xD501_0002, 0x01A9_FEF3, 0x4040_0000, // v_cndmask_b32 v2, -1.0, 3.0, vcc
-        0x7E06_0280, // v_mov_b32 v3, 0
-        0x7E08_02F2, // v_mov_b32 v4, 1.0
-        0xF800_08CF, 0x0403_0201, // exp pos0 v1, v2, v3, v4 done
-        0xBF81_0000, // s_endpgm
-    ];
+    let vertex = SCREEN_TRIANGLE;
     let pixel = [
         0x8004_9000, // s_add_u32 s4, s0, 16
         0x8205_8080, // s_addc_u32 s5, 0, 0
@@ -570,6 +561,84 @@ fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
     let mut pixels = [0; 8 * 8 * 4];
     t.host.backend.read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
     assert_eq!(&pixels[(4 * 8 + 4) * 4..][..4], [128, 0, 0, 255]);
+}
+
+/// A guessed vertex shader of the triangle over the whole target.
+const SCREEN_TRIANGLE: [u32; 13] = [
+    0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+    0xD501_0001, 0x01A9_FEF3, 0x4040_0000, // v_cndmask_b32 v1, -1.0, 3.0, vcc
+    0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
+    0xD501_0002, 0x01A9_FEF3, 0x4040_0000, // v_cndmask_b32 v2, -1.0, 3.0, vcc
+    0x7E06_0280, // v_mov_b32 v3, 0
+    0x7E08_02F2, // v_mov_b32 v4, 1.0
+    0xF800_08CF, 0x0403_0201, // exp pos0 v1, v2, v3, v4 done
+    0xBF81_0000, // s_endpgm
+];
+
+/// A pixel program's wave maximum, finished by the compiler only in lanes 32..63, read at lane
+/// 63 inside a later whole-wave section (and shifted there by a scalar step) and after it:
+/// (39 >> 1, 39) out as unorm bytes.
+#[test]
+fn a_pixel_wave_maximum_read_at_its_last_lane_is_drawn() {
+    let pixel = [
+        0x7E00_02A7, // v_mov_b32_e32 v0, 39
+        0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0001, 0x0022_0080, // v_cndmask_b32_e64 v1, 0, v0, s[8:9]
+        0x2802_02FA, 0xFF04_B101, // v_max_u32_dpp v1, v1, v1 quad_perm:[1,0,3,2] fi:1
+        0x2802_02FA, 0xFF04_4E01, // v_max_u32_dpp v1, v1, v1 quad_perm:[2,3,0,1] fi:1
+        0x2802_02FA, 0xFF05_4101, // v_max_u32_dpp v1, v1, v1 row_half_mirror fi:1
+        0x2802_02FA, 0xFF05_4001, // v_max_u32_dpp v1, v1, v1 row_mirror fi:1
+        0xD778_0002, 0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0x2802_0501, // v_max_u32_e32 v1, v1, v2
+        0xD760_000A, 0x0201_0101, // v_readlane_b32 s10, v1, 0
+        0x2802_020A, // v_max_u32_e32 v1, s10, v1
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD760_000E, 0x0201_7F01, // v_readlane_b32 s14, v1, 63
+        0x900F_810E, // s_lshr_b32 s15, s14, 1
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xD760_0010, 0x0201_7F01, // v_readlane_b32 s16, v1, 63
+        0x7E04_0C0F, // v_cvt_f32_u32_e32 v2, s15
+        0x7E06_0C10, // v_cvt_f32_u32_e32 v3, s16
+        0x1004_04FF, 0x3B80_8081, // v_mul_f32_e32 v2, 1/255, v2
+        0x1006_06FF, 0x3B80_8081, // v_mul_f32_e32 v3, 1/255, v3
+        0x7E08_0280, // v_mov_b32_e32 v4, 0
+        0x7E0A_02F2, // v_mov_b32_e32 v5, 1.0
+        0xF800_180F, 0x0504_0302, // exp mrt0 v2, v3, v4, v5 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let translate = |stage, words: &[u32]| {
+        let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let c = victory_shader::emit::graphics::container(stage, &bytes, &[0; 0x10]).unwrap();
+        shaders::translate(&c).unwrap()
+    };
+    let (vs, ps) = (translate(HwStage::Vs, &SCREEN_TRIANGLE), translate(HwStage::Ps, &pixel));
+    use victory_metal::msc::{DEFAULT_DYLIB, Msc};
+    if !std::path::Path::new(DEFAULT_DYLIB).exists() && std::env::var_os("VICTORY_MSC_DYLIB").is_none() {
+        eprintln!("skipped: Metal Shader Converter not installed");
+        return;
+    }
+    let Ok(metal) = Metal::new() else {
+        eprintln!("skipped the draw: no Metal device");
+        return;
+    };
+    let mut t = Title::new(metal, Arc::new(crate::native::memory::PoolTable::default()));
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "wave maximum") else {
+        panic!("{:?}", t.shaders);
+    };
+    let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+    desc.render_target = true;
+    let color = t.host.texture(&desc).unwrap();
+    let mut list = NativeList::default();
+    list.set_render_targets(std::slice::from_ref(&color), None);
+    list.set_graphics_pipeline(&pso, Topology::Triangles);
+    list.set_graphics_binding(binding);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    super::run(&t.host, &[&list]);
+    let mut pixels = [0; 8 * 8 * 4];
+    t.host.backend.read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
+    assert!(pixels.chunks(4).all(|p| p == [19, 39, 0, 255]), "{pixels:?}");
 }
 
 /// A guessed vertex shader reads its positions through a buffer descriptor built around the address

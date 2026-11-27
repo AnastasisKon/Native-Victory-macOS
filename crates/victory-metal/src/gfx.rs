@@ -49,6 +49,8 @@ pub struct Heap {
     /// retaining it here keeps its `gpuResourceID` live without duplicating the pool's pages in
     /// `alloc_counts` / `MTLResidencySet` / per-encoder `useResource`.
     refs: RefCell<std::collections::HashMap<usize, (Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>>,
+    /// Entries in `refs` that currently hold `Some(texture_buffer)`.
+    typed_views: Cell<usize>,
     /// The distinct allocations `refs` names, by raw `MTLResource` pointer, with how many entries
     /// name each: an allocation is added to `set` once and removed + committed before its last
     /// `refs` entry is dropped, and without a set each is named to an encoder once.
@@ -530,6 +532,7 @@ impl Metal {
                 .enumerate()
                 .for_each(|(i, w)| p.add(i).write_volatile(*w));
         }
+        let added_typed = matches!(keep, Some((_, Some(_))));
         let old = match keep {
             Some((r, tex_view)) => {
                 let ptr = (&*r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
@@ -547,6 +550,12 @@ impl Metal {
             }
             None => heap.refs.borrow_mut().remove(&index),
         };
+        let removed_typed = matches!(old, Some((_, Some(_))));
+        if added_typed != removed_typed {
+            let n = heap.typed_views.get();
+            heap.typed_views
+                .set(if added_typed { n + 1 } else { n - 1 });
+        }
         if let Some((old, old_tex_view)) = old {
             let old_ptr = (&*old as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
             let mut counts = heap.alloc_counts.borrow_mut();
@@ -841,6 +850,7 @@ impl ResourceBackend for Metal {
             kind,
             count,
             refs: RefCell::default(),
+            typed_views: Cell::new(0),
             alloc_counts: RefCell::default(),
             set,
             dirty: Cell::new(false),
@@ -875,12 +885,12 @@ impl ResourceBackend for Metal {
         size: u32,
         format: Format,
         writable: bool,
-    ) {
+    ) -> bool {
         debug_assert_eq!(heap.kind, HeapKind::Resource);
         let (bw, elem_bytes) = format.block();
         if bw != 1 || format.is_depth() || size == 0 {
             self.write_buffer(heap, index, buffer, title, size);
-            return;
+            return false;
         }
         let pf = pixel_format(format);
         let align = self
@@ -892,7 +902,7 @@ impl ResourceBackend for Metal {
         let width = ((size as usize) / elem_bytes).min(max_elems).min(1 << 26);
         if width == 0 {
             self.write_buffer(heap, index, buffer, title, size);
-            return;
+            return false;
         }
         if !offset.is_multiple_of(align) {
             static WARNED: std::sync::atomic::AtomicBool =
@@ -915,7 +925,7 @@ impl ResourceBackend for Metal {
                 );
             }
             self.write_buffer(heap, index, buffer, title, size);
-            return;
+            return false;
         }
         let td = MTLTextureDescriptor::new();
         td.setTextureType(MTLTextureType::TypeTextureBuffer);
@@ -935,7 +945,7 @@ impl ResourceBackend for Metal {
             .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, width * elem_bytes)
         else {
             self.write_buffer(heap, index, buffer, title, size);
-            return;
+            return false;
         };
         let gpu = self.gpu_address(buffer, title);
         let tex_id = resource_id(tex.gpuResourceID());
@@ -946,6 +956,7 @@ impl ResourceBackend for Metal {
             [gpu, tex_id, size as u64],
             Some((keep_buf, Some(tex))),
         );
+        true
     }
 
     fn write_texture(&self, heap: &Heap, index: usize, t: &Texture, min_lod: f32) {
@@ -965,6 +976,10 @@ impl ResourceBackend for Metal {
 
     fn clear_entry(&self, heap: &Heap, index: usize) {
         self.heap_entry(heap, index, [0; 3], None);
+    }
+
+    fn heap_typed_views(&self, heap: &Heap) -> usize {
+        heap.typed_views.get()
     }
 
     fn heap_allocations(&self, heap: &Heap, last_used: &[u32]) -> Option<Vec<HeapAllocation>> {
@@ -2245,17 +2260,28 @@ pub fn direct_copy(a: Format, b: Format) -> bool {
 /// `ExecuteIndirect` with a count buffer runs record `index` only while `index < count`, both read
 /// on the GPU: this one-thread kernel copies the record's `words`, or zeros (no groups, no
 /// vertices or instances), into a buffer of its own, which the indirect command then reads.
-/// Bound at 20 and up, apart from the converter's slots.
+/// A rectangle list's record (`DrawCall::Rects`) becomes the four-vertex strip instances a direct
+/// one draws: (4, vertices / 3, 0, first vertex / 3).
+/// Bound at 20 and up, apart from the converter's slots. `at`: the record's index, its words,
+/// whether a count applies, whether it is a rectangle list's.
 const GATE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 kernel void gate(device const uint *count [[buffer(20)]],
                  device const uint *record [[buffer(21)]],
                  device uint *out [[buffer(22)]],
-                 constant uint2 &at [[buffer(23)]]) {
-    bool run = at.x < count[0];
+                 constant uint4 &at [[buffer(23)]]) {
+    bool run = at.z == 0u || at.x < count[0];
     for (uint w = 0; w < at.y; w++) {
         out[w] = run ? record[w] : 0u;
+    }
+    if (at.w != 0u) {
+        // shortcut: an instanced rectangle list draws nothing (the rectangle translation takes the
+        // instance for the rectangle); draw its instances when a title is seen to use them.
+        out[0] = 4u;
+        out[1] = run && record[1] == 1u ? record[0] / 3u : 0u;
+        out[2] = 0u;
+        out[3] = run ? record[2] / 3u : 0u;
     }
 }
 "#;
@@ -2282,7 +2308,8 @@ impl Metal {
             .map_err(Clone::clone)
     }
 
-    /// Encodes the gate of one counted record (`words` long at `record`) into `e`; returns the
+    /// Encodes the gate of one counted (`count`: buffer, address, index) or rectangle-list (`rect`)
+    /// record (`words` long at `record`) into `e`; returns the
     /// buffer the indirect command reads instead of the record. Tracked by Metal (unlike the
     /// title's pools), so whatever reads it later in the command buffer waits for the write.
     /// shortcut: one gate dispatch and one small buffer per record; gate all the records of one
@@ -2290,15 +2317,19 @@ impl Metal {
     fn encode_gate(
         &self,
         e: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-        (count, at, index): (&Buffer, *const u8, u32),
+        count: Option<(&Buffer, *const u8, u32)>,
         (record, title): (&Buffer, *const u8),
         words: u32,
+        rect: bool,
         set_on_queue: bool,
     ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, String> {
         let out = self
             .dev
             .newBufferWithLength_options(words as usize * 4, MTLResourceOptions::StorageModePrivate)
             .ok_or("no buffer for a gated indirect record")?;
+        let counted = u32::from(count.is_some());
+        // Without a count, slot 20 is bound to the record (not read).
+        let (count, at, index) = count.unwrap_or((record, title, 0));
         for b in [count, record] {
             if self.names(b, set_on_queue) {
                 e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
@@ -2307,7 +2338,7 @@ impl Metal {
         // What the work before wrote (the count, the record) is seen.
         e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
         e.setComputePipelineState(self.gate_pipeline()?);
-        let args = [index, words];
+        let args = [index, words, counted, u32::from(rect)];
         // SAFETY: both title ranges lie inside live buffers (the caller resolved them); the bytes
         // are copied before the call returns.
         unsafe {
@@ -2320,7 +2351,7 @@ impl Metal {
             e.setBuffer_offset_atIndex(Some(&out), 0, 22);
             e.setBytes_length_atIndex(
                 NonNull::new(args.as_ptr().cast_mut().cast()).unwrap(),
-                8,
+                16,
                 23,
             );
         }
@@ -2364,7 +2395,7 @@ impl Metal {
             let gated = match (d.count, d.indirect) {
                 (Some(count), Some(record)) => {
                     // An open encoder left behind makes Metal abort at the next pass's encoder.
-                    Some(self.encode_gate(&e, count, record, 3, set_on_queue).inspect_err(|_| e.endEncoding())?)
+                    Some(self.encode_gate(&e, Some(count), record, 3, false, set_on_queue).inspect_err(|_| e.endEncoding())?)
                 }
                 _ => None,
             };
@@ -2564,13 +2595,11 @@ impl Metal {
                 None => a.setLoadAction(MTLLoadAction::Load),
             }
         }
-        // Counted indirect draws are gated first, in a compute pass of their own.
+        // Counted indirect draws and indirect rectangle lists are gated first, in a compute pass
+        // of their own.
+        let gated = |d: &Draw<'_, Metal>| d.indirect.is_some() && (d.count.is_some() || matches!(d.call, DrawCall::Rects));
         let mut gates = Vec::new();
-        if rp
-            .draws
-            .iter()
-            .any(|d| d.count.is_some() && d.indirect.is_some())
-        {
+        if rp.draws.iter().any(gated) {
             let c = cb.computeCommandEncoder().ok_or("no compute encoder")?;
             if let Some((f, started)) = order
                 && started.get()
@@ -2580,13 +2609,14 @@ impl Metal {
             for d in &rp.draws {
                 let words = match d.call {
                     DrawCall::Indexed { .. } => 5,
-                    DrawCall::Arrays { .. } => 4,
+                    DrawCall::Arrays { .. } | DrawCall::Rects => 4,
                     DrawCall::Mesh { .. } => 3,
                 };
-                gates.push(match (d.count, d.indirect) {
-                    (Some(count), Some(record)) => {
-                        Some(self.encode_gate(&c, count, record, words, set_on_queue).inspect_err(|_| c.endEncoding())?)
-                    }
+                gates.push(match d.indirect {
+                    Some(record) if gated(d) => Some(
+                        self.encode_gate(&c, d.count, record, words, matches!(d.call, DrawCall::Rects), set_on_queue)
+                            .inspect_err(|_| c.endEncoding())?,
+                    ),
                     _ => None,
                 });
             }
@@ -2647,7 +2677,7 @@ impl Metal {
             // The stage that reads the draw's buffers before the pixel shader.
             let first = match (d.pipeline.mesh, d.call) {
                 (Some(_), DrawCall::Mesh { .. }) => MTLRenderStages::Mesh,
-                (None, DrawCall::Arrays { .. } | DrawCall::Indexed { .. }) => MTLRenderStages::Vertex,
+                (None, DrawCall::Arrays { .. } | DrawCall::Indexed { .. } | DrawCall::Rects) => MTLRenderStages::Vertex,
                 _ => {
                     static ONCE: std::sync::Once = std::sync::Once::new();
                     ONCE.call_once(|| eprintln!("metal: a mesh draw of a vertex pipeline, or the reverse, is dropped"));
@@ -2806,7 +2836,7 @@ impl Metal {
                 // SAFETY: the record is inside the live buffer (the caller resolved it).
                 unsafe { e.setVertexBuffer_offset_atIndex(Some(args), at, DRAW_ARGUMENTS) };
                 match (d.call, d.index_buffer) {
-                    (DrawCall::Arrays { .. }, _) => {
+                    (DrawCall::Arrays { .. } | DrawCall::Rects, _) => {
                         set_index_type(&e, 0);
                         // SAFETY: as above.
                         unsafe { e.drawPrimitives_indirectBuffer_indirectBufferOffset(prim, args, at) };
@@ -2877,6 +2907,7 @@ impl Metal {
                         )
                     };
                 }
+                DrawCall::Rects => unreachable!("an indirect-only call, and so empty here"),
                 DrawCall::Indexed {
                     index_count,
                     instance_count,
@@ -2951,6 +2982,8 @@ fn empty_draw(call: &DrawCall) -> bool {
             index_count == 0 || instance_count == 0
         }
         DrawCall::Mesh { groups } => groups.contains(&0),
+        // Only an indirect call.
+        DrawCall::Rects => true,
     }
 }
 
@@ -3625,13 +3658,16 @@ mod heap_set_tests {
                     .read_unaligned()
             }
         };
-        m.write_typed_buffer(&heap, 0, &buf, arena.primary, 1024, Format::Rgba32Uint, true);
+        assert!(m.write_typed_buffer(&heap, 0, &buf, arena.primary, 1024, Format::Rgba32Uint, true));
+        assert_eq!(m.heap_typed_views(&heap), 1);
         assert_ne!(entry_words(0)[1], 0, "aligned typed buffer writes textureViewID");
         // SAFETY: `1024` and `4` are inside the 64 KiB `arena` allocation.
         let second = unsafe { arena.primary.add(1024) };
         let unaligned = unsafe { arena.primary.add(4) };
-        m.write_typed_buffer(&heap, 1, &buf, second, 1024, Format::Rgba32Float, true);
-        m.write_typed_buffer(&heap, 2, &buf, unaligned, 1024, Format::Rgba32Float, true);
+        assert!(m.write_typed_buffer(&heap, 1, &buf, second, 1024, Format::Rgba32Float, true));
+        assert_eq!(m.heap_typed_views(&heap), 2);
+        assert!(!m.write_typed_buffer(&heap, 2, &buf, unaligned, 1024, Format::Rgba32Float, true));
+        assert_eq!(m.heap_typed_views(&heap), 2, "unaligned fallback holds no typed view");
         assert_ne!(entry_words(2)[0], 0, "unaligned fallback preserves gpuVA in word 0");
         assert_eq!(entry_words(2)[1], 0, "unaligned fallback leaves textureViewID null");
         assert_eq!(entry_words(2)[2], 1024);
@@ -3641,10 +3677,15 @@ mod heap_set_tests {
             heap_only + arena.len as u64,
             "buffer-backed texture views do not multiply the pool's residency-set size"
         );
+        m.write_buffer(&heap, 0, &buf, arena.primary, 1024);
+        assert_eq!(m.heap_typed_views(&heap), 1, "overwriting with write_buffer drops the typed view");
+        assert_eq!(entry_words(0)[1], 0, "write_buffer zeroes textureViewID");
         m.clear_entry(&heap, 0);
         m.clear_entry(&heap, 2);
         assert_eq!(held(), 2);
+        assert_eq!(m.heap_typed_views(&heap), 1);
         m.clear_entry(&heap, 1);
+        assert_eq!(m.heap_typed_views(&heap), 0, "clear_entry drops the last typed view");
         assert_eq!(held(), 1, "cleared typed buffer entries release the pool allocation");
     }
 

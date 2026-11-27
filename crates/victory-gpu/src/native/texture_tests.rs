@@ -126,19 +126,18 @@ fn a_texture_uploaded_blank_is_probed_at_each_submission() {
     let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
     let info = crate::resource::texture_info(res).unwrap();
     let key = res as usize;
+    // One title lock for the whole test, and no probe deadline: see
+    // `a_texture_rewritten_whole_is_read_whole_only_now_and_then`.
     with_title(|t| {
         assert!(t.realize(key));
-        t.sync_dirty();
+        t.sync_dirty_without_probe_deadline();
         assert_eq!(t.uploads_of(key), 1, "the blank first upload");
-    });
-    pool.write(0, &vec![0xABu8; info.size]);
-    with_title(|t| {
-        t.sync_dirty();
+        pool.write(0, &vec![0xABu8; info.size]);
+        t.sync_dirty_without_probe_deadline();
         assert_eq!(t.uploads_of(key), 2, "uploaded again at the next submission");
-    });
-    // Its samples showed that write, as they show a streamed texture's: it is not read whole at
-    // every submission after it (thousands of those were most of what a world submission read).
-    with_title(|t| {
+        // Its samples showed that write, as they show a streamed texture's: it is not read whole
+        // at every submission after it (thousands of those were most of what a world submission
+        // read).
         let reads = (0..crate::native::textures::WHOLE_EVERY)
             .filter(|_| {
                 let jobs = t.sync_jobs();
@@ -148,20 +147,16 @@ fn a_texture_uploaded_blank_is_probed_at_each_submission() {
             })
             .count();
         assert!(reads <= 1, "read whole {reads} times in a whole-read period");
-    });
-    // A glyph's worth of bytes in page 3 (a page a sampling probe would skip).
-    pool.write(3 * 4096 + 100, &[1u8; 16]);
-    // (Twice the period: other tests' textures share what a submission spares for these reads.)
-    with_title(|t| {
+        // A glyph's worth of bytes in page 3 (a page a sampling probe would skip).
+        pool.write(3 * 4096 + 100, &[1u8; 16]);
+        // (Twice the period: other tests' textures share what a submission spares for these reads.)
         let n = (1..=2 * crate::native::textures::WHOLE_EVERY).find(|_| {
-            t.sync_dirty();
+            t.sync_dirty_without_probe_deadline();
             t.uploads_of(key) == 3
         });
         assert!(n.is_some(), "a small write is seen within a whole-read period or two");
-    });
-    pool.write(5 * 4096 + 100, &[1u8; 16]);
-    with_title(|t| {
-        t.sync_dirty();
+        pool.write(5 * 4096 + 100, &[1u8; 16]);
+        t.sync_dirty_without_probe_deadline();
         assert_eq!(t.uploads_of(key), 4, "and, its samples having missed one, the next at the next submission");
     });
 }
@@ -204,21 +199,32 @@ fn a_texture_rewritten_whole_is_read_whole_only_now_and_then() {
     let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
     let info = crate::resource::texture_info(res).unwrap();
     let key = res as usize;
-    let sync = || with_title(|t| { t.sync_dirty(); t.uploads_of(key) }).unwrap();
-    with_title(|t| assert!(t.realize(key)));
-    assert_eq!(sync(), 1, "the blank first upload");
-    for (i, n) in [(1u8, 2), (2, 3), (3, 4)] {
-        pool.write(0, &vec![i; info.size]);
-        assert_eq!(sync(), n, "a whole rewrite is seen by the samples at once");
-        sync();
-    }
-    // A glyph's worth of bytes in page 3 (a page the samples skip).
-    pool.write(3 * 4096 + 100, &[9u8; 16]);
-    // (Twice the period: other tests' textures share what a submission spares for these reads.)
-    let n = (1..=2 * crate::native::textures::WHOLE_EVERY).find(|_| sync() == 5);
-    assert!(n.is_some(), "a write the samples miss is seen within a whole-read period or two");
-    pool.write(5 * 4096 + 100, &[9u8; 16]);
-    assert_eq!(sync(), 6, "and the next one at the next submission");
+    // The title is shared, so the test holds its lock throughout: another test's submission in
+    // between probes and uploads this texture too, and the follow-up whole read after a missed
+    // write may then already be spent when the next write comes ("at the next" fails). And no
+    // probe deadline: other tests' textures stay hot after them (the 200 of
+    // `a_hot_texture_is_probed_at_each_submission_among_hundreds`), and a round the deadline cuts
+    // short under load may not reach this one ("at once" fails).
+    with_title(|t| {
+        assert!(t.realize(key));
+        let mut sync = || {
+            t.sync_dirty_without_probe_deadline();
+            t.uploads_of(key)
+        };
+        assert_eq!(sync(), 1, "the blank first upload");
+        for (i, n) in [(1u8, 2), (2, 3), (3, 4)] {
+            pool.write(0, &vec![i; info.size]);
+            assert_eq!(sync(), n, "a whole rewrite is seen by the samples at once");
+            sync();
+        }
+        // A glyph's worth of bytes in page 3 (a page the samples skip).
+        pool.write(3 * 4096 + 100, &[9u8; 16]);
+        // (Twice the period: other tests' textures share what a submission spares for these reads.)
+        let n = (1..=2 * crate::native::textures::WHOLE_EVERY).find(|_| sync() == 5);
+        assert!(n.is_some(), "a write the samples miss is seen within a whole-read period or two");
+        pool.write(5 * 4096 + 100, &[9u8; 16]);
+        assert_eq!(sync(), 6, "and the next one at the next submission");
+    });
 }
 
 /// A texture whose last write missed the sampled pages (a streamed mip tail, or a single glyph) is
@@ -1186,6 +1192,49 @@ fn an_indirect_dispatch_mesh_x_draws_the_groups_its_record_holds() {
     }
 }
 
+/// A render target a recorded draw wrote is the GPU's: when the title then changes the memory
+/// under it, the next submission does not upload that memory over what was drawn.
+#[test]
+fn a_drawn_target_is_not_filled_from_title_memory_again() {
+    use super::mesh_tests::{RED, TRIANGLE, translate};
+    use victory_backend::backend::ComputeBackend;
+    use victory_shader::native::HwStage;
+    let Some(pool) = pool(9206, 4) else { return };
+    let (ms, ps) = (translate(HwStage::Vs, TRIANGLE), translate(HwStage::Ps, RED));
+    let state = crate::native::state::Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let pso = match with_title(|t| t.render_pipe(&ms, Some(&ps), &state, "mesh")).unwrap() {
+        crate::native::title::Pipe::Render(pso, _) => pso,
+        _ => panic!("no mesh pipeline"),
+    };
+    let pipe_key = 0xDEAD_BEE9usize;
+    glue::install_test_render_pipeline(pipe_key, pso);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let records = 0x8000;
+    pool.write(records, &[1u32, 1, 1]);
+    let rt = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::SW_64KB_R_X.0, 1);
+    crate::descriptor::create_rtv(std::ptr::null(), rt, std::ptr::null(), handle);
+    let list = crate::list::test_list(false, std::ptr::null());
+    glue::set_pipeline(list, pipe_key as This);
+    slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(list, 1, &handle, 0, std::ptr::null());
+    slot::<extern "system" fn(This, u32, u64, u64, u64)>(list, 0x310)(list, 7, 0, pool.va(records), 0);
+    run_title_list(list);
+    let red = [255u8, 128, 128, 255];
+    let drawn = || read_mip(rt as usize, 0, 16, 16).as_chunks::<4>().0.iter().all(|p| *p == red);
+    assert!(drawn(), "the draw coloured the target");
+    // The title changes the memory under the target, and the scanner reports it at the next
+    // submission.
+    let uploads = with_title(|t| t.uploads_of(rt as usize)).unwrap();
+    with_title(|_| pool.write(0, &[0x55u8; 16 * 16 * 4])).unwrap();
+    run_title_list(crate::list::test_list(false, std::ptr::null()));
+    with_title(|t| {
+        let jobs = t.jobs(vec![rt as usize]);
+        t.sync(jobs);
+    });
+    assert_eq!(with_title(|t| t.uploads_of(rt as usize)).unwrap(), uploads, "not uploaded again");
+    assert!(drawn(), "what was drawn stays");
+}
+
 /// `CopyResource` between textures and `CopyTextureRegion` (subresource-to-subresource and
 /// footprint-to/from-subresource) execute on Metal without dropping to `dropped_op`.
 #[test]
@@ -1492,4 +1541,61 @@ fn depth_stencil_rows_go_in_and_out_as_the_depth_plane() {
         let at = (5 + r) * 16 + 3;
         assert_eq!(got, values[at..at + 4], "row {r}");
     }
+}
+
+/// A placed R9G9B9E5 view laid out exactly as a live R32_UINT object at its address (a texture
+/// compute writes as integers and the title samples as floats) names the object's host texture;
+/// one that differs in size gets its own, as before; the shared one goes with the object.
+#[test]
+fn a_placed_rgb9e5_view_over_an_r32_uint_object_shares_its_texture() {
+    let Some(pool) = pool(9109, 4) else { return };
+    // Flags 4: unordered access. DXGI 42: R32_UINT; 67: R9G9B9E5.
+    let object = crate::resource::test_texture_at(pool.va(0), (32, 32), 1, 42, Swizzle::SW_64KB_S.0, 4);
+    let info = crate::resource::texture_info(object).unwrap();
+    with_title(|t| {
+        t.texture_created(object as usize, info);
+        assert!(t.realize(object as usize));
+    });
+    let heap = crate::descriptor::test_heap(false, 4);
+    let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let place = |size: u32| {
+        let res = crate::resource::test_texture_at(pool.va(0), (size.into(), size), 1, 67, Swizzle::SW_64KB_S.0, 4);
+        let words = crate::resource::texture_desc(res).unwrap();
+        let mut view = [0u32; 16];
+        (view[0], view[1], view[5]) = (67, 4, 1);
+        (view[10], view[11]) = (pool.va(0) as u32, (pool.va(0) >> 32) as u32);
+        crate::descriptor::create_placed_srv(std::ptr::null(), &words, &view, start);
+        crate::native::textures::placed_key(pool.va(0), &words)
+    };
+    let key = place(32);
+    with_title(|t| {
+        let shared = t.host.texture_at(key).expect("registered");
+        assert!(std::rc::Rc::ptr_eq(&shared, &t.texture_of(object as usize).unwrap()), "the object's texture");
+        assert!(t.texture_of(key).is_none(), "no copy of its own");
+    });
+    let other = place(16);
+    with_title(|t| {
+        let own = t.texture_of(other).expect("a copy of its own");
+        assert!(!std::rc::Rc::ptr_eq(&own, &t.texture_of(object as usize).unwrap()));
+    });
+    let key = place(32);
+    with_title(|t| assert!(t.host.knows(key)));
+    // A GPU write through the shared view makes the object's texture the GPU's: title memory
+    // is not uploaded over it again.
+    let uploads = with_title(|t| {
+        let jobs = t.jobs(vec![object as usize]);
+        t.sync(jobs);
+        t.gpu_written(key);
+        t.uploads_of(object as usize)
+    })
+    .unwrap();
+    with_title(|_| pool.write(0, &[0x55u8; 32 * 32 * 4])).unwrap();
+    run_title_list(crate::list::test_list(false, std::ptr::null()));
+    with_title(|t| {
+        let jobs = t.jobs(vec![object as usize]);
+        t.sync(jobs);
+        assert_eq!(t.uploads_of(object as usize), uploads, "the object is not refilled");
+    });
+    glue::resource_released(object);
+    with_title(|t| assert!(!t.host.knows(key), "released with the object"));
 }

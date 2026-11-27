@@ -120,6 +120,46 @@ fn a_pixel_export_makes_every_value_before_its_first_store() {
     assert_eq!(check(&l, "storeOutput"), (4, 4));
 }
 
+/// An integer colour target (declared uint, `Options::integer_targets`) stores the bits of the
+/// float a program made as they are, as an `i32`: a bit-cast, not a conversion. The float target
+/// beside it stores floats.
+#[test]
+fn an_integer_target_stores_the_bits() {
+    let words = [
+        0x7E00_02F2, // v_mov_b32 v0, 1.0
+        0x7E06_02FF, 0x4049_0FDB, // v_mov_b32 v3, pi
+        0x0604_0680, // v_add_f32 v2, 0, v3
+        0xF800_100F, 0x0000_0000, // exp mrt0 v0, v0, v0, v0 vm
+        0xF800_1811, 0x0000_0002, // exp mrt1 v2, off, off, off done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let io = || StageIo::Ps {
+        inputs: vec![],
+        input_addr: 0,
+        db_shader_control: 0,
+        patches: vec![],
+    };
+    let float = element("SV_Target", 0, 16, 0, 4, false);
+    let uint = SigElement { comp: 5, ..element("SV_Target", 1, 16, 1, 1, false) };
+    let l = lowered(HwStage::Ps, io(), &words, vec![float.clone(), uint], vec![]).unwrap();
+    let stores = |l: &Lowered| -> Vec<(u32, String)> {
+        l.output_stores
+            .iter()
+            .filter(|s| s.name.starts_with("dx.op.storeOutput."))
+            .map(|s| (s.args[0].0.expect("an element constant") as u32, s.name.clone()))
+            .collect()
+    };
+    let f32s = |n: usize| vec![(0u32, "dx.op.storeOutput.f32".to_owned()); n];
+    let mut want = f32s(4);
+    want.push((1, "dx.op.storeOutput.i32".into()));
+    assert_eq!(stores(&l), want);
+    // Declared float (no mask), mrt1 stores the float.
+    let l = lowered(HwStage::Ps, io(), &words, vec![float.clone(), element("SV_Target", 1, 16, 1, 1, false)], vec![]).unwrap();
+    let mut want = f32s(4);
+    want.push((1, "dx.op.storeOutput.f32".into()));
+    assert_eq!(stores(&l), want);
+}
+
 #[test]
 fn a_vertex_export_makes_every_value_before_its_first_store() {
     let words = [

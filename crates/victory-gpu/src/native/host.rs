@@ -2359,6 +2359,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
         signals: &[(&B::Fence, u64)],
     ) -> Result<(), String> {
         let _counted = super::descriptor_trace::Submission;
+        // `VICTORY_SUBMIT_TIMING=1`: this submission's CPU time, entry to commit, split into
+        // prep (everything before encoding: page following and per-command preparation) and
+        // encode+commit (#461).
+        let timing = env_set!("VICTORY_SUBMIT_TIMING");
+        let t0 = timing.then(std::time::Instant::now);
         self.follow_title_pages();
         // A draw or dispatch that reads a root parameter the title never set is dropped by itself:
         // refusing the whole piece for it also dropped the piece's value writes, and a queue that
@@ -2775,6 +2780,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             });
         }
         self.passes.set(self.passes.get() + passes.len() as u64);
+        let t_encode = t0.map(|_| std::time::Instant::now());
         let submitted = self.backend.submit_passes(
             queue,
             &PassSubmission {
@@ -2783,6 +2789,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 signals,
             },
         );
+        if let Some(t0) = t0 {
+            let total = t0.elapsed();
+            let submit = t_encode.map(|t| t.elapsed()).unwrap_or_default();
+            let prep = total.checked_sub(submit).unwrap_or_default();
+            tracing::info!("{}", submit_timing_line(lists.len(), cmds.len(), prep, submit));
+        }
         // A refused submission must not lose its bottom-of-pipe value writes: another queue waits
         // on one of them with no other way to go on, and a lost write is the title's
         // `Unsignaled CrossQueueBarrier`, which kills it (#80). Only the lost passes' fills are
@@ -2839,6 +2851,37 @@ fn texture_info_of(_: usize) -> Option<super::textures::TextureInfo> {
 #[cfg(any(test, target_os = "macos"))]
 fn changed_entries<'a>(note: &str, now: impl Iterator<Item = &'a String>) -> Vec<&'a String> {
     now.filter(|e| !note.contains(&format!("\"{e}\""))).collect()
+}
+
+/// The `VICTORY_SUBMIT_TIMING=1` line for one `ExecuteCommandLists` (#461): the submission's
+/// CPU time from entry to commit, split into prep (page following and per-command preparation:
+/// translation, descriptor remirror, memory syncs) and encode+commit.
+fn submit_timing_line(
+    lists: usize,
+    cmds: usize,
+    prep: std::time::Duration,
+    submit: std::time::Duration,
+) -> String {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    format!(
+        "submit timing: lists={lists} cmds={cmds} prep={:.1}ms encode_commit={:.1}ms total={:.1}ms",
+        ms(prep),
+        ms(submit),
+        ms(prep + submit)
+    )
+}
+
+#[test]
+fn submit_timing_line_splits_prep_from_encode_commit() {
+    use std::time::Duration;
+    assert_eq!(
+        submit_timing_line(2, 17, Duration::from_micros(1500), Duration::from_micros(300)),
+        "submit timing: lists=2 cmds=17 prep=1.5ms encode_commit=0.3ms total=1.8ms"
+    );
+    assert_eq!(
+        submit_timing_line(0, 0, Duration::ZERO, Duration::ZERO),
+        "submit timing: lists=0 cmds=0 prep=0.0ms encode_commit=0.0ms total=0.0ms"
+    );
 }
 
 #[test]

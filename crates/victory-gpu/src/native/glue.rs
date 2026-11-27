@@ -1778,10 +1778,10 @@ pub(crate) fn stencil_ref(this: This, reference: u32) {
     with_list(this, |_, l| l.list.set_stencil_ref(reference));
 }
 
-/// `IASetIndexBuffer`: the buffer's address and whether its indices are 32 bits.
-pub(crate) fn index_buffer(this: This, view: Option<(u64, bool)>) {
+/// `IASetIndexBuffer`: the buffer's address, byte size, and whether its indices are 32 bits.
+pub(crate) fn index_buffer(this: This, view: Option<(u64, u32, bool)>) {
     with_list(this, |_, l| match view {
-        Some((address, wide)) => l.list.set_index_buffer(address, wide),
+        Some((address, size, wide)) => l.list.set_index_buffer_sized(address, size, wide),
         None => l.list.clear_index_buffer(),
     });
 }
@@ -1798,11 +1798,11 @@ pub(crate) fn vertex_buffers(this: This, start: u32, count: u32, views: &[Vertex
     with_list(this, |_, l| {
         for i in 0..count as usize {
             let slot = start as usize + i;
-            let (address, stride) = match views.get(i) {
-                Some(v) if v.address != 0 && v.size != 0 => (v.address, v.stride),
-                _ => (0, 0),
+            let (address, size, stride) = match views.get(i) {
+                Some(v) if v.address != 0 && v.size != 0 => (v.address, v.size, v.stride),
+                _ => (0, 0, 0),
             };
-            l.list.set_vertex_buffer(slot, address);
+            l.list.set_vertex_buffer_sized(slot, address, size);
             if l.strides.len() <= slot {
                 l.strides.resize(slot + 1, 0);
             }

@@ -730,8 +730,8 @@ pub enum Cmd<B: GraphicsBackend> {
         root: Vec<Option<Root<B>>>,
         heaps: Heaps<B>,
         targets: Targets<B>,
-        vertex: Vec<(usize, u64)>,
-        index: Option<(u64, bool)>,
+        vertex: Vec<(usize, u64, u32)>,
+        index: Option<(u64, u32, bool)>,
         state: DrawState,
         call: DrawCall,
         /// `ExecuteIndirect`: the title address of the argument record, read on the GPU (`call`
@@ -886,8 +886,8 @@ struct State<B: GraphicsBackend> {
     graphics_root: Vec<Option<Root<B>>>,
     heaps: Heaps<B>,
     targets: Targets<B>,
-    vertex: BTreeMap<usize, u64>,
-    index: Option<(u64, bool)>,
+    vertex: BTreeMap<usize, (u64, u32)>,
+    index: Option<(u64, u32, bool)>,
     draw: DrawState,
 }
 
@@ -1305,20 +1305,34 @@ impl<B: GraphicsBackend> NativeList<B> {
 
     /// `IASetVertexBuffers` for one slot: the title address of its data (the stride is the pipeline's).
     pub fn set_vertex_buffer(&mut self, slot: usize, address: u64) {
-        if address == 0 {
+        self.set_vertex_buffer_sized(slot, address, u32::from(address != 0));
+    }
+
+    /// `IASetVertexBuffers` for one slot with its `SizeInBytes`.
+    pub fn set_vertex_buffer_sized(&mut self, slot: usize, address: u64, size: u32) {
+        if address == 0 || size == 0 {
             self.state.vertex.remove(&slot);
         } else {
-            self.state.vertex.insert(slot, address);
+            self.state.vertex.insert(slot, (address, size));
         }
     }
 
     /// The address bound as vertex buffer `slot`, if any (for the target trace).
     pub fn vertex_buffer_address(&self, slot: usize) -> Option<u64> {
-        self.state.vertex.get(&slot).copied()
+        self.state.vertex.get(&slot).map(|&(addr, _)| addr)
     }
 
     pub fn set_index_buffer(&mut self, address: u64, wide: bool) {
-        self.state.index = Some((address, wide));
+        self.set_index_buffer_sized(address, u32::from(address != 0), wide);
+    }
+
+    /// `IASetIndexBuffer` with its `SizeInBytes`.
+    pub fn set_index_buffer_sized(&mut self, address: u64, size: u32, wide: bool) {
+        if address == 0 || size == 0 {
+            self.state.index = None;
+        } else {
+            self.state.index = Some((address, size, wide));
+        }
     }
 
     pub fn clear_index_buffer(&mut self) {
@@ -1387,7 +1401,7 @@ impl<B: GraphicsBackend> NativeList<B> {
                     .state
                     .index
                     .ok_or("indexed draw without an index buffer")?
-                    .1,
+                    .2,
             }
         } else {
             DrawCall::Arrays {
@@ -1418,7 +1432,12 @@ impl<B: GraphicsBackend> NativeList<B> {
             root: self.state.graphics_root.clone(),
             heaps: self.state.heaps.clone(),
             targets: self.state.targets.clone(),
-            vertex: self.state.vertex.iter().map(|(&slot, &addr)| (slot, addr)).collect(),
+            vertex: self
+                .state
+                .vertex
+                .iter()
+                .map(|(&slot, &(addr, size))| (slot, addr, size))
+                .collect(),
             index: self.state.index,
             state: self.state.draw,
             call,
@@ -1492,7 +1511,7 @@ impl<B: GraphicsBackend> NativeList<B> {
             .state
             .index
             .ok_or("indexed draw without an index buffer")?
-            .1;
+            .2;
         self.draw_call(DrawCall::Indexed {
             index_count: indices,
             instance_count: instances,

@@ -451,6 +451,16 @@ Slow work shows in the log: a translation or a conversion of 20 ms or more logs 
 
 Translations of 20 to 40 s (27 November; 44 to 48 KB pixel shaders) were lowering done over: `lower_graphics` lowered the whole program again for each join with an incoming value that has no DXIL form (574 times for one shader), and `fill_phis` now reports all the joins a pass finds, so two passes do. The shaders were refused in 30 ms until descriptor tracing followed dwords swapped by XORs, and then reached this. `descriptor_data` also searched every descriptor's sources for each load read as data: one table (`load_use`), worth about a tenth of the heaviest translations. The walk in `live_edges` is bounded separately (see "Liveness of phi edges"). A program with several such joins may now be refused for another of them than before, so tallies of refusals by reason shift without any shader changing between translated and refused. Test: `joins_without_a_value_are_found_in_one_pass` (`gfx_refusal_tests`) bounds the passes, not the time.
 
+## Buffer atomic subtraction
+
+DXIL's `AtomicBinOp` has no subtraction, so `buffer_atomic_sub` was refused by name (3 compute
+programs in a 12,020-shader corpus, Series S boot to the menus, 27 November). It is now an add of
+the negated data (`0 - d`): modulo 2^32 the dword left is the same, and the value returned with
+`glc` is the old one either way. Over that corpus the 3 translate and no other output changes.
+`heap_tests::a_buffer_atomic_sub_leaves_the_difference_and_returns_the_old_value` (`victory-gpu`)
+runs it on Metal, wrapping below zero (1 - 3). The 64-bit, image and global forms are not
+covered: no title shader in the corpus uses them.
+
 ## LDS instructions addressed by M0
 
 `ds_append`, `ds_consume`, `ds_read_addtid_b32` and `ds_write_addtid_b32` have no address

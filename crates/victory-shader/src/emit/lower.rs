@@ -632,6 +632,10 @@ fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
         .collect()
 }
 
+/// `buffer_atomic_sub` among the buffer atomics' DXIL operation numbers: no DXIL operation of its
+/// own, it is lowered as an add (0) of the negated data.
+const ATOMIC_SUB: u32 = u32::MAX - 1;
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -12771,10 +12775,12 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
-        // min and max, exchange; compare-exchange apart.
+        // min and max, exchange; compare-exchange apart. DXIL has no subtraction:
+        // `buffer_atomic_sub` is an add of the negated data (`ATOMIC_SUB`).
         let atomic = match name.strip_prefix("buffer_atomic_") {
             None => None,
             Some("add") => Some(0),
+            Some("sub") => Some(ATOMIC_SUB),
             Some("and") => Some(1),
             Some("or") => Some(2),
             Some("xor") => Some(3),
@@ -13017,9 +13023,17 @@ impl<'a> Lower<'a> {
                     &args,
                 )
             } else {
+                // `mem - d` is `mem + (0 - d)` modulo 2^32, and the value returned is the old one
+                // either way.
+                let (op, d) = if op == ATOMIC_SUB {
+                    let z = self.s.m.i32(0);
+                    (0, self.s.m.bin(self.cur, Bin::Sub, z, vals[0]))
+                } else {
+                    (op, vals[0])
+                };
                 let mut args = vec![h, self.s.m.i32(op)];
                 args.extend(coords);
-                args.push(vals[0]);
+                args.push(d);
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };

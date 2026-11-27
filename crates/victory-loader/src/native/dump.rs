@@ -32,7 +32,7 @@ pub fn start_mem_watch() {
         return;
     };
     std::thread::spawn(move || {
-        let base = (at & !0xfff) as usize;
+        let base = at & !0xfff;
         let mut last: Vec<Option<usize>> = vec![None; 512];
         loop {
             std::thread::sleep(Duration::from_secs(1));
@@ -443,10 +443,10 @@ pub fn write_trap(c: &Context, r: &super::seh::context::ExceptionRecord) -> bool
         Some((page & !0xfff, it.collect()))
     });
     let Some((page, watched)) = spec else { return false };
-    if r.code != 0xc000_0005 || r.information[0] != 1 || (r.information[1] as usize) & !0xfff != *page {
+    if r.code != 0xc000_0005 || r.information[0] != 1 || r.information[1] & !0xfff != *page {
         return false;
     }
-    let at = r.information[1] as usize;
+    let at = r.information[1];
     if watched.contains(&(at & !7)) {
         let base = unwind::image_base_of(c.rip as usize).unwrap_or(0);
         let chain = super::seh::backtrace(*c, None);

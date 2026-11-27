@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // No binding crate links AppKit or GameController, so their classes would not be registered
-// without this.
+// without this. (`link` cannot be merged into one attribute; the lint does not know that.)
+#[allow(clippy::duplicated_attributes)]
 #[link(name = "AppKit", kind = "framework")]
 #[link(name = "GameController", kind = "framework")]
 unsafe extern "C" {}

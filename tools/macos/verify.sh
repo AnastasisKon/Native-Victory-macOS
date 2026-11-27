@@ -5,7 +5,12 @@
 # usage: tools/macos/verify.sh [quick|full]
 #
 #   quick  the test suites: CONTRIBUTING.md's two, and victory-gpu natively
-#   full   quick + cargo xtask policy + the CI clippy gate for the Windows target (default)
+#   full   quick + policy + clippy-win + clippy-mac (default)
+#
+# clippy-mac lints the macOS-only code the Windows CI never sees, for the
+# Mac's own apple-darwin host target with -D warnings, allowing dead_code
+# and the unused_* lints: each platform's cfg'd-out code reads as dead on
+# the other.
 #
 # Prints one PASS/FAIL line per gate and exits non-zero if any gate failed,
 # so a caller (CI, a hook, a human) can gate a pull request on it.
@@ -15,6 +20,13 @@ cd "$(dirname "$0")/../.." || exit 1
 GATE="${1:-full}"
 RUNNER="rustup run 1.98.1"
 fail=0
+
+# The Mac's own target when this runs on a Mac; x86_64-apple-darwin otherwise.
+mac_target=$($RUNNER rustc -vV | sed -n 's/^host: //p')
+case "$mac_target" in
+    *-apple-darwin) ;;
+    *) mac_target=x86_64-apple-darwin ;;
+esac
 
 run_gate() {
     name="$1"; shift
@@ -70,6 +82,8 @@ if [ "$GATE" = "full" ]; then
         "$RUNNER cargo xtask policy"
     run_gate "clippy-win" sh -c \
         "$RUNNER cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnullvm -- -D warnings"
+    run_gate "clippy-mac" sh -c \
+        "$RUNNER cargo clippy --workspace --all-targets --locked --target $mac_target -- -D warnings -A dead_code -A unused_imports -A unused_variables -A unused_assignments -A unused_mut"
 fi
 
 echo "== gate $([ $fail -eq 0 ] && echo PASSED || echo FAILED) =="

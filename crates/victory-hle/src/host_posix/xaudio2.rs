@@ -9,6 +9,8 @@
 //!
 //! shortcut: PCM and float sources only, add other formats when a title needs them through XAudio2.
 //! shortcut: operation sets apply at once, defer them when a title needs atomic CommitChanges.
+// The Win32 names these after (HRESULT, HANDLE) keep their capitalisation.
+#![allow(clippy::upper_case_acronyms)]
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -67,7 +69,7 @@ struct Callbacks {
 }
 
 #[repr(C)]
-struct Engine {
+pub struct Engine {
     vtable: *const usize,
     refs: AtomicU32,
     inner: Arc<Inner>,

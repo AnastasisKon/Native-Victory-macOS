@@ -436,11 +436,15 @@ struct Pipeline {
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
+/// A console pipeline's stages: (name, shader) per stage, and the graphics state if read.
+#[cfg(target_os = "macos")]
+type Stages = (Vec<(&'static str, Arc<Shader>)>, Option<crate::native::state::Graphics>);
+
 /// A title pipeline's stages (name, shader) and graphics state, for the native host.
 #[cfg(target_os = "macos")]
 pub(crate) fn native_stages(
     this: This,
-) -> Option<(Vec<(&'static str, Arc<Shader>)>, Option<crate::native::state::Graphics>)> {
+) -> Option<Stages> {
     if this.is_null() {
         return None;
     }
@@ -1373,7 +1377,7 @@ mod changed_descriptor_tests {
             // s_add_u32 s8, s8, 16; s_addc_u32 s9, s9, 0
             (&[0x8008_9008, 0x8209_8009], "dword 0 added to (s_add, s_sub...)"),
         ] {
-            let err = crate::native::shaders::translate(&program(change)).err().expect("refused");
+            let err = crate::native::shaders::translate(&program(change)).unwrap_err();
             assert!(err.ends_with(&format!("{prefix}{why} is not supported")), "{err}");
         }
     }
@@ -1688,7 +1692,7 @@ mod pieces_tests {
             // v_mov_b32_dpp v1, v0 row_shr:1: each lane its neighbour's value.
             (&[0x7E02_02FA, 0xFF01_1100], "a value that is no reduction or prefix"),
         ] {
-            let err = crate::native::shaders::translate(&program(step)).err().expect("refused");
+            let err = crate::native::shaders::translate(&program(step)).unwrap_err();
             assert!(err.ends_with(&format!("{prefix}{why} is not supported")), "{err}");
         }
     }
@@ -1772,7 +1776,7 @@ mod pieces_tests {
             (0x7E04_020D, "a buffer's dword 1 (address high bits, stride, swizzle)"),
             (0x7E04_020F, "a buffer's dword 3 (format and type)"),
         ] {
-            let err = crate::native::shaders::translate(&program(read)).err().expect("refused");
+            let err = crate::native::shaders::translate(&program(read)).unwrap_err();
             assert!(err.ends_with(&format!("{prefix}{why} is not supported")), "{err}");
         }
     }

@@ -5,6 +5,8 @@
 //! (activate, process, reset, deactivate) and dequeues one result per
 //! command. We decode each command when it is queued, so its result is ready
 //! at once; the order of results is the order of commands.
+// The Win32 names these after (HRESULT, HANDLE) keep their capitalisation.
+#![allow(clippy::upper_case_acronyms)]
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -152,6 +154,7 @@ fn lock(c: &Connection) -> std::sync::MutexGuard<'_, State> {
     c.state.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[allow(unused_unsafe)]
 pub extern "system" fn XApuConnect(
     input: *const ConnectInput,
     output: *mut ConnectOutput,
@@ -232,6 +235,7 @@ pub extern "system" fn XApuConnect(
     S_OK
 }
 
+#[allow(unused_unsafe)]
 pub extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
     if handle.is_null() {
         return E_INVALIDARG;
@@ -247,6 +251,7 @@ pub extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
     S_OK
 }
 
+#[allow(unused_unsafe)]
 pub extern "system" fn XApuEnqueueCommand(
     handle: *mut Connection,
     command: *const CommandId,

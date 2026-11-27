@@ -668,7 +668,10 @@ pub extern "system" fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32 
     }
 }
 
-static LEDGER: LazyLock<Mutex<HashMap<usize, (Vec<usize>, u64, u64)>>> = LazyLock::new(Default::default);
+/// Per watched address: the reads (counts, bytes).
+type Ledger = HashMap<usize, (Vec<usize>, u64, u64)>;
+
+static LEDGER: LazyLock<Mutex<Ledger>> = LazyLock::new(Default::default);
 
 static WATCHED: LazyLock<Mutex<std::collections::HashSet<usize>>> = LazyLock::new(Default::default);
 

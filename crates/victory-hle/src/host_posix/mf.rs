@@ -13,6 +13,7 @@
 //! reader) is the place to start if a title's video is wanted.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::upper_case_acronyms)]
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -119,7 +120,7 @@ mod tests {
     #[test]
     fn the_platform_starts_and_nothing_can_be_created() {
         assert_eq!(MFStartup(0x0002_0070, 0), S_OK);
-        let mut object = 1usize as *mut c_void;
+        let mut object = std::ptr::without_provenance_mut::<c_void>(1);
         let none = std::ptr::null_mut();
         let results = [
             MFCreateAttributes(&mut object, 4),

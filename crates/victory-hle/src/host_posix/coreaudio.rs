@@ -192,6 +192,7 @@ struct MixerQueue {
 // SAFETY: `AudioQueueRef` is thread-safe and `ctx` is touched only by the serial callback and
 // by `Drop` after `AudioQueueDispose(..., 1)` has stopped all callbacks.
 unsafe impl Send for MixerQueue {}
+// SAFETY: as above.
 unsafe impl Sync for MixerQueue {}
 
 impl Drop for MixerQueue {
@@ -364,6 +365,7 @@ impl MixerQueue {
                 return Err(("AudioQueueAllocateBuffer", status));
             }
             // Prime with silence. Title callbacks begin once `started` is set.
+            // SAFETY: `buffer` is the callback's writable audio buffer of `bytes`.
             let status = unsafe {
                 (*buffer).data.cast::<u8>().write_bytes(0, bytes as usize);
                 (*buffer).byte_size = bytes;
@@ -585,7 +587,7 @@ mod tests {
         let render: Render = Box::new(move |out| {
             let out = out.unwrap();
             // A 440 Hz tone, as a title's mixer would give it.
-            for (i, frame) in out.chunks_exact_mut(2).enumerate() {
+            for (i, frame) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                 let x = (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.01;
                 frame.fill(x);
             }

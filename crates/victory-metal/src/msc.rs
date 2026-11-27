@@ -175,6 +175,10 @@ unsafe impl Send for Msc {}
 // SAFETY: as above, no state is shared between calls.
 unsafe impl Sync for Msc {}
 
+/// Where the converter lays out a root layout's resources in the top-level argument buffer:
+/// (resource type, space, register, byte offset, size) per resource.
+pub type ResourceLocations = Vec<(u32, u32, u32, u32, u64)>;
+
 /// A converter failure: the `IRError` code and the converter's own message.
 #[derive(Debug)]
 pub struct ConvError {
@@ -313,7 +317,7 @@ impl Msc {
 
     /// Where the converter lays out `l` in the top-level argument buffer: (resource type, space,
     /// register, byte offset, size) per resource, as `IRRootSignatureGetResourceLocations` gives.
-    pub fn locations(&self, l: &RootLayout) -> Result<Vec<(u32, u32, u32, u32, u64)>, ConvError> {
+    pub fn locations(&self, l: &RootLayout) -> Result<ResourceLocations, ConvError> {
         let h = self.h;
         // SAFETY: the converter's documented C API; the signature is destroyed below.
         unsafe {

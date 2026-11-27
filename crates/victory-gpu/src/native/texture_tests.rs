@@ -1469,7 +1469,8 @@ fn check_rectangular_color_clear(
     let queue = crate::queue::test_queue(false);
     let mut fence = std::ptr::null();
     assert_eq!(crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), 0);
-    let cases: [(&str, &[[i32; 4]], &[usize]); 6] = [
+    type Case = (&'static str, &'static [[i32; 4]], &'static [usize]);
+    let cases: [Case; 6] = [
         ("interior", &[[1, 1, 3, 2]], &[5, 6]),
         ("bounded", &[[-2, 1, 2, 2]], &[4, 5]),
         ("empty and inverted", &[[1, 1, 1, 2], [3, 1, 1, 2]], &[]),
@@ -1815,7 +1816,9 @@ fn streamed_mips_across_scattered_pool_pages_upload_each_step_without_whole_rere
     }
 
     let mut va = 0u64;
+    // SAFETY: reading our own task port.
     let task = unsafe { super::mach_task_self() };
+    // SAFETY: reserving `info.size` in our own task; the result is checked.
     assert_eq!(unsafe { super::mach_vm_allocate(task, &mut va, info.size as u64, 1) }, 0);
     // SAFETY: `va..va + info.size` is our freshly allocated reservation.
     unsafe { protect(va as *mut u8, info.size, Protect::NO_ACCESS) }.unwrap();
@@ -1973,10 +1976,13 @@ fn bench_streamed_texture_sync_pool_reads_and_mip_probes() {
             .unwrap();
     }
 
+    // SAFETY: reading our own task port.
     let task = unsafe { super::mach_task_self() };
     let mut va = 0u64;
     let total_va = N * TILES_PER_TEX * TILE;
+    // SAFETY: reserving `total_va` in our own task; the result is checked.
     assert_eq!(unsafe { super::mach_vm_allocate(task, &mut va, total_va as u64, 1) }, 0);
+    // SAFETY: `va..va + total_va` is our freshly allocated reservation.
     unsafe { protect(va as *mut u8, total_va, Protect::NO_ACCESS) }.unwrap();
 
     // Realize all 32 textures blank first.
@@ -2003,6 +2009,7 @@ fn bench_streamed_texture_sync_pool_reads_and_mip_probes() {
             let pool_slot = (N * RESIDENT_TILES - 1) - (i * RESIDENT_TILES + r);
             let pool_off = pool_slot * TILE;
             let src_off = r * TILE;
+            // SAFETY: source and destination are distinct regions of `TILE` bytes.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     tiled_template[src_off..src_off + TILE].as_ptr(),
@@ -2113,6 +2120,7 @@ fn bench_streamed_texture_sync_pool_reads_and_mip_probes() {
         t.texture_released(k);
     }
     t.host.memory().pool_released(&pool_info);
+    // SAFETY: `va` was reserved above and is released once.
     assert_eq!(unsafe { super::mach_vm_deallocate(task, va, total_va as u64) }, 0);
 }
 

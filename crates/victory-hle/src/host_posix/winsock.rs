@@ -716,6 +716,7 @@ pub extern "system" fn WSAIoctl(
     }
     match code {
         FIONBIO if input_len >= 4 && !input.is_null() => {
+            // SAFETY: FIONBIO's input is a 4-byte unsigned long, read before the call.
             let mut v = unsafe { input.cast::<u32>().read_unaligned() };
             ioctlsocket(s, code, &mut v)
         }

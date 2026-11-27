@@ -34,6 +34,9 @@ struct MacTm {
     zone: *const u8,
 }
 
+// Both `localtime_r` declarations in this crate point at libSystem's one
+// symbol; `MacTm` and `Tm` are the same macOS `struct tm`.
+#[allow(clashing_extern_declarations)]
 unsafe extern "C" {
     fn localtime_r(t: *const i64, out: *mut MacTm) -> *mut MacTm;
     fn mktime(t: *mut MacTm) -> i64;

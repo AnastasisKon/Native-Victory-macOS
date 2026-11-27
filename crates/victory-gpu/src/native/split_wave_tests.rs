@@ -180,7 +180,7 @@ fn the_thread_group_info_sgpr_numbers_the_console_waves() {
     if got.is_empty() {
         return;
     }
-    assert_eq!(got, (0..128).map(|i| i / 64 << 6 | 2).collect::<Vec<u32>>());
+    assert_eq!(got, (0..128).map(|i| ((i / 64) << 6) | 2).collect::<Vec<u32>>());
 }
 
 /// `v_ldexp_f32` (a pixel shader of GTA VI's world was refused for it): `s0` scaled by two to

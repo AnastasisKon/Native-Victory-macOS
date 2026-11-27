@@ -13,6 +13,8 @@
 //! shortcut: shared mode only, one render endpoint and no capture, no
 //! `IAudioStreamVolume`/`ISimpleAudioVolume`, no device notifications; add
 //! them when a title asks (each unknown request is logged once).
+// The Win32 names these after (HRESULT, HANDLE) keep their capitalisation.
+#![allow(clippy::upper_case_acronyms)]
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 

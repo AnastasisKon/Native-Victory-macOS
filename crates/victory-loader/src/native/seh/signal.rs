@@ -645,8 +645,8 @@ mod watch_tests {
         let before = stores();
         // SAFETY: inside the allocation; the watch reopens the page for the store.
         unsafe { ((p + 16) as *mut u64).write_volatile(0x1122_3344) };
-        // SAFETY: as above.
         assert_eq!(
+            // SAFETY: as above.
             unsafe { ((p + 16) as *const u64).read_volatile() },
             0x1122_3344
         );

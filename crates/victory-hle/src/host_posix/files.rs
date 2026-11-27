@@ -967,6 +967,30 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
     )
 }
 
+/// `VICTORY_TRACE_FILES=1`: reads per file (first and every power of two).
+fn trace_read(file: &File, len: u32) {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    static SEEN: Mutex<std::collections::BTreeMap<String, (u64, u64)>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    let mut buf = [0u8; 1024];
+    // SAFETY: F_GETPATH (50) fills a PATH_MAX buffer.
+    if unsafe { fcntl(file.as_raw_fd(), 50, buf.as_mut_ptr()) } < 0 {
+        return;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(0);
+    let path = String::from_utf8_lossy(&buf[..end]).into_owned();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let e = seen.entry(path.clone()).or_default();
+    e.0 += 1;
+    e.1 += u64::from(len);
+    if e.0.is_power_of_two() {
+        tracing::info!(path, reads = e.0, bytes = e.1, "ReadFile of a file so far");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,8 +1056,10 @@ mod tests {
         assert_ne!(handle, invalid_handle());
         assert_eq!(FIND_METADATA_LOOKUPS.get(), 1);
         let name: Vec<u16> = data[44..]
-            .chunks_exact(2)
-            .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|unit| u16::from_le_bytes(*unit))
             .take_while(|&unit| unit != 0)
             .collect();
         assert_eq!(String::from_utf16(&name).unwrap(), "slot.sav");
@@ -1253,7 +1279,7 @@ mod tests {
         assert_eq!(super::super::CloseHandle(handle), 1);
         let data = std::fs::read(path).unwrap();
         assert_eq!(data.len(), ROUNDS * 2 * RECORD_LEN);
-        for (round, pair) in data.chunks_exact(2 * RECORD_LEN).enumerate() {
+        for (round, pair) in data.as_chunks::<{ 2 * RECORD_LEN }>().0.iter().enumerate() {
             let (left, right) = pair.split_at(RECORD_LEN);
             assert!(
                 (left == first && right == second) || (left == second && right == first),
@@ -1388,29 +1414,5 @@ mod tests {
         // FindClose on an invalid handle sets ERROR_INVALID_HANDLE.
         assert_eq!(FindClose(invalid_handle()), 0);
         assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
-    }
-}
-
-/// `VICTORY_TRACE_FILES=1`: reads per file (first and every power of two).
-fn trace_read(file: &File, len: u32) {
-    use std::os::fd::AsRawFd;
-    unsafe extern "C" {
-        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
-    }
-    static SEEN: Mutex<std::collections::BTreeMap<String, (u64, u64)>> =
-        Mutex::new(std::collections::BTreeMap::new());
-    let mut buf = [0u8; 1024];
-    // SAFETY: F_GETPATH (50) fills a PATH_MAX buffer.
-    if unsafe { fcntl(file.as_raw_fd(), 50, buf.as_mut_ptr()) } < 0 {
-        return;
-    }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(0);
-    let path = String::from_utf8_lossy(&buf[..end]).into_owned();
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let e = seen.entry(path.clone()).or_default();
-    e.0 += 1;
-    e.1 += u64::from(len);
-    if e.0.is_power_of_two() {
-        tracing::info!(path, reads = e.0, bytes = e.1, "ReadFile of a file so far");
     }
 }

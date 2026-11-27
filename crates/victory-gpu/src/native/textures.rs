@@ -2827,6 +2827,7 @@ mod tests {
         let mut scratch = Vec::new();
         let mut textures: Textures<Capture> = (0..N)
             .map(|i| {
+                // SAFETY: `i` is below `N` and `backing` holds `N * SIZE` bytes.
                 let ptr = unsafe { backing.as_ptr().add(i * SIZE) };
                 let probe = probe_hash(
                     Some(&pools),

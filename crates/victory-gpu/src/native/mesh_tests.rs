@@ -801,7 +801,7 @@ fn exported_input(ena: u32, v: u32) -> Option<Vec<u32>> {
 #[test]
 fn a_pixel_program_reads_its_fixed_point_position_where_the_register_image_says() {
     let Some(words) = exported_input(0x8080, 1) else { return };
-    let want: Vec<u32> = (0..64u32).map(|i| i % 8 | (i / 8) << 16).collect();
+    let want: Vec<u32> = (0..64u32).map(|i| (i % 8) | ((i / 8) << 16)).collect();
     assert_eq!(words, want);
 }
 

@@ -748,7 +748,7 @@ fn texture_blit_ops_copy_between_textures_and_buffers() {
         unordered_access: false,
     };
     let tex_a = m.create_texture(&desc).unwrap();
-    let mut srgb_desc = desc.clone();
+    let mut srgb_desc = desc;
     srgb_desc.format = Format::Rgba8UnormSrgb;
     let tex_b = m.create_texture(&srgb_desc).unwrap();
     let dst_off = 0x10000;

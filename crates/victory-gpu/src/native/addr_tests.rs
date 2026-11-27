@@ -1084,7 +1084,7 @@ fn a_descriptor_with_its_stride_cleared_reads_the_view_raw_on_the_gpu() {
     f.put(0x2_1000, &src);
     f.put(0x2_2000, &[0u32; 64]);
     // The title's heap: a structured SRV of 16-byte elements, then a raw UAV.
-    let records = vec![0u32; 8 * 2];
+    let records = [0u32; 8 * 2];
     let start = records.as_ptr() as u64;
     let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
     let (rs, rd) = (0x57D_0001usize, 0x57D_0002usize);

@@ -373,7 +373,7 @@ pub fn run(
             );
             if let Some((w, h, bgra)) = victory_gpu::native::last_frame() {
                 let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
-                out.extend(bgra.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]));
+                out.extend(bgra.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0]]));
                 let _ = std::fs::write(&path, out);
                 tracing::warn!(w, h, path, "frame saved");
             }

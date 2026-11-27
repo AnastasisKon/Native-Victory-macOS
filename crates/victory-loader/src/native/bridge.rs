@@ -611,8 +611,9 @@ extern "C" fn spare_slot(spare: &Spare) -> i32 {
 }
 
 /// Raw table address to its bridged copy, and the reverse set of copies.
-static TABLES: Mutex<Option<(std::collections::HashMap<usize, usize>, HashSet<usize>)>> =
-    Mutex::new(None);
+type Tables = (std::collections::HashMap<usize, usize>, HashSet<usize>);
+
+static TABLES: Mutex<Option<Tables>> = Mutex::new(None);
 
 /// A copy of the method table at `raw` (`len` slots) that title code can
 /// call: each slot is a bridge stub for the host function in it (null stays
@@ -834,7 +835,7 @@ fn note_callbacks(info: &Traced, args: *const u64) {
         let a = a as usize;
         if in_text(a) {
             found.push((a, i, 0));
-        } else if a >= 0x10000 && a < 0x7fff_ffff_0000 && a & 7 == 0 && !info.area.contains("-crt-") {
+        } else if (0x10000..0x7fff_ffff_0000).contains(&a) && a.is_multiple_of(8) && !info.area.contains("-crt-") {
             for k in 0..16 {
                 match super::dump::read_checked(a + 8 * k) {
                     Some(v) if in_text(v) => found.push((v, i, 8 * k)),

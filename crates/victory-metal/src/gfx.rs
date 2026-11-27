@@ -18,6 +18,10 @@ use std::ptr::NonNull;
 
 type Res = Retained<ProtocolObject<dyn MTLResource>>;
 
+/// One entry of a heap's `refs`: the resource it holds, and its typed `texture_buffer` view if
+/// made.
+type TypedRef = (Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>);
+
 /// A fence chaining the encoders of one command buffer, and whether one has run: what a pass waits
 /// for and updates when the queue's buffers are made resident by a set instead of named.
 struct Order {
@@ -48,7 +52,7 @@ pub struct Heap {
     /// A buffer-backed `TypeTextureBuffer` shares its parent `MTLBuffer`'s backing allocation, so
     /// retaining it here keeps its `gpuResourceID` live without duplicating the pool's pages in
     /// `alloc_counts` / `MTLResidencySet` / per-encoder `useResource`.
-    refs: RefCell<std::collections::HashMap<usize, (Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>>,
+    refs: RefCell<std::collections::HashMap<usize, TypedRef>>,
     /// Entries in `refs` that currently hold `Some(texture_buffer)`.
     typed_views: Cell<usize>,
     /// The distinct allocations `refs` names, by raw `MTLResource` pointer, with how many entries
@@ -516,7 +520,7 @@ impl Metal {
         heap: &Heap,
         index: usize,
         words: [u64; 3],
-        keep: Option<(Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>,
+        keep: Option<TypedRef>,
     ) {
         assert!(
             index < heap.count,
@@ -1529,7 +1533,7 @@ impl Metal {
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
         owed: Owed,
         piece: u64,
-        tinfo: Option<(String, Vec<(String, usize, usize)>)>,
+        tinfo: Option<(String, Vec<GateEntry>)>,
     ) {
         let owed = std::sync::Arc::new(owed);
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2118,10 +2122,13 @@ std::thread_local! {
 /// Tracing: command buffers committed and not yet completed, by serial: when, and what they carry.
 static IN_FLIGHT: std::sync::Mutex<std::collections::BTreeMap<u64, (std::time::Instant, String)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
-/// Tracing: the gate buffers of a command buffer's indirect dispatches and draws (pipeline name or
-/// the draw's place in its pass, contents address, words), by serial. The command buffer keeps
-/// the buffers alive while it is in flight.
-static GATED: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<(String, usize, usize)>>> =
+/// One gate buffer's record: the pipeline name or the draw's place in its pass, the contents
+/// address, and the words.
+type GateEntry = (String, usize, usize);
+
+/// Tracing: the gate buffers of a command buffer's indirect dispatches and draws, by serial.
+/// The command buffer keeps the buffers alive while it is in flight.
+static GATED: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<GateEntry>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The group counts the GPU gave command buffer `serial`'s indirect dispatches, as its gates
@@ -2286,8 +2293,8 @@ impl Metal {
             };
             if (is_depth(t.tex.pixelFormat()) && !matches!(t.format, Format::D32FloatS8 | Format::D32Float | Format::D16Unorm))
                 || !fits_region(&t.tex, mip, slice, at, sz)
-                || buf_off % align != 0
-                || row_pitch % align != 0
+                || !buf_off.is_multiple_of(align)
+                || !row_pitch.is_multiple_of(align)
                 || buf_off.saturating_add(len) > buf.0.buf.length()
                 || !rows_fit
             {
@@ -2745,6 +2752,8 @@ impl Metal {
         Ok(())
     }
 
+    // Eight arguments: the encoder family shares one shape per pass kind.
+    #[allow(clippy::too_many_arguments)]
     fn encode_color_clear_rects(
         &self,
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
@@ -4052,6 +4061,7 @@ mod heap_set_tests {
         assert_ne!(entry_words(0)[1], 0, "aligned typed buffer writes textureViewID");
         // SAFETY: `1024` and `4` are inside the 64 KiB `arena` allocation.
         let second = unsafe { arena.primary.add(1024) };
+        // SAFETY: as above.
         let unaligned = unsafe { arena.primary.add(4) };
         assert!(m.write_typed_buffer(&heap, 1, &buf, second, 1024, Format::Rgba32Float, true));
         assert_eq!(m.heap_typed_views(&heap), 2);

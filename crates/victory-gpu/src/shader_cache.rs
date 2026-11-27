@@ -771,12 +771,12 @@ mod tests {
         let probe = Translate { translate: |_: &[u8]| Err::<HostShader, String>(String::new()), ran: AtomicBool::new(false) };
         let path = first.path_for(&victory_pipeline::CacheKey::new(&probe, &input));
         assert!(!path.is_file());
-        assert_eq!(cached(&first, &native_key(&settings()), b"container", translate).1, false);
+        assert!(!cached(&first, &native_key(&settings()), b"container", translate).1);
         // Where `native_present` looks: the entry `cached` wrote.
         assert!(path.is_file());
         drop(first);
         let second = Cache::open(dir.path()).unwrap();
-        assert_eq!(cached(&second, &native_key(&settings()), b"container", translate).1, true);
+        assert!(cached(&second, &native_key(&settings()), b"container", translate).1);
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         let rect = format!("{:?}", victory_shader::emit::Options { rect_list: true, ..crate::native::shaders::options() });
         assert_ne!(native_key(&settings()), native_key(&rect));

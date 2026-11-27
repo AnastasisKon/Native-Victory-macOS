@@ -529,7 +529,7 @@ fn mix_pass(objects: &[Mix]) -> (Vec<f32>, u32) {
         let (l, r) = gains(o.kind, d.position);
         let (l, r) = (l * d.volume, r * d.volume);
         let n = d.last.map_or(PERIOD, |n| n.min(PERIOD));
-        for (frame, s) in out.chunks_exact_mut(2).zip(&d.samples[..n]) {
+        for (frame, s) in out.as_chunks_mut::<2>().0.iter_mut().zip(&d.samples[..n]) {
             frame[0] += s * l;
             frame[1] += s * r;
         }

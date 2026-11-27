@@ -778,6 +778,7 @@ extern "system" fn copy_texture_region(
     #[cfg(target_os = "macos")]
     // SAFETY: the title passes both locations and an optional box (null is tolerated).
     if let (Some(&d), Some(&s)) = unsafe { (dst.as_ref(), src.as_ref()) } {
+        // SAFETY: the title passes an optional box (null is tolerated).
         let b = unsafe { source_box.as_ref().copied() };
         if !crate::native::glue::copy_texture_region(this, d, [x, y, z], s, b) {
             crate::native::glue::dropped_op("CopyTextureRegion", d.resource, s.resource);

@@ -652,7 +652,7 @@ fn trace_present_draw(t: &MetalTitle, l: &MetalList) {
         }
     }
     let n = N.fetch_add(1, Ordering::Relaxed);
-    if n % every != 0 || n / every >= 12 {
+    if !n.is_multiple_of(every) || n / every >= 12 {
         return;
     }
     let shaders = stage_hashes(l.pipeline);
@@ -816,7 +816,7 @@ pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4], rects: &[crate
 fn trace_clear_dsv(flags: u32, depth: f32) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    if n < 6 || (n % 40 == 0 && n < 3000) {
+    if n < 6 || (n.is_multiple_of(40) && n < 3000) {
         tracing::info!(flags, depth, n, "ClearDepthStencilView");
     }
 }
@@ -1284,19 +1284,19 @@ fn pass_present(resource: This) {
                     // format 10: count infinities and NaNs by their bits (decode_hdr folds inf).
                     let mut nan16 = 0usize;
                     if info.format == 10 {
-                        nan16 = raw.chunks_exact(2).filter(|p| u16::from_le_bytes([p[0], p[1]]) & 0x7c00 == 0x7c00).count();
+                        nan16 = raw.as_chunks::<2>().0.iter().filter(|p| u16::from_le_bytes(**p) & 0x7c00 == 0x7c00).count();
                     }
                     extra = format!(" max={max} min={min} mean={} notfinite={bad} infnan16={nan16} negative={neg}", sum / (rgb.len() * 3).max(1) as f64);
                     // A few texels of 32-bit floats (exposure and histogram results): every channel, alpha too.
                     if info.format == 2 && w * h <= 16 {
-                        let v: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                        let v: Vec<f32> = raw.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
                         extra += &format!(" values={v:?}");
                     }
                     out.extend(rgb.iter().flat_map(|c| c.map(|v| if v.is_finite() && v > 0.0 { ((v / (1.0 + v)).sqrt() * 255.0) as u8 } else { 0 })));
                 }
                 28 | 29 | 87 | 91 => {
                     let bgra = matches!(info.format, 87 | 91);
-                    out.extend(raw.chunks_exact(4).flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
+                    out.extend(raw.as_chunks::<4>().0.iter().flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
                 }
                 _ => {
                     // Any other: the low byte of up to three channels, as grey or colour.
@@ -1710,7 +1710,9 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     let spent = frame_left().is_zero();
     if spent && rect && !g.vs_source.rect_ready() {
         let s = g.vs_source.clone();
-        put_off(format!("{} rect", s.hash), move || drop(s.native_rect()));
+        put_off(format!("{} rect", s.hash), move || {
+            let _ = s.native_rect();
+        });
         return Pipe::Refused;
     }
     let rect_vs = if rect {
@@ -1862,7 +1864,7 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
         static START: OnceLock<std::time::Instant> = OnceLock::new();
         let late = START.get_or_init(std::time::Instant::now).elapsed().as_secs() >= 26;
         let n = N.fetch_add(1, Ordering::Relaxed);
-        if n < 8 || (late && n % 7 == 0 && n < 4000) {
+        if n < 8 || (late && n.is_multiple_of(7) && n < 4000) {
             with_list(this, |_, l| {
                 let mut head = [0u8; 72];
                 let at = l.list.vertex_buffer_address(0);
@@ -1880,13 +1882,13 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
             if rect && env_set!("VICTORY_TRACE_RECTS") {
                 static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
                 let mut seen = SEEN.lock().unwrap();
-                if seen.iter().filter(|&&p| p == l.pipeline as usize).count() < 3 {
-                    seen.push(l.pipeline as usize);
+                if seen.iter().filter(|&&p| p == l.pipeline).count() < 3 {
+                    seen.push(l.pipeline);
                     let stride = l.strides.first().copied().unwrap_or(0) as usize;
                     let mut head = vec![0u8; (stride * 3).clamp(12, 192)];
                     let at = l.list.vertex_buffer_address(0).map(|a| a + (first as u64) * stride as u64);
                     let ok = at.is_some_and(|a| super::safe_read(a as *const u8, &mut head));
-                    let floats: Vec<f32> = head.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                    let floats: Vec<f32> = head.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
                     tracing::info!(pipeline = ?l.pipeline, vertices, first, strides = ?l.strides, ok, ?floats, "rect draw");
                 }
             }
@@ -2025,13 +2027,13 @@ pub(crate) fn execute_indirect(
                         if crate::list::trace_dispatch_flags() {
                             static SEEN: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
                             let mut seen = SEEN.lock().unwrap();
-                            let key = (l.pipeline as usize, count.is_some());
+                            let key = (l.pipeline, count.is_some());
                             if seen.iter().filter(|k| **k == key).count() < 3 {
                                 seen.push(key);
                                 // What title memory holds now, not what the GPU will read.
                                 let now: Vec<u32> = super::textures::read_memory(at(i) as *const u8, 12)
-                                    .chunks_exact(4)
-                                    .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                                    .as_chunks::<4>().0.iter()
+                                    .map(|w| u32::from_le_bytes(*w))
                                     .collect();
                                 tracing::warn!(shader = ?stage_hashes(l.pipeline), ?command, counted = count.is_some(), stride, record = format_args!("{:#x}", at(i)), ?now, "an indirect dispatch (the first three of each pipeline)");
                             }
@@ -2250,7 +2252,8 @@ fn copied(t: &mut MetalTitle, what: &str, src: This, dst: Option<This>) {
         trace_bump(d as usize, 0);
     }
     if tracing_targets() {
-        static KINDS: Mutex<Vec<(String, Option<victory_backend::resources::Format>, Option<victory_backend::resources::Format>)>> = Mutex::new(Vec::new());
+        type Kind = (String, Option<victory_backend::resources::Format>, Option<victory_backend::resources::Format>);
+        static KINDS: Mutex<Vec<Kind>> = Mutex::new(Vec::new());
         let kind = (what.to_owned(), t.format_of(src as usize), dst.and_then(|d| t.format_of(d as usize)));
         let mut kinds = KINDS.lock().unwrap_or_else(|e| e.into_inner());
         if !kinds.contains(&kind) {

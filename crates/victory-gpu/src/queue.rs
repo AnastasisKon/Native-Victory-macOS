@@ -688,7 +688,7 @@ extern "system" fn present(
         tracing::info!(frame, "PresentX");
     }
     #[cfg(target_os = "macos")]
-    if frame % 64 == 0 {
+    if frame.is_multiple_of(64) {
         crate::native::glue::log_draw_counts(frame);
     }
     #[cfg(windows)]

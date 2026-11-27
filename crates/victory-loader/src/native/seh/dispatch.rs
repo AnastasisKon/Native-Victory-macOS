@@ -692,6 +692,8 @@ pub mod api {
 
     pub use super::{capture_context_address, debug_break_address, raise_exception_address};
 
+    // Called from the signal handler with the title's out-pointers; dereferencing them is the point.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub extern "C" fn lookup_function_entry(
         pc: usize,
         image_base: *mut usize,
@@ -752,6 +754,8 @@ pub mod api {
         i32::from(unwind::delete_function_table(entries))
     }
 
+    // Called from the signal handler with the title's out-pointers; dereferencing them is the point.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub extern "C" fn pc_to_file_header(pc: usize, base: *mut usize) -> usize {
         let found = unwind::image_base_of(pc).unwrap_or(0);
         if !base.is_null() {

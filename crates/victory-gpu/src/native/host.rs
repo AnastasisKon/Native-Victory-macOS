@@ -2006,9 +2006,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
     fn pass_at_submit(&self, exec: u64, notes: &[(usize, String)], li: usize, ci: usize, c: &Cmd<B>) {
         // Only work that ran: a dropped draw's note reads its tables to other limits.
         let Some((_, note)) = notes.iter().find(|(at, n)| *at == ci && n.contains("out=\"ran")) else { return };
-        let (root, limits): (&[Option<Root<B>>], Vec<(u8, usize)>) = match c {
+        type Limits = Vec<(u8, usize)>;
+        let (root, limits): (&[Option<Root<B>>], Limits) = match c {
             Cmd::Draw { root, binding, .. } => {
-                let mut limits: Vec<(u8, usize)> = Vec::new();
+                let mut limits: Limits = Vec::new();
                 // As the `PASS` note read them (`glue::pass_note`).
                 if let Some(b) = binding {
                     limits.extend(b.table_entries.iter().copied());

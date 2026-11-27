@@ -56,7 +56,7 @@ impl Archive {
                 make(false).ok()?
             }
         };
-        let list = NSArray::from_retained_slice(&[archive.clone()]);
+        let list = NSArray::from_retained_slice(std::slice::from_ref(&archive));
         let archive = Arc::new(Archive { archive, list, path, added: AtomicU32::new(0), changing: RwLock::new(()) });
         let weak = Arc::downgrade(&archive);
         let _ = std::thread::Builder::new().name("pipeline-archive".into()).spawn(move || {

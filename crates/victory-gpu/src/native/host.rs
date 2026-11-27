@@ -306,6 +306,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             mirrored: Default::default(),
             pending_mirror: Default::default(),
             images: Default::default(),
+            used: Default::default(),
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
@@ -372,6 +373,45 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// Heap entries cleared so far because the texture they showed was released.
     pub fn cleared(&self) -> u64 {
         self.cleared.get()
+    }
+
+    /// What the descriptor heaps keep resident, each allocation counted once over all of them,
+    /// split by whether a bound table named it within the last `idle_frames` frames
+    /// (`VICTORY_TRACE_HEAP_SET`): `[all, idle, never]`, each `(textures, texture bytes, buffers,
+    /// buffer bytes)`.
+    /// shortcut: entries a shader reaches by indexing the heap itself are never "named" here, so
+    /// `idle` and `never` are upper bounds.
+    pub fn heap_set_report(&self, idle_frames: u32) -> Option<[(usize, u64, usize, u64); 3]> {
+        let now = (crate::frame::current() as u32).saturating_add(1);
+        let before = now.saturating_sub(idle_frames).max(1);
+        let mut merged = std::collections::HashMap::<usize, HeapAllocation>::new();
+        let mut any = false;
+        for h in self.heaps.borrow().iter() {
+            let Some(all) = self.backend.heap_allocations(&h.heap, &h.used.borrow()) else { continue };
+            any = true;
+            for a in all {
+                merged.entry(a.id).and_modify(|m| m.latest = m.latest.max(a.latest)).or_insert(a);
+            }
+        }
+        any.then(|| {
+            let mut r = [(0, 0, 0, 0); 3];
+            for a in merged.values() {
+                let kinds = [true, a.latest != 0 && a.latest < before, a.latest == 0];
+                for (k, hit) in kinds.into_iter().enumerate() {
+                    if hit {
+                        let e = &mut r[k];
+                        if a.texture {
+                            e.0 += 1;
+                            e.1 += a.bytes;
+                        } else {
+                            e.2 += 1;
+                            e.3 += a.bytes;
+                        }
+                    }
+                }
+            }
+            r
+        })
     }
 
     /// Whether resource object `key` is registered (as a buffer or a texture).
@@ -539,6 +579,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
             let (mut checked, mut changed) = (0, 0);
             let step = Self::step(h.kind) as usize;
             let end = (*at + check).min(h.count);
+            if heap_set_trace().is_some() {
+                let frame = (crate::frame::current() as u32).saturating_add(1);
+                let mut used = h.used.borrow_mut();
+                if used.len() < end {
+                    used.resize(h.count.max(end), 0);
+                }
+                used[*at..end].fill(frame);
+            }
             // The whole span in one read (a system call each); entry by entry only if part of it
             // cannot be read.
             let mut span = vec![0u8; end.saturating_sub(*at) * step];
@@ -778,6 +826,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             mirrored: Default::default(),
             pending_mirror: Default::default(),
             images: Default::default(),
+            used: Default::default(),
         });
         self.contract.borrow_mut().heap = Some(heap.clone());
         Ok(heap)
@@ -1667,6 +1716,13 @@ fn placed_info_of(_: u64, _: &[u32; 14]) -> Option<super::textures::TextureInfo>
 /// Entries of a bound table at root `slot` to check for plain-store updates at submission:
 /// at least `floor`, extended to cover any higher table entry declared or read by the bound
 /// shader(s).
+/// `VICTORY_TRACE_HEAP_SET=<frames>`: report what the heaps keep resident that no bound table has
+/// named for that many frames (diagnostics; [`NativeHost::heap_set_report`]).
+pub(crate) fn heap_set_trace() -> Option<u32> {
+    static N: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_TRACE_HEAP_SET").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0))
+}
+
 fn table_check_count(slot: usize, binding: Option<&Binding>, floor: usize) -> usize {
     let mut count = floor;
     let Ok(slot) = u8::try_from(slot) else {

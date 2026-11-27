@@ -33,6 +33,9 @@ pub struct NativeHeap<B: GraphicsBackend> {
     /// so unchanged entries are retried only once the pool table or registered resources change.
     pub pending_mirror: std::cell::RefCell<std::collections::HashMap<usize, PendingMirror>>,
     pub images: std::cell::RefCell<Shown>,
+    /// With `VICTORY_TRACE_HEAP_SET`: the frame (+1; 0: never) each entry was last inside a table a
+    /// draw or dispatch bound (diagnostics).
+    pub used: std::cell::RefCell<Vec<u32>>,
 }
 
 /// The title texture each heap entry shows (`of`), and each texture's entries (`entries`; those

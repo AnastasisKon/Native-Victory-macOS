@@ -1046,6 +1046,12 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let indirect = crate::list::indirect_dropped();
     let (r, heap_cleared) = with_title(|t| (t.host.backend.residency_counts(), t.host.cleared())).unwrap_or_default();
     tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, "native draws so far");
+    if let Some(n) = super::host::heap_set_trace()
+        && let Some([all, idle, never]) = with_title(|t| t.host.heap_set_report(n)).flatten()
+    {
+        let mb = |b: u64| b >> 20;
+        tracing::info!(frame, idle_frames = n, textures = all.0, textures_mb = mb(all.1), buffers = all.2, buffers_mb = mb(all.3), idle_textures = idle.0, idle_textures_mb = mb(idle.1), idle_buffers = idle.2, idle_buffers_mb = mb(idle.3), never_textures = never.0, never_textures_mb = mb(never.1), never_buffers = never.2, never_buffers_mb = mb(never.3), "heap set: allocations (once over all heaps) no bound table named for that many frames (idle), or ever (never)");
+    }
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_SHADER_CACHE").is_some_and(|v| !v.is_empty() && v != "0")) {
         let (shaders_cached, shaders_translated) = crate::shader_cache::counts();

@@ -77,7 +77,7 @@ You need:
 
 - an Apple Silicon Mac (M1 or newer) with macOS 15 or newer and about 20 GB free;
 - [rustup](https://rustup.rs) (not Homebrew's `rust` package);
-- Apple's free [Metal Shader Converter](https://developer.apple.com/metal/shader-converter/) (download and run the installer);
+- Apple's free [Metal Shader Converter](https://developer.apple.com/metal/shader-converter/) 3.0 or newer (download and run the installer; older ones are refused, #295);
 - your own copy of the Xbox Series game files.
 
 **1. Get the code and build it.**

@@ -1146,3 +1146,55 @@ fn a_descriptor_with_its_stride_cleared_reads_the_view_raw_on_the_gpu() {
     assert_eq!(f.get(0x2_2000, 32), src[..32]);
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
+
+/// A compute program's buffer descriptor built around an address it computes from its root
+/// constants (`docs/native-host.md`, "Computed compute buffers"), run on the GPU: each lane builds
+/// a raw descriptor over `s[0:1] + 16` (bounds mode 3, a byte count in dword 2) and loads dword
+/// `lane` from it by byte offset, then stores it to `dst[lane]` (`s[2:3]`). The host reads title
+/// memory there (`zero_copy_memory`), above 4 GiB too; past the byte count a lane reads 0.
+#[test]
+fn a_compute_buffer_descriptor_around_a_computed_address_loads_title_memory() {
+    let program = |bytes: u32| -> Vec<u32> {
+        vec![
+            0x8004_9000, // s_add_u32 s4, s0, 16
+            0x8205_8001, // s_addc_u32 s5, s1, 0
+            0x8705_FF05,
+            0x0000_FFFF, // s_and_b32 s5, s5, 0xffff (stride 0)
+            0xBE86_03FF,
+            bytes, // s_mov_b32 s6, <bytes>
+            0xBE87_03FF,
+            0x3101_4FAC, // s_mov_b32 s7, 0x31014fac (raw dwords, bounds mode 3: the byte count)
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xE030_1000,
+            0x8001_0201, // buffer_load_dword v2, v1, s[4:7], 0 offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xDC70_8000,
+            0x0002_0201, // global_store_dword v1, v2, s[2:3]
+            0xBF81_0000, // s_endpgm
+        ]
+    };
+    // As the host translates it: an FSPX container whose root constants (root type 0, user
+    // data 0) reach the four user SGPRs.
+    let mut constants = [0u8; 32];
+    constants[0] = 0x41;
+    constants[4..6].copy_from_slice(&[2, 0]);
+    constants[16] = 1;
+    constants[20..23].copy_from_slice(&[4, 0, 0]);
+    constants[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    // Source dwords at VA_A + 0x1000 + 16 (pool offset 0x2_1010).
+    let src: Vec<u32> = (0..32u32).map(|i| 0x5000_0000 | i * 7 + 3).collect();
+    f.put(0x2_1010, &src);
+    let [a, b] = halves(VA_A + 0x1000);
+    let [c, d] = halves(VA_A + 0x4_0000);
+    for bytes in [128u32, 64] {
+        let c0 = crate::pipeline::test_compute_container(&program(bytes), &[constants], 4);
+        let cs = shaders::translate(&c0).expect("translates");
+        assert!(cs.memory, "reads title memory through the page table");
+        dispatch(&mut t, &cs, &[a, b, c, d], false);
+        assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+        let want: Vec<u32> = (0..32).map(|i| if 4 * i < bytes { src[i as usize] } else { 0 }).collect();
+        assert_eq!(f.get(0x6_0000, 32), want, "{bytes} bytes");
+    }
+}

@@ -1600,6 +1600,38 @@ impl<B: GraphicsBackend> NativeHost<B> {
         (reads, writes, none, keys)
     }
 
+    /// Pass trace: the table entries of a noted draw or dispatch as they are when it is submitted,
+    /// against its `PASS` line (made when it was recorded). A `PASSSUB` line lists the entries that
+    /// read differently now: the title rewrote them between recording and submitting.
+    #[cfg(target_os = "macos")]
+    fn pass_at_submit(&self, exec: u64, notes: &[(usize, String)], li: usize, ci: usize, c: &Cmd<B>) {
+        // Only work that ran: a dropped draw's note reads its tables to other limits.
+        let Some((_, note)) = notes.iter().find(|(at, n)| *at == ci && n.contains("out=\"ran")) else { return };
+        let (root, limits): (&[Option<Root<B>>], Vec<(u8, usize)>) = match c {
+            Cmd::Draw { root, binding, .. } => {
+                let mut limits: Vec<(u8, usize)> = Vec::new();
+                // As the `PASS` note read them (`glue::pass_note`).
+                if let Some(b) = binding {
+                    limits.extend(b.table_entries.iter().copied());
+                    if let Some(ps) = &b.ps {
+                        limits.extend(ps.table_entries.iter().copied());
+                    }
+                    if limits.is_empty() {
+                        limits.push((255, 0));
+                    }
+                }
+                (root, limits)
+            }
+            Cmd::Dispatch { root, .. } => (root, Vec::new()),
+            _ => return,
+        };
+        let (reads, writes, _, _) = self.pass_views(root, &limits);
+        let changed = changed_entries(note, reads.iter().chain(&writes));
+        if !changed.is_empty() {
+            eprintln!("PASSSUB exec={exec} li={li} ci={ci} changed={changed:?}");
+        }
+    }
+
     /// For `VICTORY_TRACE_RECORD_WRITERS`: what the first 64 entries from each of `root`'s tables
     /// name: the title memory (start, size) of buffers viewed for unordered access, the textures
     /// viewed as shader resources, and the textures viewed for unordered access. A table may be
@@ -2005,6 +2037,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
             // Reported from this one preparation: preparing again for the trace would mirror tables
             // and write view pairs twice.
             let prepared = self.prep(c);
+            #[cfg(target_os = "macos")]
+            if noted {
+                self.pass_at_submit(exec, &lists[li].notes, li, ci, c);
+            }
             if noted && let Err(e) = &prepared {
                 eprintln!("PASSFAIL exec={exec} li={li} ci={ci} err={e}");
             }
@@ -2350,6 +2386,21 @@ fn texture_info_of(_: usize) -> Option<super::textures::TextureInfo> {
 /// The pass trace's name for a shader-resource view the host has no texture for: a buffer the host
 /// knows (`<key>:buf`), a null resource with its view description's format and dimension
 /// (`null:f<format>:dim<dimension>`, read as zeros), or anything else (`<key>:untracked`).
+/// The entries (`<slot>.<index>=<view>`) of `now` that a `PASS` note does not hold as they are.
+#[cfg(any(test, target_os = "macos"))]
+fn changed_entries<'a>(note: &str, now: impl Iterator<Item = &'a String>) -> Vec<&'a String> {
+    now.filter(|e| !note.contains(&format!("\"{e}\""))).collect()
+}
+
+#[test]
+fn an_entry_rewritten_after_recording_is_listed_at_submit() {
+    let note = r#"kind=draw rd=["1.29=0x10:f54:240x135@0xa0", "1.30=null:f34:dim4"] wr=[]"#;
+    let now = ["1.29=0x10:f54:240x135@0xa0".to_owned(), "1.30=0x20:f34:1280x720@0xb0".to_owned()];
+    assert_eq!(changed_entries(note, now.iter()), [&now[1]]);
+    // A prefix of an entry is not that entry.
+    assert_eq!(changed_entries(r#"rd=["1.3=0x2"]"#, ["1.3=0x".to_owned()].iter()).len(), 1);
+}
+
 #[cfg(any(test, target_os = "macos"))]
 fn untextured_srv(r: usize, buffer: bool, desc: Option<[u32; 10]>) -> String {
     match (r, desc) {

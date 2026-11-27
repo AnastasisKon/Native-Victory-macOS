@@ -100,8 +100,8 @@ pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
     if shader.memory && !memory {
         return Some("reads title memory through the page table in a graphics pipeline");
     }
-    if shader.view_addresses || shader.view_marks {
-        return Some("needs view addresses or write marks");
+    if shader.view_marks {
+        return Some("needs write marks");
     }
     None
 }
@@ -223,6 +223,8 @@ impl<B: PresentBackend> Title<B> {
                 }))
             }
             Err(e) => {
+                #[cfg(target_os = "macos")]
+                self.compile_failed(name, &e);
                 self.shaders.refuse(name, format!("conversion: {e}"));
                 Pipe::Refused
             }
@@ -357,6 +359,8 @@ impl<B: PresentBackend> Title<B> {
                 })))
             }
             Err(e) => {
+                #[cfg(target_os = "macos")]
+                self.compile_failed(name, &e);
                 self.shaders.refuse(name, format!("conversion: {e}"));
                 Pipe::Refused
             }
@@ -366,5 +370,14 @@ impl<B: PresentBackend> Title<B> {
     /// A translation that failed, counted.
     pub fn refused_translation(&mut self, name: &str, reason: String) {
         self.shaders.refuse(name, format!("translation: {reason}"));
+    }
+
+    /// A pipeline compile that ended in `error`: if Metal's compiler died on it rather than
+    /// refusing a shader the host cannot run, the frame spends the rest of its pipeline budget
+    /// (`glue::compile_failed`), so the frame's other new pipelines are put off instead of each
+    /// waiting about a second for a compiler that crashes (issue #181).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn compile_failed(&mut self, name: &str, error: &str) {
+        super::glue::compile_failed(name, error);
     }
 }

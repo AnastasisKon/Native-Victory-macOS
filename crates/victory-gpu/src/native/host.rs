@@ -16,6 +16,12 @@ use std::sync::Arc;
 use victory_backend::backend::{Dispatch, Heaps, RootArgs};
 use victory_backend::resources::*;
 
+#[cfg(test)]
+thread_local! {
+    /// Walks of the pool table for a wrap's signature ([`NativeHost::alias_signature`]), for tests.
+    pub(crate) static SIGNATURES: Cell<u64> = const { Cell::new(0) };
+}
+
 /// Buffers over ranges of the title's own addresses, by `(start, end)`: the signature of the
 /// mappings they were made over, when they were last used, and the buffer.
 type TitleAliases<Buf> = RefCell<HashMap<(u64, u64), (u64, u64, Rc<Buf>)>>;
@@ -389,6 +395,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// part of it is not mapped.
     fn alias_signature(&self, addr: u64, len: u64) -> Option<u64> {
         let (base, end) = Self::alias_range(addr, len)?;
+        #[cfg(test)]
+        SIGNATURES.with(|n| n.set(n.get() + 1));
         self.memory.signature(base, end - base)
     }
 
@@ -415,13 +423,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 .collect();
             tracing::info!(looks, generation, ?large, "following the title's pages under heap buffer views");
         }
+        // The title copies one view into many entries (54 of the 174 MiB one in a world run): each
+        // range's walk is made once a look (about 3 ms a look before, the pool table locked).
+        let mut walked: HashMap<(u64, u64), Option<u64>> = HashMap::new();
         for heap in heaps {
             let moved: Vec<_> = heap
                 .title_views
                 .borrow()
                 .iter()
                 .filter_map(|(&index, &(addr, len, was))| {
-                    let now = self.alias_signature(addr, len);
+                    let now = match Self::alias_range(addr, len) {
+                        Some(range) => *walked.entry(range).or_insert_with(|| self.alias_signature(addr, len)),
+                        None => None,
+                    };
                     (now != was).then_some((index, addr, len, was, now))
                 })
                 .collect();
@@ -538,6 +552,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pairs: Default::default(),
             table: Default::default(),
             strides: Default::default(),
+            addresses: Default::default(),
             mirrored: Default::default(),
             pending_mirror: Default::default(),
             title_views: Default::default(),
@@ -733,6 +748,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
         {
             strides.write_at(index, &[self.stride_word(view.as_ref())]);
         }
+        if heap.kind == HeapKind::Resource
+            && let Some(addresses) = &*heap.addresses.borrow()
+        {
+            addresses.write_at(4 * index, &self.address_words(view.as_ref()));
+        }
         let Some(view) = view else {
             // Emptied (by the title's stores): not mirrored any more, so a submission does not
             // look at it again until the title writes a record there.
@@ -747,6 +767,21 @@ impl<B: GraphicsBackend> NativeHost<B> {
             heap.title_views.borrow_mut().remove(&index);
         }
         match decoded {
+            // A buffer view of address 0 (what D3D12 writes for a null view): the null view, and
+            // mirrored like any other entry, whatever its size. Nothing is ever mapped at 0 here
+            // (title addresses are this process's, and `apps/victory/build.rs` keeps page 0 as
+            // `__PAGEZERO`), and no buffer object is at 0 (a resource at address 0 is refused), so
+            // neither a pool nor a wrap of the title's pages can ever hold it. Taken for memory in
+            // no pool, it was tried again after every change to the pool table, which world
+            // streaming makes all the time. Not a view whose title pages are followed either.
+            Decoded::Buffer { addr: 0, .. } => {
+                heap.title_views.borrow_mut().remove(&index);
+                let null = self.null_view()?;
+                self.backend.write_buffer(&heap.heap, index, &null.buf, null.ptr().cast_const(), 0);
+                // No typed view over the null view: one pending from the entry's last record goes.
+                heap.typed_pending.borrow_mut().set(index, false, false);
+                heap.shows(index, None);
+            }
             Decoded::Buffer { addr, size } => {
                 // Read before resolving: a pool mapped by a title thread after a failed resolve
                 // must bump past these, so the entry is retried.
@@ -1270,6 +1305,58 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(())
     }
 
+    /// What a shader that reads views' title addresses or texture sizes from descriptors is given
+    /// after the page table: the view addresses of the heap it reads.
+    fn view_address_args(&self, heap: Option<&Rc<NativeHeap<B>>>, p: &mut Prep<B>) -> Result<(), String> {
+        let heap = match (&p.heap, heap) {
+            (Some(h), _) | (None, Some(h)) => h.clone(),
+            (None, None) => self.host_heap()?,
+        };
+        let table = self.view_addresses(&heap)?;
+        let gpu = self.backend.gpu_address(&table.buf, table.ptr());
+        p.bufs.push(table.buf.clone());
+        p.root = std::mem::take(&mut p.root).address(gpu);
+        p.heap = Some(heap);
+        Ok(())
+    }
+
+    /// The four dwords of a heap entry in the view addresses: a buffer view's title address
+    /// (dword 0, and dword 1 bits 0-15), a texture view's size fields
+    /// ([`crate::descriptor::texture_words`]), zeros for anything else.
+    fn address_words(&self, view: Option<&crate::descriptor::View>) -> [u32; 4] {
+        let Some(view) = view else { return [0; 4] };
+        if let Some(words) = crate::descriptor::texture_words(view) {
+            return words;
+        }
+        match decode(view, &self.resources.borrow()) {
+            Some(Decoded::Buffer { addr, .. }) => [addr as u32, (addr >> 32) as u32 & 0xFFFF, 0, 0],
+            _ => [0; 4],
+        }
+    }
+
+    /// The view addresses of `heap` (the translator's root SRV `t1` of the memory space,
+    /// `victory_shader::emit`, "View addresses"): per title entry, four dwords of the console
+    /// descriptor as far as the host knows them ([`Self::address_words`]), so a shader that walks
+    /// a BVH from its SRV's address, or sizes a texture from its descriptor, reads them. 16 bytes
+    /// an entry. Made at first use from the heap as the title's memory has it now and kept
+    /// current by [`Self::mirror`]. shortcut: an entry the title copied as bytes outside a bound
+    /// table keeps its old words until it is mirrored.
+    fn view_addresses(&self, heap: &NativeHeap<B>) -> Result<Rc<Pages<B>>, String> {
+        if let Some(made) = &*heap.addresses.borrow() {
+            return Ok(made.clone());
+        }
+        let pages = Rc::new(Pages::new(&self.backend, heap.count.max(1) * 16)?);
+        let step = Self::step(heap.kind);
+        for index in 0..heap.count {
+            let view = crate::descriptor::view(heap.start + index as u64 * step);
+            if view.is_some() {
+                pages.write_at(4 * index, &self.address_words(view.as_ref()));
+            }
+        }
+        *heap.addresses.borrow_mut() = Some(pages.clone());
+        Ok(pages)
+    }
+
     /// A resource heap of the host's own, for work that needs the view pairs and has no heap.
     fn host_heap(&self) -> Result<Rc<NativeHeap<B>>, String> {
         if let Some(h) = &self.contract.borrow().heap {
@@ -1283,6 +1370,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pairs: Default::default(),
             table: Default::default(),
             strides: Default::default(),
+            addresses: Default::default(),
             mirrored: Default::default(),
             pending_mirror: Default::default(),
             title_views: Default::default(),
@@ -1736,6 +1824,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     } else if let Some(h) = p.heap.clone() {
                         self.write_pairs(&h)?;
                     }
+                    if b.view_addresses {
+                        self.view_address_args(heaps.0.as_ref(), &mut p)?;
+                    }
                 }
                 None => self.root_args(root, &mut p)?,
             }},
@@ -1771,11 +1862,17 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         if b.memory {
                             self.memory_args(heaps.0.as_ref(), &mut p)?;
                         }
+                        if b.view_addresses {
+                            self.view_address_args(heaps.0.as_ref(), &mut p)?;
+                        }
                         if let Some(ps) = &b.ps {
                             let vs_args = std::mem::take(&mut p.root);
                             self.translated_args(root, ps, heaps.0.as_ref(), [u32::MAX; 3], &mut p)?;
                             if ps.memory {
                                 self.memory_args(heaps.0.as_ref(), &mut p)?;
+                            }
+                            if ps.view_addresses {
+                                self.view_address_args(heaps.0.as_ref(), &mut p)?;
                             }
                             p.ps_root = Some(std::mem::replace(&mut p.root, vs_args));
                         }

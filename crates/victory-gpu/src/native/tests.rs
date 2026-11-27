@@ -339,6 +339,71 @@ fn a_wrapped_view_follows_title_pages_remapped_or_unmapped_under_it() {
     assert_eq!(pass(), expect(&|i| i + 68), "the view still read the old pool page");
     title.unmap(&h, 1, page);
     assert_eq!(pass(), vec![1; 64], "a view with an unmapped page is the null view");
+    // A null view (address 0) written over a followed entry is not followed any more.
+    assert!(heap.title_views.borrow().contains_key(&0));
+    crate::descriptor::create_cbv(std::ptr::null_mut(), &[0, 0, 256, 0], start);
+    assert!(h.mirror(start).unwrap());
+    assert!(!heap.title_views.borrow().contains_key(&0), "a null view's pages are followed");
+    drop(slots);
+}
+
+/// The title copies one view into many heap entries; following the pages under them walks the
+/// pool table once for that range a look, not once an entry, and every copy still follows a
+/// remap (#267 review: 54 copies of the 174 MiB view cost about 3 ms a look).
+#[test]
+fn copies_of_a_wrapped_view_are_followed_with_one_walk() {
+    let Some(h) = host() else { return };
+    let page = page_size().max(16384);
+    let pool = Alias::new(5 * page).unwrap();
+    let info = PoolInfo { id: 1, base: pool.primary as usize, len: pool.len, memory_entry: None };
+    h.memory().pool_created(&info);
+    let title = TitlePages::new(&h, &pool, &info, &[2 * page, page, 3 * page], page);
+    let (src, dst) = (page - 128, 2 * page);
+    title.write(src, &(0..64u32).collect::<Vec<_>>());
+    // SAFETY: inside the pool's own mapping; the GPU is idle.
+    unsafe { std::ptr::copy_nonoverlapping((100..132u32).collect::<Vec<_>>().as_ptr(), pool.primary.add(4 * page).cast(), 32) };
+    let slots = vec![0u32; 8 * 8];
+    let start = slots.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 8).unwrap();
+    let placed = |at: usize| {
+        let mut d = [0u32; 16];
+        (d[1], d[6], d[8]) = (1, 64, 1);
+        d[10] = (title.va + at as u64) as u32;
+        d[11] = ((title.va + at as u64) >> 32) as u32;
+        d
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    // Entries 0 to 2: three copies of the source view; entry 3: the output.
+    for k in 0..3 {
+        crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &placed(src), start + 32 * k);
+        assert!(h.mirror(start + 32 * k).unwrap());
+    }
+    let mut uav = placed(dst);
+    (uav[4], uav[6]) = (64, 0);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 96);
+    assert!(h.mirror(start + 96).unwrap());
+    let walks = || super::host::SIGNATURES.with(|n| n.replace(0));
+    // A pool-table change elsewhere: one walk for the three copies, none moved.
+    h.memory().pool_created(&PoolInfo { id: 2, base: 0x1000, len: 0x1000, memory_entry: None });
+    walks();
+    run(&h, &[]);
+    assert_eq!(walks(), 1);
+    // Remapped under them: still one walk, and the copy the program reads follows.
+    let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    title.remap(&h, &info, &pool, 1, 4 * page, page);
+    title.write(dst, &[0xCAFE_CAFEu32; 64]);
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[3, 1]);
+    l.set_compute_root_table(1, &heap, 2);
+    l.dispatch(1, 1, 1).unwrap();
+    walks();
+    run(&h, &[&l]);
+    assert_eq!(walks(), 1);
+    let expect: Vec<u32> = (0..64u32).map(|i| if i < 32 { i * 3 + 1 } else { (i + 68) * 3 + 1 }).collect();
+    assert_eq!(title.read::<u32>(dst, 64), expect);
     drop(slots);
 }
 
@@ -697,6 +762,47 @@ fn submission_retries_an_unchanged_buffer_descriptor_after_mapping() {
 
     submit();
     assert_eq!(host.backend.buffer_writes.borrow().len(), 2);
+}
+
+/// A buffer view of address 0 (a null view) is the null view for good: a change to the pool table
+/// (world streaming maps pages between almost every submission) does not make it be tried again.
+#[test]
+fn a_null_buffer_view_is_not_retried_when_the_pool_table_changes() {
+    let host = super::host::NativeHost::new(super::vertex_tests::Capture::default());
+    let mut slot = [0u32; 8];
+    let handle = slot.as_mut_ptr() as u64;
+    let heap = host.heap(HeapKind::Resource, handle, 1).unwrap();
+    crate::descriptor::create_cbv(std::ptr::null_mut(), &[0, 0, 256, 0], handle);
+
+    let mut list = NativeList::default();
+    list.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
+    list.set_render_targets(
+        &[Rc::new(victory_backend::resources::TextureDesc::d2(victory_backend::resources::Format::Rgba8Unorm, 1, 1))],
+        None,
+    );
+    list.set_heaps(Some(&heap), None);
+    list.set_graphics_root_table(0, &heap, 0);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    let submit = || host.execute(&(), &[&list], &[], &[]).unwrap();
+
+    submit();
+    assert!(matches!(
+        host.backend.buffer_writes.borrow().as_slice(),
+        [(0, _, _, 0)]
+    ));
+
+    // Pages mapped elsewhere move the pool table's generation on.
+    for (n, at) in [0x80000usize, 0x90000].into_iter().enumerate() {
+        let pool = PoolInfo {
+            id: n + 1,
+            base: 0x40000 + n * 0x4000,
+            len: 0x4000,
+            memory_entry: None,
+        };
+        host.memory().mapped(at, pool.len, &pool, 0);
+        submit();
+    }
+    assert_eq!(host.backend.buffer_writes.borrow().len(), 1);
 }
 
 #[test]

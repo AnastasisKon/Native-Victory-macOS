@@ -455,17 +455,22 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
 /// One texel of an HDR or 10-bit colour target (DXGI 2, 10, 24, 26) as linear RGB.
 fn decode_hdr(format: u32, p: &[u8]) -> [f32; 3] {
     let word = |i: usize| u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
-    // An unsigned small float: `mbits` mantissa bits over a 5-bit exponent.
+    // The magnitude of a small float with `mbits` mantissa bits and a 5-bit exponent.
     let small = |v: u32, mbits: u32| {
         let (e, m) = ((v >> mbits) & 0x1f, v & ((1 << mbits) - 1));
-        if e == 0 { m as f32 * 2f32.powi(-14 - mbits as i32) } else { (1.0 + m as f32 / (1 << mbits) as f32) * 2f32.powi(e as i32 - 15) }
+        match (e, m) {
+            (0, m) => m as f32 * 2f32.powi(-14 - mbits as i32),
+            (31, 0) => f32::INFINITY,
+            (31, _) => f32::NAN,
+            _ => (1.0 + m as f32 / (1 << mbits) as f32) * 2f32.powi(e as i32 - 15),
+        }
     };
     match format {
         2 => [0, 4, 8].map(|i| f32::from_bits(word(i))),
         10 => [0, 2, 4].map(|i| {
             let h = u32::from(u16::from_le_bytes([p[i], p[i + 1]]));
             let v = small(h & 0x7fff, 10);
-            if h >> 15 == 1 { -v } else if (h >> 10) & 0x1f == 0x1f { f32::NAN } else { v }
+            if h >> 15 == 1 { -v } else { v }
         }),
         24 => [0, 10, 20].map(|s| ((word(0) >> s) & 0x3ff) as f32 / 1023.0),
         _ => {
@@ -473,6 +478,29 @@ fn decode_hdr(format: u32, p: &[u8]) -> [f32; 3] {
             [small(v & 0x7ff, 6), small((v >> 11) & 0x7ff, 6), small(v >> 22, 5)]
         }
     }
+}
+
+#[test]
+fn hdr_dump_preserves_non_finite_channels() {
+    let rgba16 = |words: [u16; 4]| {
+        let bytes: Vec<u8> = words.into_iter().flat_map(u16::to_le_bytes).collect();
+        decode_hdr(10, &bytes)
+    };
+    let rgb11 = |r: u32, g: u32, b: u32| {
+        decode_hdr(26, &(r | (g << 11) | (b << 22)).to_le_bytes())
+    };
+
+    let [r, g, b] = rgba16([0x7c00, 0xfc00, 0xfe00, 0]);
+    assert_eq!(r, f32::INFINITY);
+    assert_eq!(g, f32::NEG_INFINITY);
+    assert!(b.is_nan());
+    assert_eq!(rgba16([0x3c00, 0xb800, 1, 0]), [1.0, -0.5, 2f32.powi(-24)]);
+
+    let [r, g, b] = rgb11(0x7c0, 0x7e0, 0x3e0);
+    assert_eq!(r, f32::INFINITY);
+    assert!(g.is_nan());
+    assert_eq!(b, f32::INFINITY);
+    assert_eq!(rgb11(0x3c0, 1, 0x1c0), [1.0, 2f32.powi(-20), 0.5]);
 }
 
 /// A texture operation the native host does not do (copies, resolves), counted by the trace.

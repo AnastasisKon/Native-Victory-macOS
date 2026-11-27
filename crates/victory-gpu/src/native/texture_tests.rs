@@ -875,6 +875,72 @@ fn a_target_the_host_cannot_make_does_not_shift_the_ones_after_it() {
     drop(slots);
 }
 
+/// A dispatch whose bound table runs into a page that cannot be read (#445): the textures it may
+/// write are still noted from the entries that can be, and the rest are skipped, not loaded. Here
+/// the copy-back shows the UAV was noted.
+#[test]
+fn a_table_running_into_an_unreadable_page_is_noted_without_a_fault() {
+    use victory_platform::mem::{Protect, protect};
+    // Skips without the Shader Converter.
+    if super::host().is_none() {
+        return;
+    }
+    let dxil = include_bytes!("../../../victory-metal/tests/fixtures/tex_fill.dxil");
+    const W: u32 = 64;
+    let mut t = Title::new(victory_metal::metal::Metal::new().unwrap(), Default::default());
+    let mem = Alias::new((64 << 10).max(page_size())).unwrap();
+    let info = PoolInfo { id: 9133, base: mem.primary as usize, len: mem.len, memory_entry: None };
+    t.host.memory().pool_created(&info);
+    t.host.memory().mapped(mem.alias as usize, mem.len, &info, 0);
+    let pool = Pool { mem };
+    t.set_texture_back(true);
+    let res = crate::resource::test_texture_at(pool.va(0), (u64::from(W), W), 1, 28, Swizzle::LINEAR.0, 4);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    pool.write(0, &vec![0u8; info.size]);
+    t.texture_created(key, info.clone());
+    assert!(t.realize(key));
+    // Two pages of descriptor records: the UAV in the last entry of the first, the table bound
+    // there, and its checked span (16 entries) running on into the second.
+    let (page, step) = (page_size(), crate::descriptor::increment(0).unwrap_or(32) as usize);
+    let mut records = 0u64;
+    // SAFETY: no arguments; the task port of this process.
+    let task = unsafe { super::mach_task_self() };
+    // SAFETY: `records` is written with the new allocation's address.
+    assert_eq!(unsafe { super::mach_vm_allocate(task, &mut records, 2 * page as u64, 1) }, 0);
+    let at = page / step - 1;
+    let uav = [28u32, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::descriptor::create_uav(std::ptr::null(), res, std::ptr::null(), &uav, records + (at * step) as u64);
+    let heap = t.host.heap(HeapKind::Resource, records, 2 * page / step).unwrap();
+    // SAFETY: the second page of our own allocation.
+    unsafe { protect((records as usize + page) as *mut u8, page, Protect::NO_ACCESS) }.unwrap();
+    let pso = t.host.compute_pipeline(dxil, [8, 8, 1]).unwrap();
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap, at);
+    l.dispatch(W / 8, W / 8, 1).unwrap();
+    t.ensure_queue(1).unwrap();
+    t.submit(1, vec![(l, vec![])]);
+    t.signal_queue(1, 11, 0, 1);
+    let start = std::time::Instant::now();
+    while !t.try_wait(11, 0, 1) {
+        assert!(start.elapsed().as_secs() < 10, "the dispatch did not complete");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let mut out = vec![0u8; info.size];
+    assert!(crate::native::safe_read(pool.va(0) as *const u8, &mut out));
+    let linear: Vec<u8> = (0..W).flat_map(|y| (0..W).flat_map(move |x| [x as u8, y as u8, 64, 255])).collect();
+    let mut want = vec![0u8; info.size];
+    info.layout.tile(&mut want, 0, 0, &linear, W as usize * 4, linear.len()).unwrap();
+    assert!(out == want, "the UAV in the readable entry was not noted");
+    t.host.drop_heap(records);
+    t.host.forget_resource(key);
+    t.texture_released(key);
+    // SAFETY: our allocation, which nothing uses any more.
+    assert_eq!(unsafe { super::mach_vm_deallocate(task, records, 2 * page as u64) }, 0);
+}
+
 /// A compute dispatch writes a tiled title texture through a UAV; once its fence value shows, the
 /// title's own memory holds the texels, in the texture's layout (the ocean maps' path, #46).
 #[test]

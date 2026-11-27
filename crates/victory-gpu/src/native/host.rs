@@ -1239,11 +1239,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
             if h.kind != HeapKind::Resource {
                 continue;
             }
-            let end = (*at + table_check_count(slot, binding, Self::TABLE_CHECK)).min(h.count);
-            for index in *at..end {
-                match crate::descriptor::view(h.start + index as u64 * Self::step(h.kind)) {
-                    Some(crate::descriptor::View::Unordered(r, ..)) => written.push(r),
-                    Some(crate::descriptor::View::Placed(true, res, d)) if res[0] > 1 => {
+            let records: Vec<[u32; 3]> = Self::table_records(h, Self::table_span(h, slot, *at, binding))
+                .iter()
+                .map(|r| std::array::from_fn(|k| u32::from_le_bytes(r[4 * k..][..4].try_into().expect("4 bytes"))))
+                .collect();
+            for view in crate::descriptor::views_of(&records).into_iter().flatten() {
+                match view {
+                    crate::descriptor::View::Unordered(r, ..) => written.push(r),
+                    crate::descriptor::View::Placed(true, res, d) if res[0] > 1 => {
                         let address = u64::from(d[10]) | u64::from(d[11]) << 32;
                         written.push(super::textures::placed_key(address, &res));
                     }
@@ -1262,6 +1265,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// [`Self::TABLE_CHECK`], within the heap.
     fn table_span(h: &NativeHeap<B>, slot: usize, at: usize, binding: Option<&Binding>) -> std::ops::Range<usize> {
         at..(at + table_check_count(slot, binding, Self::TABLE_CHECK)).min(h.count)
+    }
+
+    /// The title's records of entries `span` of `h`: the whole span in one read (a system call),
+    /// entry by entry only if part of it cannot be read. Never plain loads: an unreadable record
+    /// reads as zeros.
+    fn table_records(h: &NativeHeap<B>, span: std::ops::Range<usize>) -> Vec<[u8; 12]> {
+        let step = Self::step(h.kind) as usize;
+        let mut bytes = vec![0u8; span.len() * step];
+        if super::safe_read((h.start + (span.start * step) as u64) as *const u8, &mut bytes) {
+            bytes.chunks(step).map(|r| r[..12].try_into().expect("12 bytes")).collect()
+        } else {
+            span.map(|index| record_at(h.start + (index * step) as u64)).collect()
+        }
     }
 
     /// The resources the records of the tables `lists`' draws and dispatches bind name now: the
@@ -1335,17 +1351,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 }
                 used[*at..end].fill(frame);
             }
-            // The whole span in one read (a system call each); entry by entry only if part of it
-            // cannot be read.
-            let mut span = vec![0u8; end.saturating_sub(*at) * step];
-            let whole = super::safe_read((h.start + (*at * step) as u64) as *const u8, &mut span);
-            for index in *at..end {
+            for (index, record) in (*at..end).zip(Self::table_records(h, *at..end)) {
                 let handle = h.start + (index * step) as u64;
-                let record = if whole {
-                    span[(index - *at) * step..][..12].try_into().expect("12 bytes")
-                } else {
-                    record_at(handle)
-                };
                 checked += 1;
                 let seen = h.mirrored.borrow().get(&index).copied();
                 // An empty record is mirrored only if a view was mirrored there before: the title

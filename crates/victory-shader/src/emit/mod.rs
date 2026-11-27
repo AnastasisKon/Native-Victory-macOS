@@ -156,7 +156,8 @@
 //!   0), a texture view's width and height - 1 (dword 1 bits 30-31, dword 2
 //!   bits 0-13 and 14-29), first and last level (dword 3 bits 12-15, 16-19)
 //!   and type (bits 28-31) with an identity swizzle; zeros for anything
-//!   else.
+//!   else. A program that can see a bit of a field the table gives as 0
+//!   is refused (`Lower::seen_bits`).
 //! * **Write marks** ([`HostShader::view_marks`], with
 //!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap

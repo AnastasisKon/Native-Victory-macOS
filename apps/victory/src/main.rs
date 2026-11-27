@@ -175,7 +175,10 @@ fn stop_gpu_on_signals() {
             return;
         }
         tracing::warn!(signal = sig, "stopping: waking and draining the GPU's queued work first");
-        let (in_flight, left) = victory_gpu::stop_gpu(std::time::Duration::from_secs(3));
+        // A command buffer still running on the GPU gets up to 20 s in all: run-native.sh's
+        // `timeout` gives a run 30 s past its --seconds stop.
+        let (in_flight, left) =
+            victory_gpu::stop_gpu(std::time::Duration::from_secs(3), std::time::Duration::from_secs(20));
         tracing::warn!(in_flight, left, "stopped the GPU's work; exiting");
         std::process::exit(128 + sig);
     });

@@ -1247,6 +1247,13 @@ impl<B: PresentBackend> Title<B> {
         self.textures.get(&key).and_then(|t| t.info.desc()).map(|d| d.format)
     }
 
+    /// The description the host keeps of title texture `key` (a placed one too, which no resource
+    /// object describes).
+    #[cfg(target_os = "macos")]
+    pub(super) fn info_of(&self, key: usize) -> Option<&TextureInfo> {
+        self.textures.get(&key).map(|t| &t.info)
+    }
+
     /// The host texture of title texture `key`.
     pub fn texture_of(&mut self, key: usize) -> Option<Rc<B::Texture>> {
         self.realize(key);
@@ -1434,9 +1441,20 @@ impl<B: PresentBackend> Title<B> {
     /// work in flight reads it through an entry, and no list holds one), and none a submission in
     /// flight names. One still shown waits until the title writes another record over that entry.
     /// One named again later is made again from title memory.
-    fn give_up_covered(&mut self) {
-        let keys: Vec<usize> = self.covered.iter().copied().collect();
+    ///
+    /// shortcut: a sync checks at most [`COVERED_CHECKS`] of them, round-robin (a world keeps ~9,000
+    /// covered copies in use, and checking them all took ~8 ms of each submission under the host's
+    /// lock), so one is given up up to a sweep late (about a second); upgrade to a mark on the
+    /// copies whose entries or lists changed if memory is short.
+    pub(super) fn give_up_covered(&mut self) {
+        if self.covered_queue.is_empty() {
+            self.covered_queue = self.covered.iter().copied().collect();
+        }
+        let keys = self.covered_queue.split_off(self.covered_queue.len().saturating_sub(COVERED_CHECKS));
         for k in keys {
+            if !self.covered.contains(&k) {
+                continue;
+            }
             let Some(t) = self.textures.get(&k) else {
                 self.covered.remove(&k);
                 continue;
@@ -1555,9 +1573,19 @@ impl<B: PresentBackend> Title<B> {
         for key in self.host.take_wanted() {
             self.realize(key);
         }
+        let timed = lock_traced();
+        let phase = |i: usize, since: std::time::Instant| {
+            if timed {
+                SYNC_PHASES[i].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            std::time::Instant::now()
+        };
+        let t = std::time::Instant::now();
         self.keep_to_budget();
+        let t = phase(1, t);
         self.give_up_covered();
         let pools = self.host.memory();
+        phase(2, t);
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
         // a time budget so world streaming (thousands of blank textures) never stalls submissions;
@@ -1569,6 +1597,7 @@ impl<B: PresentBackend> Title<B> {
         let hot = std::time::Instant::now();
         let until = budget.map(|budget| hot + budget);
         probe_round(&pools, &mut self.textures, &mut self.blank_keys, &mut self.blank_cursor, until, None, &mut self.probe_buf, &mut dirty);
+        phase(3, started);
         if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
             SyncCost { probe: [hot - started, hot.elapsed()], hot: self.hot_keys.len() as u64, ..Default::default() }.log();
         }
@@ -1934,6 +1963,19 @@ impl SyncCost {
     }
 }
 
+/// `VICTORY_TRACE_TITLE_LOCK=1`: once a second, how long the macOS host's `TITLE` lock was waited
+/// for and held, by the line of `glue.rs` that took it (the 12 that held it longest).
+pub(super) fn lock_traced() -> bool {
+    env_set!("VICTORY_TRACE_TITLE_LOCK")
+}
+
+/// With [`lock_traced`]: microseconds submissions spent in `keep_named`, `keep_to_budget`,
+/// `give_up_covered` and the probes (`Title::sync_jobs`).
+pub(super) static SYNC_PHASES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Covered copies a sync checks at most ([`Title::give_up_covered`]).
+pub(super) const COVERED_CHECKS: usize = 512;
+
 /// The texture budget: how many bytes of sampled host texture copies the host keeps before it
 /// gives up the least recently used of those it may ([`Title::keep_to_budget`]).
 #[derive(Default)]
@@ -2087,10 +2129,14 @@ impl<B: PresentBackend> Title<B> {
         }
         // shortcut: a record changed after this read (before held work is encoded) still gets the
         // cleared entry and `take_wanted`; reading again at encoding needs the title's state there.
+        let since = std::time::Instant::now();
         let held: Vec<Rc<NativeList<B>>> = self.held.segments().cloned().collect();
         let mut all: Vec<&NativeList<B>> = lists.collect();
         all.extend(held.iter().map(|l| &**l));
         let named = self.host.resources_named(all.into_iter());
+        if lock_traced() {
+            SYNC_PHASES[0].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         for &key in &named {
             if self.host.is_evicted(key) {
                 self.realize(key);

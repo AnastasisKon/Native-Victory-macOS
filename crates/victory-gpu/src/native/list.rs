@@ -671,6 +671,9 @@ pub enum Cmd<B: GraphicsBackend> {
         indirect: Option<u64>,
         /// `ExecuteIndirect` with a count buffer: its title address and this record's index.
         count: Option<(u64, u32)>,
+        /// `ExecuteIndirect`: `(stride, n)`, this record and the `n - 1` that follow it `stride`
+        /// bytes apart, each run as its own dispatch (count index one more each); `(0, 1)` else.
+        records: (u32, u32),
     },
     Copy {
         dst: u64,
@@ -736,6 +739,8 @@ pub enum Cmd<B: GraphicsBackend> {
         indirect: Option<u64>,
         /// `ExecuteIndirect` with a count buffer: its title address and this record's index.
         count: Option<(u64, u32)>,
+        /// As [`Cmd::Dispatch`]'s: the records of one `ExecuteIndirect`, each its own draw.
+        records: (u32, u32),
     },
 }
 
@@ -750,6 +755,7 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 threads,
                 indirect,
                 count,
+                records,
             } => Cmd::Dispatch {
                 pso: pso.clone(),
                 root: root.clone(),
@@ -758,6 +764,7 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 threads: *threads,
                 indirect: *indirect,
                 count: *count,
+                records: *records,
             },
             Cmd::Copy { dst, src, len } => Cmd::Copy {
                 dst: *dst,
@@ -850,6 +857,7 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 call,
                 indirect,
                 count,
+                records,
             } => Cmd::Draw {
                 pso: pso.clone(),
                 binding: binding.clone(),
@@ -863,6 +871,7 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 call: *call,
                 indirect: *indirect,
                 count: *count,
+                records: *records,
             },
         }
     }
@@ -1109,6 +1118,7 @@ impl<B: GraphicsBackend> NativeList<B> {
             threads,
             indirect,
             count,
+            records: (0, 1),
         });
         Ok(())
     }
@@ -1414,7 +1424,33 @@ impl<B: GraphicsBackend> NativeList<B> {
             call,
             indirect,
             count,
+            records: (0, 1),
         });
+        Ok(())
+    }
+
+    /// The `n` records of one `ExecuteIndirect`, at title address `first` and `stride` bytes apart,
+    /// as one command: `record` records the first (with count index 0), and the command is
+    /// widened to all `n`. The host prepares it once and runs each record as its own draw or
+    /// dispatch, as `n` calls of `record` at each record (index `i`) would.
+    pub fn indirect_records(
+        &mut self,
+        first: u64,
+        stride: u32,
+        n: u32,
+        count: Option<u64>,
+        record: impl FnOnce(&mut Self, u64, Option<(u64, u32)>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if n == 0 {
+            return Ok(());
+        }
+        let before = self.cmds.len();
+        record(self, first, count.map(|c| (c, 0)))?;
+        if self.cmds.len() > before
+            && let Some(Cmd::Draw { records, .. } | Cmd::Dispatch { records, .. }) = self.cmds.last_mut()
+        {
+            *records = (stride, n);
+        }
         Ok(())
     }
 

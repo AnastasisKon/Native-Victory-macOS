@@ -1189,6 +1189,58 @@ fn an_indirect_dispatch_mesh_x_draws_the_groups_its_record_holds() {
     }
 }
 
+/// A list with a mesh pipeline (one triangle covering the target, red) bound and a 16x16 RGBA8
+/// target at `pool` offset `at`, after `call` records its mesh dispatch through the method table;
+/// the target's pixels once the list ran.
+fn mesh_dispatch_into(pool: &Pool, at: usize, pipe_key: usize, call: impl FnOnce(This)) -> Vec<[u8; 4]> {
+    use super::mesh_tests::{RED, TRIANGLE, translate};
+    use victory_shader::native::HwStage;
+    let (ms, ps) = (translate(HwStage::Vs, TRIANGLE), translate(HwStage::Ps, RED));
+    let state = crate::native::state::Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let pso = match with_title(|t| t.render_pipe(&ms, Some(&ps), &state, "mesh")).unwrap() {
+        crate::native::title::Pipe::Render(pso, _) => pso,
+        _ => panic!("no mesh pipeline"),
+    };
+    glue::install_test_render_pipeline(pipe_key, pso);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let rt = crate::resource::test_texture_at(pool.va(at), (16, 16), 1, 28, Swizzle::SW_64KB_R_X.0, 1);
+    crate::descriptor::create_rtv(std::ptr::null(), rt, std::ptr::null(), handle);
+    let list = crate::list::test_list(false, std::ptr::null());
+    glue::set_pipeline(list, pipe_key as This);
+    slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(list, 1, &handle, 0, std::ptr::null());
+    call(list);
+    run_title_list(list);
+    read_mip(rt as usize, 0, 16, 16).as_chunks::<4>().0.to_vec()
+}
+
+/// `DispatchMeshX` without an argument address runs `x` groups of the bound mesh pipeline (#353):
+/// one group colours the target, zero groups leave it as it was. It was dropped before.
+#[test]
+fn a_direct_dispatch_mesh_x_draws_its_groups() {
+    let Some(pool) = pool(9217, 4) else { return };
+    let red = [255u8, 128, 128, 255];
+    for (i, (x, want)) in [(1u32, red), (0, [0; 4])].into_iter().enumerate() {
+        let before = crate::list::DROPPED_KINDS[0].load(std::sync::atomic::Ordering::Relaxed);
+        // DispatchMeshX(x, flags, indirect arguments, payload), no arguments.
+        let got = mesh_dispatch_into(&pool, 0x2000 * i, 0xDEAD_BEF1, |list| {
+            slot::<extern "system" fn(This, u32, u64, u64, u64)>(list, 0x310)(list, x, 0, 0, 0)
+        });
+        assert!(got.iter().all(|p| *p == want), "x {x}: {:?}", &got[..2]);
+        assert_eq!(crate::list::DROPPED_KINDS[0].load(std::sync::atomic::Ordering::Relaxed), before, "x {x}: not dropped");
+    }
+}
+
+/// `DispatchMesh(x, y, z)` (method 0x3f8) runs those groups of the bound mesh pipeline (#353).
+#[test]
+fn a_direct_dispatch_mesh_draws_its_groups() {
+    let Some(pool) = pool(9218, 4) else { return };
+    let got = mesh_dispatch_into(&pool, 0, 0xDEAD_BEF2, |list| {
+        slot::<extern "system" fn(This, u32, u32, u32)>(list, 0x3f8)(list, 1, 1, 1)
+    });
+    assert!(got.iter().all(|p| *p == [255, 128, 128, 255]), "{:?}", &got[..2]);
+}
+
 /// A render target a recorded draw wrote is the GPU's: when the title then changes the memory
 /// under it, the next submission does not upload that memory over what was drawn.
 #[test]

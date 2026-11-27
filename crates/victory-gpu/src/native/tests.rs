@@ -1035,6 +1035,128 @@ fn a_draw_tests_against_the_depth_compute_wrote_through_an_unordered_view() {
     drop((views, smp));
 }
 
+/// Console DXGI 119 (`R16_UNORM_X8_TYPELESS`, mapped to 21) and DXGI 21 (`R32_FLOAT_X8X24_TYPELESS`)
+/// depth-plane SRVs mirrored before any UAV exists are immediately re-mirrored onto the twin and
+/// read both compute-written depth (surviving a stencil-only clear) and render-cleared depth when
+/// sampled by a render pass with no compute pass in between.
+#[test]
+fn depth_plane_srvs_and_render_sampled_twins_read_compute_and_depth_writes() {
+    let Some(h) = host() else { return };
+    const W: usize = 16;
+    let pool = Pool::new(&h, 4);
+    let verts: [Vertex; 3] = [
+        [-1.0, -1.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0],
+        [3.0, -1.0, 2.0, 0.5, 1.0, 1.0, 1.0, 1.0],
+        [-1.0, 3.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0],
+    ];
+    pool.write(0, &verts);
+    let attrs = [
+        VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
+        VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
+        VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+    ];
+    let pso = h
+        .render_pipeline(&RenderPipelineDesc {
+            vs: &fixture("tri_vs"),
+            ps: Some(&fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &attrs,
+            streams: &[VertexStream { slot: 0, stride: 32, per_instance: false }],
+            color: &[Format::Rgba8Unorm],
+            depth: None,
+            depth_test: None,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    let fill = h.compute_pipeline(&fixture("tex_fill"), [8, 8, 1]).unwrap();
+    let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
+    rt.render_target = true;
+    let color = h.texture(&rt).unwrap();
+
+    // Console DXGI 118 (D16_UNORM_S8_UINT, kept on the host as D32FloatS8).
+    let res = crate::resource::test_texture_at(
+        pool.va(16384),
+        (W as u64, W as u32),
+        1,
+        118,
+        victory_formats::texture::Swizzle::LINEAR.0,
+        2 | 4,
+    );
+    let desc = crate::resource::texture_info(res).unwrap().desc().unwrap();
+    assert_eq!(desc.format, Format::D32FloatS8);
+    let depth = h.texture(&desc).unwrap();
+    h.register_texture(res as usize, &depth);
+
+    let views = vec![0u32; 8 * 4];
+    let smp = vec![0u32; 4 * 4];
+    let (vstart, sstart) = (views.as_ptr() as u64, smp.as_ptr() as u64);
+    let vheap = h.heap(HeapKind::Resource, vstart, 4).unwrap();
+    let sheap = h.heap(HeapKind::Sampler, sstart, 4).unwrap();
+
+    // Mirror entry 0 as DXGI 119 (R16_UNORM_X8_TYPELESS) and entry 2 as DXGI 21 *before* creating
+    // the R16_UNORM UAV at entry 1.
+    let srv_119 = [119u32, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+    let srv_21 = [21u32, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+    let uav_56 = [56u32, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::descriptor::create_srv(std::ptr::null_mut(), res, &srv_119, vstart);
+    crate::descriptor::create_srv(std::ptr::null_mut(), res, &srv_21, vstart + 64);
+    assert!(h.mirror(vstart).unwrap() && h.mirror(vstart + 64).unwrap());
+    crate::descriptor::create_uav(std::ptr::null_mut(), res, std::ptr::null_mut(), &uav_56, vstart + 32);
+    assert!(h.mirror(vstart + 32).unwrap());
+
+    let mut sw = [0u32; 27];
+    (sw[6], sw[7], sw[8]) = (3, 3, 3); // point clamp
+    crate::descriptor::create_sampler_x(std::ptr::null_mut(), &sw, sstart);
+    assert!(h.mirror(sstart).unwrap());
+
+    // 1. Compute writes `x / 255` through R16_UNORM UAV -> stencil-only clear must not clobber the
+    //    twin -> pixel shader samples DXGI 119 SRV (entry 0).
+    let mut l1 = NativeList::default();
+    l1.clear_depth(&depth, 1.0);
+    l1.set_heaps(Some(&vheap), Some(&sheap));
+    l1.set_compute_pipeline(&fill);
+    l1.set_compute_root_table(0, &vheap, 1);
+    l1.dispatch((W / 8) as u32, (W / 8) as u32, 1).unwrap();
+    l1.clear_depth_stencil(&depth, None, Some(5));
+    l1.set_render_targets(std::slice::from_ref(&color), None);
+    l1.clear_render_target(&color, [0.0, 0.0, 0.0, 1.0]);
+    l1.set_graphics_pipeline(&pso, Topology::Triangles);
+    l1.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
+    l1.set_graphics_root_table(1, &vheap, 0);
+    l1.set_graphics_root_table(2, &sheap, 0);
+    l1.set_vertex_buffer(0, pool.va(0));
+    l1.draw_instanced(3, 1, 0, 0).unwrap();
+    run(&h, &[&l1]);
+
+    let mut out = vec![0u8; W * W * 4];
+    h.backend.read_texture(&color, 0, 0, &mut out, W * 4, 0);
+    let row: Vec<u8> = (0..W).map(|x| out[(8 * W + x) * 4]).collect();
+    assert_eq!(row, (0..W as u8).collect::<Vec<_>>(), "DXGI 119 SRV reads compute-written twin");
+
+    // 2. Depth clear writes 128/255 into `depth`, and a render pass immediately samples DXGI 21 SRV
+    //    (entry 2) with NO compute pass in between: `twin_copies` syncs `depth -> twin` first.
+    let mut l2 = NativeList::default();
+    l2.clear_depth(&depth, 128.0 / 255.0);
+    l2.set_heaps(Some(&vheap), Some(&sheap));
+    l2.set_render_targets(std::slice::from_ref(&color), None);
+    l2.clear_render_target(&color, [0.0, 0.0, 0.0, 1.0]);
+    l2.set_graphics_pipeline(&pso, Topology::Triangles);
+    l2.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
+    l2.set_graphics_root_table(1, &vheap, 2);
+    l2.set_graphics_root_table(2, &sheap, 0);
+    l2.set_vertex_buffer(0, pool.va(0));
+    l2.draw_instanced(3, 1, 0, 0).unwrap();
+    run(&h, &[&l2]);
+
+    h.backend.read_texture(&color, 0, 0, &mut out, W * 4, 0);
+    let row: Vec<u8> = (0..W).map(|x| out[(8 * W + x) * 4]).collect();
+    assert_eq!(row, vec![128u8; W], "render pass samples freshly cleared depth via DXGI 21 SRV");
+    crate::native::glue::resource_released(res);
+    drop((views, smp));
+}
+
 /// A draw left with no render target (the title's targets were of formats the host does not
 /// represent) is dropped by itself: Metal opens no pass without an attachment, and the value
 /// write recorded with it still runs.

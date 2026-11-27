@@ -1770,6 +1770,142 @@ fn a_depth_twin_and_its_depth_plane_hold_the_same_texels() {
     }
 }
 
+/// Multi-mip (`D32_FLOAT_S8X24_UINT`, 4 mips) and 2D-array (`D16_UNORM`, 2 layers x 3 mips) depth
+/// twins keep every mip and array layer, mirror high-mip UAVs and DXGI 21/119 full-chain SRVs,
+/// create twins on placed UAVs, immediately re-mirror pre-existing heap entries onto the twin, and
+/// round-trip every `(slice, mip)` subresource through the depth plane bit for bit.
+#[test]
+fn multi_mip_array_and_placed_depth_twins_preserve_all_subresources_and_remirror_immediately() {
+    let Some(pool) = pool(9219, 32) else { return };
+    let heap = crate::descriptor::test_heap(false, 32);
+    let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    with_title(|t| {
+        t.host.heap(HeapKind::Resource, start, 32).unwrap();
+    });
+
+    // 1. 16x16 DXGI 19 (D32_FLOAT_S8X24_UINT) with 4 mips: mirror a DXGI 21 full-chain SRV at
+    //    bindless entry 24 *before* any UAV exists, then mirror UAVs at mips 0..4.
+    let depth4 = crate::resource::test_texture_at(pool.va(0), (16, 16), 4, 19, Swizzle::LINEAR.0, 2 | 4);
+    let srv_all = [21u32, 4, 5768, 0, 0, 4, 0, 0, 0, 0];
+    crate::descriptor::create_srv(std::ptr::null(), depth4, &srv_all, start + 24 * 32);
+    for mip in 0..4u32 {
+        let uav = [41u32, 4, mip, 0, 0, 0, 0, 0, 0, 0];
+        crate::descriptor::create_uav(std::ptr::null(), depth4, std::ptr::null(), &uav, start + u64::from(mip) * 32);
+    }
+    with_title(|t| {
+        assert_eq!(t.host.mirror(start + 24 * 32), Ok(true));
+        for mip in 0..4u64 {
+            assert_eq!(t.host.mirror(start + mip * 32), Ok(true), "mip {mip}");
+        }
+        let tex = t.texture_of(depth4 as usize).unwrap();
+        let twin = t.host.twin_of(&tex).expect("multi-mip depth twin");
+        // Entry 24 (outside any 16-entry bound table) must be re-mirrored immediately onto the twin.
+        assert!(t.host.is_mirrored(start + 24 * 32), "bindless SRV at index 24 was immediately re-mirrored");
+        assert_eq!(t.host.run_twin_copies_for_test(true, &tex), 1);
+        let mut expected = Vec::new();
+        for mip in 0..4usize {
+            let w = (16 >> mip).max(1);
+            let bytes: Vec<u8> = (0..(w * w))
+                .flat_map(|i| (((mip * 64 + i + 1) as f32) / 512.0).to_le_bytes())
+                .collect();
+            t.host.backend.upload_texture(&twin, mip, 0, &bytes, w * 4, bytes.len());
+            expected.push(bytes);
+        }
+        assert_eq!(t.host.run_twin_copies_for_test(false, &tex), 1, "all 4 mips into depth plane");
+        for mip in 0..4usize {
+            let w = (16 >> mip).max(1);
+            t.host.backend.upload_texture(&twin, mip, 0, &vec![0u8; w * w * 4], w * 4, w * w * 4);
+        }
+        assert_eq!(t.host.run_twin_copies_for_test(true, &tex), 1, "all 4 mips back into twin");
+        for (mip, want) in expected.iter().enumerate() {
+            let w = (16 >> mip).max(1);
+            let mut got = vec![0u8; want.len()];
+            t.host.backend.read_texture(&twin, mip, 0, &mut got, w * 4, 0);
+            assert!(got == *want, "mip {mip} mismatch");
+        }
+    });
+    glue::resource_released(depth4);
+
+    // 2. 16x16 DXGI 53 (D16_UNORM) 2D array with 2 layers x 3 mips.
+    let arr = crate::resource::test_texture_array_at(pool.va(65536), (16, 16), 3, 2, 53, Swizzle::LINEAR.0, 2 | 4);
+    let uav_arr = [56u32, 5, 1, 0, 2, 0, 0, 0, 0, 0]; // R16_UNORM, Texture2DArray, mip 1, slices 0..2
+    crate::descriptor::create_uav(std::ptr::null(), arr, std::ptr::null(), &uav_arr, start + 8 * 32);
+    with_title(|t| {
+        let tex = t.texture_of(arr as usize).unwrap();
+        assert_eq!(t.host.mirror(start + 8 * 32), Ok(true));
+        let twin = t.host.twin_of(&tex).expect("array depth twin");
+        assert_eq!(t.host.run_twin_copies_for_test(true, &tex), 1);
+        for slice in 0..2usize {
+            for mip in 0..3usize {
+                let w = (16 >> mip).max(1);
+                let bytes: Vec<u8> = (0..(w * w))
+                    .flat_map(|i| (((slice * 1000 + mip * 100 + i + 3) as u16) * 17).to_le_bytes())
+                    .collect();
+                t.host.backend.upload_texture(&twin, mip, slice, &bytes, w * 2, bytes.len());
+            }
+        }
+        assert_eq!(t.host.run_twin_copies_for_test(false, &tex), 1);
+        for slice in 0..2usize {
+            for mip in 0..3usize {
+                let w = (16 >> mip).max(1);
+                t.host.backend.upload_texture(&twin, mip, slice, &vec![0u8; w * w * 2], w * 2, w * w * 2);
+            }
+        }
+        assert_eq!(t.host.run_twin_copies_for_test(true, &tex), 1);
+        for slice in 0..2usize {
+            for mip in 0..3usize {
+                let w = (16 >> mip).max(1);
+                let want: Vec<u8> = (0..(w * w))
+                    .flat_map(|i| (((slice * 1000 + mip * 100 + i + 3) as u16) * 17).to_le_bytes())
+                    .collect();
+                let mut got = vec![0u8; want.len()];
+                t.host.backend.read_texture(&twin, mip, slice, &mut got, w * 2, 0);
+                assert!(got == want, "slice {slice} mip {mip} mismatch");
+            }
+        }
+    });
+    glue::resource_released(arr);
+
+    // 3. Placed UAV (`View::Placed(true, ..)`) creates a depth twin and immediately re-mirrors a
+    //    pre-existing placed SRV of the same depth texture.
+    let placed_va = pool.va(131072);
+    let res_words = [
+        3u32,
+        0,
+        0,
+        0,
+        16,
+        0,
+        16,
+        1 | (1 << 16),
+        40,
+        1,
+        0,
+        0x100 | Swizzle::LINEAR.0,
+        2 | 4,
+        0,
+    ];
+    let mut placed_srv = [0u32; 16];
+    (placed_srv[0], placed_srv[1], placed_srv[2], placed_srv[5]) = (41, 4, 5768, 1);
+    placed_srv[10] = placed_va as u32;
+    placed_srv[11] = (placed_va >> 32) as u32;
+    crate::descriptor::record(start + 28 * 32, crate::descriptor::View::Placed(false, res_words, placed_srv));
+    glue::mirror(start + 28 * 32);
+    let mut placed_uav = [0u32; 16];
+    placed_uav[0] = 41; // R32_FLOAT
+    placed_uav[1] = 4; // Texture2D
+    placed_uav[10] = placed_va as u32;
+    placed_uav[11] = (placed_va >> 32) as u32;
+    crate::descriptor::record(start + 29 * 32, crate::descriptor::View::Placed(true, res_words, placed_uav));
+    glue::mirror(start + 29 * 32);
+    let pkey = crate::native::textures::placed_key(placed_va, &res_words);
+    with_title(|t| {
+        let tex = t.texture_of(pkey).unwrap();
+        assert!(t.host.twin_of(&tex).is_some(), "placed UAV created a depth twin");
+        assert!(t.host.is_mirrored(start + 28 * 32), "placed SRV was immediately re-mirrored");
+    });
+}
+
 
 /// A mip-streamed 64 KiB XOR-tiled texture placed in an unmapped reservation (`NO_ACCESS`) and
 /// populated step by step across scattered 64 KiB physical pages (tail mips first, then mid mips,

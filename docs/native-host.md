@@ -528,6 +528,28 @@ The first-chance log (`seh::dispatch`) shows a breakpoint's `rip` as the `int3` 
 
 Instructions Rosetta does not run are skipped or emulated by the SIGILL path in `seh::signal`: `clwb`/`clflushopt` (skipped; a whole `clwb [p]; add p, 0x40; cmp p, limit; jbe/jb` flush loop is skipped in one signal, since the title flushes buffers of many megabytes a line at a time), `clzero` (zeroes the line, or the whole clearing loop), `monitorx`/`mwaitx` (skipped, the latter yields), and the SSE4a `insertq`/`extrq` (run on the saved XMM registers; the title uses `insertq` once its world loads).
 
+## Sweeping a shader corpus
+
+A translator change can be checked against every shader a title registers without running the title again: dump the containers once, translate them all with the tree before the change and with the tree after it, and compare what came out. Counts alone hide a wrong accept (a shader that still translates, to something else), so a sweep keeps a fingerprint of each translation's output beside its outcome.
+
+**The corpus is game data.** The dumped containers are the title's shaders: the folder lives outside the repo and is never committed, attached to an issue or pull request, or sent to any service. Sweep files and `--show` output describe those shaders and stay outside the repo too. What goes in an issue or pull request is counts, shader hashes and refusal messages.
+
+1. **Dump your own corpus** (needs the game; once per title build). Run with `VICTORY_DUMP_ALL_SHADERS=1 VICTORY_DUMP_REFUSED=<folder>`, the folder made beforehand: each shader the host translates is written there as `<stage>_<hash>.bin` (`Shader::native`, `victory-gpu`'s `pipeline.rs`). The prewarm threads translate every shader as the title creates it, so a run leaves all the shaders registered up to where it got, bound or not.
+2. **Sweep each build**, in that build's tree (a `git worktree` for the base and one for the change):
+
+   ```bash
+   cargo run --release -p victory-shader --example sweep -- <folder> -j 4 > <outside the repo>/base.tsv
+   ```
+
+   The example (`crates/victory-shader/examples/sweep.rs`) is built with the translator of the tree it sits in and translates each container with the native host's options (`native::shaders::options`: `wave32_host`, `zero_copy_memory`). It prints one line a shader, sorted by name: `<file> \t ok|refused|panic|timeout|missing \t <fingerprint or reason> \t <ms>`, and the counts on stderr. `--list FILE` sweeps only the files named in `FILE`, one a line (the shaders of one refusal take seconds; `compare.sh --names` makes such a list). `--timeout SECONDS` (default 120) is how long one shader may take: past it its line says `timeout` and the sweep goes on without it. `--show` prints the host-side description (the `HostShader` but its DXIL) in place of the fingerprint.
+3. **Compare.** `tools/corpus/compare.sh base.tsv` tallies one sweep: outcomes per stage, and the refusal reasons by count (code offsets and the numbers of a range taken out, so one reason is one line). `tools/corpus/compare.sh base.tsv new.tsv` says what changed, in four groups: **newly translated**; **REGRESSIONS** (translated before; refused, panicking or timing out now); **output changed** (translated before and after, with another fingerprint); **other reason now**. `--world FILE` takes the names of the shaders a reference run bound (`<stage>_<hash>.bin`, one a line) and adds how many of each count are among them: a change that helps those shows in the game at once. `--names TEXT` lists the files whose reason contains `TEXT`, `--show N` sets how many names a group lists, and `--self-test` runs the script on made-up sweeps (CI runs it).
+
+Reading a comparison: no regression is the bar, and every "output changed" shader needs an explanation. It is either the point of the change or a side effect to understand before the change is kept.
+
+The fingerprint is a hash (std's `DefaultHasher`) of the DXIL and of the `Debug` text of the rest of the `HostShader`. Two sweeps of one build are identical but for the times. Fingerprints compare only between builds of one toolchain with the same `HostShader` fields: a change that adds a field changes every fingerprint, and the comparison then reports every translated shader as "output changed". Give each tree its own target directory (cargo's default does that; one `CARGO_TARGET_DIR` for both does not): cargo decides what to rebuild from file times, and with one directory for two trees the second sweep can run the first tree's translator without saying so.
+
+Not swept: the host's other translations of a container (`thread_counts` dispatches, rectangle lists, vertex shaders widened with `extra_params`), and everything after translation (the Metal Shader Converter and pipeline creation; `victory-metal --corpus` in docs/metal-backend.md covers those for a shader cache).
+
 ## Lane masks joined with data
 
 A lane mask joined at a block entry with a register that holds data on one edge (the BVH walks
@@ -635,7 +657,7 @@ Without ground truth for the 0x1c8 register image, `VICTORY_GUESS_GRAPHICS=1` bu
 * **`v_cvt_pknorm_u16_f32`, `v_cvt_pknorm_i16_f32` and NaN.** Assumption: a NaN source packs as 0. No public source states what the hardware gives; this follows Direct3D's float-to-normalized conversion rule, and the code comment marks it as a guess. The rest is not a guess: src0 in the low half and src1 in the high half (RDNA2 ISA, Mesa ACO), clamped, scaled and rounded to nearest even (Mesa NIR `pack_unorm_1x16` / `pack_snorm_1x16`).
 * **`s_pack_{ll,lh,hh}_b32_b16`, `s_bfm_b64`, `s_bitreplicate_b64_b32`, `v_mad_u32_u16`.** Lowered from the RDNA2 ISA opcode tables (SOP2 50-52 and 37, SOP1 59, VOP3 883); none writes SCC. `s_bfm_b64` reads six bits of each count, as its opcode entry says (the summary table's `[4:0]` is the 32-bit form's). `v_mad_u32_u16` takes op_sel bits 0 and 1 (table 21) to pick the high halves of src0 and src1; op_sel bits 2 and 3 (the 32-bit addend and result) and source modifiers have no documented meaning and are refused rather than guessed.
 * **Refused shaders.** `VICTORY_DUMP_REFUSED=<dir>` writes the container of each shader the native host cannot translate as `<stage>_<hash>.bin` (the hash the refusal log line names); with `VICTORY_DUMP_ALL_SHADERS=1` every shader translated. A compute container carries the FSPX part (code, kind 6; metadata, kind 7); a guessed graphics one the `FSPG` part. Game data: keep the folder outside the repo.
-* **Debugging.** `cargo run -p victory-shader --example disasm` (`VICTORY_PIECE=<piece>`) disassembles a dumped code piece; `--example guess` (`VICTORY_STAGE=vs|ps VICTORY_CODE VICTORY_META`) runs the guessed translation on a pair.
+* **Debugging.** `cargo run -p victory-shader --example disasm` (`VICTORY_PIECE=<piece>`) disassembles a dumped code piece; `--example guess` (`VICTORY_STAGE=vs|ps VICTORY_CODE VICTORY_META`) runs the guessed translation on a pair; `--example sweep` translates a whole folder of dumped containers ("Sweeping a shader corpus").
 
 ### Why guessed draws leave the target black (findings)
 

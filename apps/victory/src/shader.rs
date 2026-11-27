@@ -448,6 +448,10 @@ mod sources_tests {
     fn input_without_shaders_yields_nothing() {
         assert!(sources(&[]).is_empty());
         assert!(sources(b"title bytes without magic").is_empty());
+        // The SGD5 magic alone is no record, and a "DXBC" with no header
+        // behind it is no container.
+        assert!(sources(b"SGD5\x00\x00\x00\x00").is_empty());
+        assert!(sources(b"DXBC").is_empty());
         // A "DXBC" whose size field disagrees with the data is not a container…
         let mut fake = container();
         fake.truncate(0x18);

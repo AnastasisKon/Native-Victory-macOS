@@ -401,3 +401,176 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The smallest container `Container::parse` accepts: a header and no
+    /// parts.
+    fn header_only_container() -> Vec<u8> {
+        let mut out = b"DXBC".to_vec();
+        out.extend_from_slice(&[0u8; 16]); // digest
+        out.extend_from_slice(&0u16.to_le_bytes()); // version major
+        out.extend_from_slice(&0u16.to_le_bytes()); // version minor
+        out.extend_from_slice(&0x20u32.to_le_bytes()); // total size
+        out.extend_from_slice(&0u32.to_le_bytes()); // part count
+        assert_eq!(out.len(), 0x20);
+        out
+    }
+
+    /// The simplest well-formed deflate stream: one stored block.
+    fn stored_deflate(data: &[u8]) -> Vec<u8> {
+        let len = u16::try_from(data.len()).expect("a stored block holds at most 64 KiB");
+        let mut out = vec![0x01]; // last block, stored
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// One shader object as SGD5 stores it: `str name, u8 kind, u32 n, n bytes
+    /// record`, the record being `u32 0x000DDCE7, u32 n, u32 unpacked size, the
+    /// deflate stream`. Returns it with the record's own offset in it.
+    fn shader_object(
+        name: &str,
+        kind: u8,
+        packed: &[u8],
+        unpacked_size: usize,
+    ) -> (Vec<u8>, usize) {
+        let n = u32::try_from(12 + packed.len()).expect("a small record");
+        let mut out = vec![u8::try_from(name.len() + 1).expect("a short name")]; // with its NUL
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+        out.push(kind);
+        out.extend_from_slice(&n.to_le_bytes());
+        let at = out.len();
+        out.extend_from_slice(&0x000D_DCE7u32.to_le_bytes()); // marker
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(unpacked_size)
+                .expect("a small container")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(packed);
+        (out, at)
+    }
+
+    /// A file holding `objects`: an SGD5 one, so that the records are looked
+    /// for as well as the containers stored as is.
+    fn sgd5_file(objects: &[(Vec<u8>, usize)], raw: &[u8]) -> Vec<u8> {
+        let mut file = sgd5::MAGIC.to_vec();
+        file.extend(
+            objects
+                .iter()
+                .flat_map(|(object, _)| object.iter().copied()),
+        );
+        file.extend_from_slice(raw);
+        file
+    }
+
+    #[test]
+    fn a_file_holding_no_shader_has_no_sources() {
+        assert!(sources(b"").is_empty());
+        assert!(sources(b"a file that holds no shader").is_empty());
+        // The magic alone is no record.
+        assert!(sources(b"SGD5\x00\x00\x00\x00").is_empty());
+    }
+
+    #[test]
+    fn a_container_stored_as_is_is_found_with_its_offset() {
+        let container = header_only_container();
+        let mut file = b"four".to_vec();
+        file.extend_from_slice(&container);
+        let found = sources(&file);
+        assert_eq!(found.len(), 1);
+        assert!(matches!(found[0], Source::Raw { offset, .. } if offset == 4));
+        assert_eq!(found[0].label(), "@0x4");
+        assert_eq!(found[0].bytes().as_deref(), Some(container.as_slice()));
+    }
+
+    #[test]
+    fn a_magic_whose_container_does_not_parse_is_skipped() {
+        // A header claiming 0x100 bytes where the file holds 0x20.
+        let mut short = header_only_container();
+        short[0x18..0x1c].copy_from_slice(&0x100u32.to_le_bytes());
+        assert!(sources(&short).is_empty());
+        // Nor is a magic with no header behind it.
+        assert!(sources(b"DXBC").is_empty());
+    }
+
+    #[test]
+    fn a_packed_record_is_listed_by_its_offset_and_name() {
+        // No DXBC magic in the payload, so the raw scan has nothing else to find.
+        let payload = b"a packed payload that is no container".to_vec();
+        let (object, at) = shader_object(
+            "PS_main_Wrapped",
+            0x32,
+            &stored_deflate(&payload),
+            payload.len(),
+        );
+        let file = sgd5_file(&[(object, at)], &[]);
+        let found = sources(&file);
+        assert_eq!(found.len(), 1, "one record, and no container stored as is");
+        let offset = sgd5::MAGIC.len() + at;
+        assert_eq!(found[0].label(), format!("@{offset:#x} PS_main_Wrapped"));
+        match &found[0] {
+            Source::Packed(r) => {
+                assert_eq!(r.offset, offset);
+                assert_eq!(r.name, Some("PS_main_Wrapped"));
+                assert_eq!(r.kind, 0x32);
+            }
+            Source::Raw { .. } => panic!("the record, not a raw container"),
+        }
+        assert_eq!(found[0].bytes().as_deref(), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn a_record_whose_stream_is_no_deflate_lists_no_bytes() {
+        let (object, at) = shader_object("CS_main_Wrapped", 0x32, &[0xff; 8], 32);
+        let file = sgd5_file(&[(object, at)], &[]);
+        let found = sources(&file);
+        assert_eq!(
+            found.len(),
+            1,
+            "still listed, so a run can report it corrupt"
+        );
+        assert_eq!(
+            found[0].label(),
+            format!("@{:#x} CS_main_Wrapped", sgd5::MAGIC.len() + at)
+        );
+        assert!(
+            found[0].bytes().is_none(),
+            "a corrupt stream unpacks to nothing"
+        );
+    }
+
+    #[test]
+    fn an_sgd5_file_lists_its_records_then_the_containers_stored_as_is() {
+        let container = header_only_container();
+        let payload = b"a packed payload that is no container";
+        let (object, at) = shader_object(
+            "VS_main_Wrapped",
+            0x41,
+            &stored_deflate(payload),
+            payload.len(),
+        );
+        let raw_at = sgd5::MAGIC.len() + object.len();
+        let file = sgd5_file(&[(object, at)], &container);
+        let found = sources(&file);
+        assert_eq!(
+            found.len(),
+            2,
+            "the record, then the container stored as is"
+        );
+        assert!(matches!(found[0], Source::Packed(_)), "records come first");
+        assert_eq!(
+            found[0].label(),
+            format!("@{:#x} VS_main_Wrapped", sgd5::MAGIC.len() + at)
+        );
+        assert!(matches!(found[1], Source::Raw { offset, .. } if offset == raw_at));
+        assert_eq!(found[1].label(), format!("@{raw_at:#x}"));
+        let bytes = found[1].bytes().expect("the container stored as is");
+        assert!(Container::parse(&bytes).is_ok());
+    }
+}

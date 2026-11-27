@@ -45,14 +45,31 @@ Fewer layers means fewer places for things to break, and much better speed: boot
 | Running past ~50 s | ✅ Fixed: the old Metal GPU timeout is gone ([#2](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/2)) |
 | Story mode load | ✅ Loads, and reaches the prologue |
 | Prologue | 🟡 Runs into the world without crashing; the dialogue plays. The crash (GPU work that overwrote the game's memory) is fixed. With a cold shader cache, the first world frame can still take more than 30 s and trip the game's own watchdog; a second run is usually past it ([#15](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/15)) |
-| World picture | 🔴 The surfaces are drawn (the G-buffer has content), but the compute pass that lights them is still refused, so the screen is mostly black. Being worked on now |
-| World frame rate | 🔴 About 0.5 fps on an M5 Pro with 48 GB (was 0.07). Most of a frame goes to copying the textures the world streams in, one by one; that fix is in progress |
+| World picture | 🔴 Not watchable yet. On main the world's surfaces are mostly missing, because the shaders that choose what to draw get empty inputs. With the fixes contributors have open for that ([#258](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/258)), about two thirds of the surface buffers fill with real geometry in a test build, but the lighting pass still writes noise and the screen is a flat grey |
+| World frame rate | 🔴 About 1 to 3 fps on an M5 Pro with 48 GB (was 0.07), and the world run still ends in a GPU time-out or a crash within about two minutes. Most of a frame goes to copying the textures the world streams in, and to memory pressure |
 | macOS 15 | 🟡 Boots and loads, but Apple's Metal compiler crashes on a few world pipelines, which holds the first world frame. Some macOS 27 Macs also report this failure ([#181](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/181)) |
 | Memory on 16 to 24 GB Macs | 🟡 Use the Series S profile (the default there); Series X can run out of GPU memory at the world load. Macs with 32 GB or more keep GPU memory resident in one set by default, which is much faster; on smaller Macs you can try it with `VICTORY_METAL_RESIDENCY_SETS=heap` and tell us how it goes ([#8](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/8), [#79](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/79)) |
 | Apple Silicon recompilation (no Rosetta) | 🟡 The whole game (440,000 functions) recompiles to arm64, and a contributor's branch boots it to the intro at 30 fps ([#115](https://github.com/LakshanSivakumar/Native-Victory-macOS/pull/115)); not on main yet |
 | Gameplay | 🔴 Not yet |
 
 The live list of open problems, with everything we already know about each one, is in **[docs/ROADMAP.md](docs/ROADMAP.md)**.
+
+## How far along is the port?
+
+**Roughly 55%**, as of 27 November 2026. This is a judgement, not a measurement: each area gets a share of the whole job and a rough score for how much of it works today.
+
+| Area | Share of the job | Done | What is left |
+| --- | --- | --- | --- |
+| Running the game's code: loader, threads, exceptions, about 1,000 system calls | 15% | about 95% | Calls that only later parts of the game use |
+| Sound, input, files and loading | 5% | about 85% | Reverb, and a sound device that fails in the middle of a run |
+| GPU host: the console's D3D12 on Metal | 20% | about 75% | The buffer views the culling shaders read ([#258](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/258), fixes open), mesh dispatches, the parts that are still inferred |
+| Shader translation: GFX10 → DXIL → Metal | 20% | about 80% | About four in five of the game's shaders translate. Of the shaders the first world frame binds, about one in five is still refused, and a refused shader's work is skipped |
+| A correct world picture | 15% | about 20% | Menus, boot movie and loading screen are right. In the world the geometry is starting to arrive; lighting and everything after it are not right yet |
+| Speed | 10% | about 10% | Menus run at about 30 fps, the world at 1 to 3 fps. The goal is 30 |
+| Stability and memory | 10% | about 20% | A world run still ends within about two minutes, even with 48 GB. Macs with 16 to 24 GB run short of GPU memory ([#8](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/8), [#79](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/79)) |
+| Gameplay: the prologue and beyond | 5% | 0% | Not started. It needs everything above |
+
+What the number does not say: nothing is playable yet, and the remaining 45% is the harder part. The first half was getting the game to boot, load and reach the story. The second half is making the world look right, run fast and stay up, and that work finds new problems as it goes. We cannot give a date.
 
 ## Quick start
 

@@ -42,6 +42,9 @@ pub struct NativeHost<B: GraphicsBackend> {
     own: OwnBuffers<B::Buffer>,
     /// Counts changes to [`Self::resources`], so unrealized table entries retry once registered.
     resources_epoch: std::cell::Cell<u64>,
+    /// Textures made without their top levels (`VICTORY_TEXTURE_DROP_TOP_MIP`): key to
+    /// (levels dropped, levels the host texture has).
+    dropped: RefCell<HashMap<usize, (usize, usize)>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
     /// Draws and dispatches dropped because they read a root parameter the title never set.
@@ -165,6 +168,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             resources: RefCell::default(),
             own: RefCell::default(),
             resources_epoch: std::cell::Cell::new(0),
+            dropped: RefCell::default(),
             heaps: RefCell::default(),
             contract: RefCell::default(),
             unset_roots: std::cell::Cell::new(0),
@@ -494,6 +498,17 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.own.borrow_mut().insert((addr, key), (addr.saturating_add(len), None));
     }
 
+    /// Records that texture `key` was made without its top `dropped` levels, `host_mips` left,
+    /// so views of it map the title's levels onto the host's.
+    pub fn set_dropped_levels(&self, key: usize, dropped: usize, host_mips: usize) {
+        let mut map = self.dropped.borrow_mut();
+        if dropped == 0 {
+            map.remove(&key);
+        } else {
+            map.insert(key, (dropped, host_mips));
+        }
+    }
+
     pub fn register_texture(&self, key: usize, texture: &Rc<B::Texture>) {
         self.resources
             .borrow_mut()
@@ -818,11 +833,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 };
                 match (mips, format) {
                     (Some((first, count)), Some(format)) if count > 0 => {
+                        let (dropped, host_mips) = self.dropped.borrow().get(&resource).copied().unwrap_or((0, 0));
+                        let mips = super::textures::host_mip_range(first as usize, count as usize, dropped, host_mips);
                         let v = self.backend.create_texture_view(
                             tex,
                             &ViewDesc {
                                 format,
-                                mips: (first as usize, count as usize),
+                                mips,
                                 slices: slices.map_or((0, usize::MAX), |(first, count)| {
                                     (first as usize, count as usize)
                                 }),

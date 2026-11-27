@@ -1089,6 +1089,10 @@ still record commands for depth-only, stencil-only and combined flags. Array/unk
 and default views of multisampled resources are also rejected; explicit and default
 single-layer 1D views still record full mip-0 clears. Rectangle and subresource clear support remains unimplemented.
 
+#### Large sampled textures without their top mip (`VICTORY_TEXTURE_DROP_TOP_MIP=1`)
+
+For Macs whose unified memory cannot hold the title's texture set (#8: 16 GB, out of GPU memory at the world load). Off by default. A sampled-only 2D or array texture whose larger side is at least 1024 texels, with a level below its top, is made on the host without that level: half the width and height, one level fewer, about 75% of its memory saved. `detile` skips the top level (title level `m` becomes host level `m - 1`) and `host_mip_range` maps each view's levels onto the host texture. Render targets, UAV and 3D textures are left as they are. Not console behaviour: implicit-LOD sampling uses the next level (a little blurrier up close), explicit-LOD samples come out one level blurrier, and integer loads and `GetDimensions` see the smaller texture. It complements #301 (a byte budget on how many copies are kept) by making each large copy smaller. Details in [metal-backend.md](metal-backend.md); tests `drop_top_mip_tests` and `a_texture_made_without_its_top_level_gets_the_lower_levels`.
+
 #### GPU-written textures copied back into title memory (`VICTORY_TEXTURE_BACK=1`)
 
 Host textures are Metal's own allocations in Apple's layout, so what a compute pass writes never shows in the title's bytes, and a title that reads such a texture on the CPU (the ocean's height and displacement maps, [#46](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/46)) gets the old contents. Off unless `VICTORY_TEXTURE_BACK=1`:

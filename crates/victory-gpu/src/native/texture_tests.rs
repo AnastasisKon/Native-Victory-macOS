@@ -110,6 +110,33 @@ fn a_tiled_title_texture_is_detiled_into_the_host_texture() {
     }
 }
 
+/// `VICTORY_TEXTURE_DROP_TOP_MIP`: a host texture made without the top level receives the title's
+/// level 1 as its level 0, and so on down the chain.
+#[test]
+fn a_texture_made_without_its_top_level_gets_the_lower_levels() {
+    let Some(pool) = pool(9301, 8) else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (64, 32), 4, 28, Swizzle::SW_64KB_D.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    tile(&pool, 0, &info.layout);
+    let tiled = super::super::textures::read_memory(info.memory, info.size);
+    let mut desc = info.desc().unwrap();
+    (desc.width, desc.height, desc.mips) = (32, 16, 3);
+    with_title(|t| {
+        let tex = t.host.backend.create_texture(&desc).unwrap();
+        super::super::textures::upload_from(&t.host.backend, &tex, &info, &tiled, 1).unwrap();
+        for host_mip in 0..3usize {
+            let (w, h) = (32 >> host_mip, 16 >> host_mip);
+            let mut out = vec![0u8; w * h * 4];
+            t.host.backend.read_texture(&tex, host_mip, 0, &mut out, w * 4, 0);
+            for (x, y) in [(0, 0), (w - 1, h - 1), (w / 2, h / 2)] {
+                let at = (y * w + x) * 4;
+                assert_eq!(out[at..at + 4], texel(host_mip as u32 + 1, x as u32, y as u32), "host mip {host_mip} at {x},{y}");
+            }
+        }
+    })
+    .unwrap();
+}
+
 /// Held by the tests that count on a texture staying hot: the many submissions of
 /// `a_texture_blank_for_thousands_of_submissions_is_still_probed` cool every other test's textures.
 static AGING: std::sync::Mutex<()> = std::sync::Mutex::new(());

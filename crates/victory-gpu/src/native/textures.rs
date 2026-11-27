@@ -80,6 +80,59 @@ impl TextureInfo {
             unordered_access: self.flags & UNORDERED_ACCESS != 0,
         })
     }
+
+    /// Top mip levels left off the host texture (0 or 1; see [`drop_top_mip`]).
+    pub fn dropped_levels(&self) -> usize {
+        dropped_levels(
+            drop_top_mip(),
+            self.render_target() || self.flags & UNORDERED_ACCESS != 0,
+            self.dimension == Dimension::Tex3d,
+            self.layout.mips.len(),
+            self.width.max(self.height),
+        )
+    }
+
+    /// [`Self::desc`] without the dropped top levels: what the host texture is made as.
+    pub fn host_desc(&self) -> Option<TextureDesc> {
+        let mut desc = self.desc()?;
+        let n = self.dropped_levels();
+        desc.width = (desc.width >> n).max(1);
+        desc.height = (desc.height >> n).max(1);
+        desc.mips -= n;
+        Some(desc)
+    }
+
+}
+
+/// Largest side (texels) from which a sampled texture loses its top level under [`drop_top_mip`].
+const DROP_TOP_MIP_MIN_SIDE: u32 = 1024;
+
+/// `VICTORY_TEXTURE_DROP_TOP_MIP=1`: large sampled textures are made on the host without their
+/// top mip (a quarter of the memory of that level, about 75% of the texture's): for hosts whose
+/// unified memory cannot hold the title's full set (an iPad's ~9 GiB before it swaps).
+/// Sampling with implicit LOD then uses the next level, a little blurrier up close. Shortcut, not
+/// console behaviour: explicit-LOD samples come out one level blurrier and integer texel loads
+/// address the smaller texture; render targets, UAV and 3D textures are never touched.
+pub fn drop_top_mip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_DROP_TOP_MIP").is_ok_and(|v| v == "1"))
+}
+
+/// Levels to leave off: one for a large, sampled-only 2D texture that has a level below its top.
+fn dropped_levels(enabled: bool, written_by_gpu: bool, volume: bool, mips: usize, largest_side: u32) -> usize {
+    let eligible = enabled && !written_by_gpu && !volume && mips >= 2 && largest_side >= DROP_TOP_MIP_MIN_SIDE;
+    usize::from(eligible)
+}
+
+/// A view's title mip range `(first, count)` on a host texture made without its top `dropped`
+/// levels (`host_mips` left): the same levels where they exist, else the nearest host level.
+pub fn host_mip_range(first: usize, count: usize, dropped: usize, host_mips: usize) -> (usize, usize) {
+    if dropped == 0 || host_mips == 0 {
+        return (first, count);
+    }
+    let end = (first + count.max(1)).saturating_sub(dropped).clamp(1, host_mips);
+    let start = first.saturating_sub(dropped).min(end - 1);
+    (start, end - start)
 }
 
 /// Uploads and change probes must see the same bytes, including across holes in title memory.
@@ -222,11 +275,13 @@ struct Level {
 
 /// Detiles every mip of every slice of `tiled` (a texture's whole memory): the levels detiled,
 /// and the error that stopped it short if one did.
-fn detile(layout: &Layout, dimension: Dimension, format: u32, tiled: &[u8]) -> (Vec<Level>, Result<(), String>) {
+/// `skip`: top levels the host texture was made without ([`TextureInfo::dropped_levels`]); title
+/// level `m` becomes host level `m - skip` and the skipped ones are not detiled.
+fn detile(layout: &Layout, dimension: Dimension, format: u32, tiled: &[u8], skip: usize) -> (Vec<Level>, Result<(), String>) {
     let slices = if dimension == Dimension::Tex3d { 1 } else { layout.slices };
     let n = layout.desc.element_bytes as usize;
     let mut levels = Vec::new();
-    for mip in 0..layout.mips.len() as u32 {
+    for mip in skip as u32..layout.mips.len() as u32 {
         let m = &layout.mips[mip as usize];
         let row = m.width as usize * n;
         let slice_pitch = row * m.height as usize;
@@ -237,7 +292,7 @@ fn detile(layout: &Layout, dimension: Dimension, format: u32, tiled: &[u8]) -> (
                 return (levels, Err(format!("detile mip {mip} slice {slice}: {e:?}")));
             }
             to_host(format, &mut texels);
-            levels.push(Level { mip: mip as usize, slice: slice as usize, texels, row, slice_pitch });
+            levels.push(Level { mip: mip as usize - skip, slice: slice as usize, texels, row, slice_pitch });
         }
     }
     (levels, Ok(()))
@@ -256,7 +311,18 @@ pub fn upload<B: ResourceBackend>(
     info: &TextureInfo,
     tiled: &[u8],
 ) -> Result<(), String> {
-    let (levels, result) = detile(&info.layout, info.dimension, info.format, tiled);
+    upload_from(backend, tex, info, tiled, 0)
+}
+
+/// [`upload`] into a host texture made without the title's top `skip` levels.
+pub fn upload_from<B: ResourceBackend>(
+    backend: &B,
+    tex: &B::Texture,
+    info: &TextureInfo,
+    tiled: &[u8],
+    skip: usize,
+) -> Result<(), String> {
+    let (levels, result) = detile(&info.layout, info.dimension, info.format, tiled, skip);
     upload_levels(backend, tex, &levels);
     result
 }
@@ -803,7 +869,7 @@ impl<B: PresentBackend> Title<B> {
         let Some(info) = self.pending.remove(&key) else {
             return false;
         };
-        let Some(desc) = info.desc() else {
+        let Some(desc) = info.host_desc() else {
             // Loud once per format: views of it get no texture and their draws sample nothing.
             static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
             let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -821,6 +887,7 @@ impl<B: PresentBackend> Title<B> {
             }
         };
         self.host.register_texture(key, &tex);
+        self.host.set_dropped_levels(key, info.dropped_levels(), desc.mips);
         static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Depth-stencil textures are GPU-written depth targets whose CPU tile layout (e.g.
@@ -1118,6 +1185,7 @@ impl<B: PresentBackend> Title<B> {
                 layout: t.info.layout.clone(),
                 last: t.last,
                 partial: t.partial,
+                skip: t.info.dropped_levels(),
             })
         };
         keys.into_iter().filter_map(job).collect()
@@ -1237,6 +1305,8 @@ pub(super) struct Job {
     last: Option<blake3::Hash>,
     /// Whether an earlier whole read met an unmapped or protected range.
     partial: bool,
+    /// Top levels the host texture was made without ([`TextureInfo::dropped_levels`]).
+    skip: usize,
 }
 
 /// What a [`Job`]'s memory held when [`prepare`] read it.
@@ -1299,7 +1369,7 @@ impl Job {
         let read = started.elapsed();
         let hash = blake3::hash(tiled);
         let hashed = started.elapsed();
-        let levels = (self.last != Some(hash)).then(|| detile(&self.layout, self.dimension, self.format, tiled));
+        let levels = (self.last != Some(hash)).then(|| detile(&self.layout, self.dimension, self.format, tiled, self.skip));
         Ready {
             key: self.key,
             serial: self.serial,
@@ -1763,5 +1833,35 @@ mod tests {
         assert_eq!((reads, queries), (1, 1));
         assert!(out[..2 * page].iter().all(|&b| b == 0x5a));
         assert!(out[2 * page..].iter().all(|&b| b == 0xa5));
+    }
+}
+
+#[cfg(test)]
+mod drop_top_mip_tests {
+    use super::{dropped_levels, host_mip_range};
+
+    #[test]
+    fn only_large_sampled_2d_textures_with_a_lower_level_lose_their_top() {
+        assert_eq!(dropped_levels(true, false, false, 11, 2048), 1);
+        assert_eq!(dropped_levels(true, false, false, 2, 1024), 1);
+        assert_eq!(dropped_levels(false, false, false, 11, 2048), 0, "off unless asked for");
+        assert_eq!(dropped_levels(true, true, false, 11, 2048), 0, "render targets and UAVs keep it");
+        assert_eq!(dropped_levels(true, false, true, 11, 2048), 0, "3D textures keep it");
+        assert_eq!(dropped_levels(true, false, false, 1, 4096), 0, "no lower level to fall back on");
+        assert_eq!(dropped_levels(true, false, false, 10, 1023), 0, "small textures keep it");
+    }
+
+    #[test]
+    fn views_map_title_levels_onto_the_host_texture() {
+        // Nothing dropped: unchanged.
+        assert_eq!(host_mip_range(2, 3, 0, 0), (2, 3));
+        // Whole chain (11 title levels, 10 on the host).
+        assert_eq!(host_mip_range(0, 11, 1, 10), (0, 10));
+        // A view of the dropped top level alone sees the host's top.
+        assert_eq!(host_mip_range(0, 1, 1, 10), (0, 1));
+        // Lower levels keep their content, one index down.
+        assert_eq!(host_mip_range(3, 2, 1, 10), (2, 2));
+        // A count past the end is clamped to the host's levels.
+        assert_eq!(host_mip_range(5, 99, 1, 10), (4, 6));
     }
 }

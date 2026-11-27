@@ -273,8 +273,11 @@ pub extern "system" fn VirtualAlloc(
             set_error(ERROR_NOT_ENOUGH_MEMORY);
             return std::ptr::null_mut();
         };
-        // SAFETY: the title commits inside a reservation of its own.
-        unsafe { mem::commit(start as *mut u8, end - start, prot) }.map(|()| start as *mut u8)
+        // SAFETY: the title commits inside a reservation of its own; if `XMemVirtualAlloc` made
+        // the reservation without `MEM_COMMIT`, back the touched 64 KiB granules with a pool now.
+        crate::modules::xmem::commit_if_reserved(start, end, prot)
+            .unwrap_or_else(|| unsafe { mem::commit(start as *mut u8, end - start, prot) })
+            .map(|()| start as *mut u8)
     } else {
         set_error(ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
@@ -1233,6 +1236,26 @@ mod memory_tests {
         // SAFETY: committed read-write.
         unsafe { p.cast::<u8>().write(1) };
         assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
+    }
+
+    #[test]
+    fn virtual_alloc_commit_inside_xmem_reservation_backs_with_pool() {
+        use crate::modules::xmem::{XMemVirtualAlloc, pool_shown_at, pools};
+        let p = XMemVirtualAlloc(std::ptr::null_mut(), 2 * GRANULARITY, MEM_RESERVE, 3, 0x01);
+        assert!(!p.is_null());
+        assert_eq!(pool_shown_at(p as usize), None);
+
+        let second = p.cast::<u8>().wrapping_add(GRANULARITY).cast();
+        assert_eq!(VirtualAlloc(second, GRANULARITY, MEM_COMMIT, 0x04), second);
+        let pool = pool_shown_at(second as usize).expect("VirtualAlloc commit backed with pool");
+        let gpu = pools().iter().find(|info| info.id == pool).expect("live").base as *const u8;
+        // SAFETY: committed read-write; the pool's base mirrors `second`.
+        unsafe {
+            second.cast::<u8>().write(0xA5);
+            assert_eq!(gpu.read(), 0xA5);
+        }
+        assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
+        assert!(!pools().iter().any(|info| info.id == pool));
     }
 
     /// `VirtualFree(MEM_DECOMMIT)` keeps the bytes of a physical page another address still

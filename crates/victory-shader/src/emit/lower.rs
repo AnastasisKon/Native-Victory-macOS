@@ -13588,10 +13588,18 @@ impl<'a> Lower<'a> {
                 if inst.reads.iter().any(|r| regs.contains(&r.0))
                     && !inst.name().starts_with("s_cbranch")
                 {
-                    // Scalar arithmetic only passes the value on.
-                    let pure = matches!(inst.fields, Fields::Sop { .. })
-                        && inst.write(Reg::S(EXEC)).is_none()
-                        && !inst.name().starts_with("s_setreg");
+                    // Scalar arithmetic and compares into SGPRs only pass the value on.
+                    let pure = (matches!(inst.fields, Fields::Sop { .. })
+                        && !inst.name().starts_with("s_setreg")
+                        || inst.name().starts_with("v_cmp_"))
+                        && inst.write(Reg::S(EXEC)).is_none();
+                    // Results the path's values fix (an AND with 0) hold nothing of it.
+                    if pure && inst.writes.iter().all(|&(_, w)| self.konst(&env, w).is_some()) {
+                        for w in &inst.writes {
+                            regs.remove(&w.0);
+                        }
+                        continue;
+                    }
                     if !pure {
                         return false;
                     }
@@ -13661,13 +13669,40 @@ impl<'a> Lower<'a> {
             if v.is_some_and(|v| tainted.contains(&v)) {
                 return true;
             }
-            match v.and_then(|v| self.compared(env, v)) {
+            let known = match atom {
+                Atom::Phi(v) => self.joined_mask(env, v),
+                _ => v.and_then(|v| self.compared(env, v)),
+            };
+            match known {
                 Some(true) => stack.push(hi),
                 Some(false) => stack.push(lo),
                 None => stack.extend([lo, hi]),
             }
         }
         false
+    }
+
+    /// The lane's bit of the lane mask joined at phi `v` (an [`Atom::Phi`]), where `env` holds
+    /// the mask none or all lanes: both dwords' phis for a Wave64 program.
+    fn joined_mask(&self, env: &HashMap<Value, u32>, v: Value) -> Option<bool> {
+        let &(b, i) = self.phi_at.get(&v)?;
+        let phis = &self.x.p.blocks[b].phis;
+        let Reg::S(c) = phis[i].reg else { return None };
+        let low = *env.get(&v)?;
+        let high = if self.x.p.wave64 {
+            if c % 2 == 1 {
+                return None;
+            }
+            let h = phis.iter().find(|p| p.reg == Reg::S(c + 1))?;
+            *env.get(&h.value)?
+        } else {
+            low
+        };
+        match (low, high) {
+            (0, 0) => Some(false),
+            (u32::MAX, u32::MAX) => Some(true),
+            _ => None,
+        }
     }
 
     /// Whether `b` can be false, and true, given the values in `env`.
@@ -13684,11 +13719,12 @@ impl<'a> Lower<'a> {
             return r;
         }
         let (atom, lo, hi) = self.x.st.bools.node(b).expect("not a constant");
-        let v = match atom {
-            Atom::Lane(v) | Atom::Uniform(v) => Some(v),
+        let known = match atom {
+            Atom::Lane(v) | Atom::Uniform(v) => self.compared(env, v),
+            Atom::Phi(v) => self.joined_mask(env, v),
             _ => None,
         };
-        let r = match v.and_then(|v| self.compared(env, v)) {
+        let r = match known {
             Some(true) => self.can_be(hi, env, memo),
             Some(false) => self.can_be(lo, env, memo),
             None => {
@@ -13806,6 +13842,45 @@ impl<'a> Lower<'a> {
                 w.src.first()?
             }
             Fields::Sop { src, .. } if inst.name() == "s_mov_b32" => src.first()?,
+            // An integer inline constant, sign-extended to 64 bits (a float one is not).
+            Fields::Sop { src, .. } if inst.name() == "s_mov_b64" => {
+                let Some(&Operand::Const(c)) = src.first() else {
+                    return None;
+                };
+                let low =
+                    crate::resource::inline(c).filter(|&x| (-16..=64).contains(&(x as i32)))?;
+                let high = inst
+                    .writes
+                    .iter()
+                    .any(|&(r, w)| w == v && matches!(r, Reg::S(c) if c % 2 == 1));
+                return Some(if high { ((low as i32) >> 31) as u32 } else { low });
+            }
+            // A dword of an AND with a zero dword, or its SCC: 0 whatever the other operand holds.
+            Fields::Sop {
+                dst: Some(Operand::Scalar { code: d, .. }),
+                src,
+                ..
+            } if matches!(inst.name(), "s_and_b32" | "s_and_b64") => {
+                let wide = inst.name() == "s_and_b64";
+                let &(r, _) = inst.writes.iter().find(|&&(_, w)| w == v)?;
+                let dwords: &[u8] = match r {
+                    Reg::Scc if wide => &[0, 1],
+                    Reg::Scc => &[0],
+                    Reg::S(c) if c == *d => &[0],
+                    Reg::S(c) if wide && c == d + 1 => &[1],
+                    _ => return None,
+                };
+                let zero = |k: u8| {
+                    src.iter().any(|op| match *op {
+                        Operand::Const(c) => crate::resource::inline(c) == Some(0),
+                        Operand::Scalar { code, .. } if code != NULL => inst
+                            .read(Reg::S(code + k))
+                            .is_some_and(|x| self.konst(env, x) == Some(0)),
+                        _ => false,
+                    })
+                };
+                return dwords.iter().all(|&k| zero(k)).then_some(0);
+            }
             Fields::Sop { imm, .. } if inst.name() == "s_movk_i32" => {
                 return Some(i32::from((*imm)? as i16) as u32);
             }

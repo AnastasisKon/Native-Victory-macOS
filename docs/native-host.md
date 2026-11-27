@@ -1423,6 +1423,23 @@ native Metal host serves no view addresses or formats to shaders, and would have
 title's pieces, the host's options. The story-load log of issue #110 (Series S) has three
 compute programs refused with the old message.
 
+Most pixel programs refused with these reasons (and with "a descriptor read only as data") read no
+descriptor word at all (27 November, offline corpus). The console compiler reuses a register that
+last held a descriptor dword (often a sampler's, loaded from the sampler heap) for a constant it
+loads in an `if`; at the join after it, the skip edge brings the stale dword together with a flag
+mask set to 0 (`s_mov_b64 s, 0`), and the code that reads the register sits behind
+`s_and_b64 vcc, cond, flag; s_and_b64 s, vcc, exec; s_cbranch_scc0`, which those lanes never
+enter. `Lower::dead_on_edge` could not show that: a branch on a joined mask (`Atom::Phi`) known 0
+or every lane on the path now goes one way (`Lower::joined_mask`), `konst` knows `s_mov_b64` of
+an integer inline constant and `s_and` with a zero dword (and its SCC), a `v_cmp_*` into SGPRs
+passes the stale value on as scalar arithmetic does, and a result the path fixes (an AND with 0)
+holds nothing of it. Corpus: 651 programs gained (493 pixel, 158 vertex), 0 lost, 0 changed; of
+the world run's 14,508 pixel draws dropped for these two reasons, 12,156 were of pipelines whose
+every stage now translates. Tests (`victory-gpu`, Metal): `stale_tests`. Still refused, rightly
+for now: texture size queries in a waterfall loop that test dword 1 against 0 for a null view
+(the view-address table holds dword 1 as width bits only, so a texture of width 4k + 1 would
+read as null); buffer dwords 2-3 and image dwords 5-7, which no host table holds.
+
 ## The device's own memory ceiling, logged at native host startup (issue #8)
 
 16 GB Macs still run the title out of GPU memory past the menus (`kIOGPUCommandBufferCallbackErrorOutOfMemory`),

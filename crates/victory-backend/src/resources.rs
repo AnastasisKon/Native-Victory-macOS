@@ -784,6 +784,8 @@ pub trait GraphicsBackend: ResourceBackend {
         queue: &Self::Queue,
         work: &PassSubmission<'_, Self>,
     ) -> Result<(), SubmitFailure>;
+    /// Names a render pipeline for diagnostics (`VICTORY_TRACE_GPU_FAILS`); the default does nothing.
+    fn name_render_pipeline(&self, _p: &Self::RenderPipeline, _name: &str) {}
 }
 
 /// Showing a texture of the title in a window.

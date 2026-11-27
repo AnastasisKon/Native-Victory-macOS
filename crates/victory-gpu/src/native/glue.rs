@@ -1044,9 +1044,12 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
     let copies_recorded = COPIES[0].load(Ordering::Relaxed);
     let indirect = crate::list::indirect_dropped();
-    let (r, heap_cleared, [dropped_unset_root, dropped_unmapped, dropped_failed]) =
-        with_title(|t| (t.host.backend.residency_counts(), t.host.cleared(), [t.host.unset_roots(), t.host.unmapped(), t.host.failed()])).unwrap_or_default();
-    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, dropped_unset_root, dropped_unmapped, dropped_failed, "native draws so far");
+    let (r, heap_cleared, [dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps]) = with_title(|t| {
+        let h = &t.host;
+        (h.backend.residency_counts(), h.cleared(), [h.unset_roots(), h.unmapped(), h.failed(), h.typed_views(), h.resource_heaps() as u64])
+    })
+    .unwrap_or_default();
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps, "native draws so far");
     if let Some(n) = super::host::heap_set_trace()
         && let Some([all, idle, never]) = with_title(|t| t.host.heap_set_report(n)).flatten()
     {

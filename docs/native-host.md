@@ -912,6 +912,10 @@ texture unit unpacks/packs by the view's `MTLPixelFormat` with no sub-32-bit ext
 16-bit `SINT` stay unmapped so `Uint` does not zero-extend signed channels. Tested on the GPU in
 `native::tests::heap_tests::formatted_buffer_stores_and_loads_through_structured_and_typed_uavs` and
 `victory-metal` `gfx::heap_set_tests::a_heaps_set_follows_its_entries`.
+The "native draws so far" line counts the promotions so far as `typed_views`
+(an entry mirrored again and promoted again counts twice) and the title's
+resource heaps as `resource_heaps`, to weigh what the typed views and the
+longer heaps cost.
 
 #### A command buffer the GPU fails still pays its signals and value writes
 

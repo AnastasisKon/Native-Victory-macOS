@@ -199,6 +199,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.typed_views.get()
     }
 
+    /// Resource heaps the title made (the host's own contract heap apart).
+    pub fn resource_heaps(&self) -> usize {
+        self.heaps.borrow().iter().filter(|h| h.kind == HeapKind::Resource).count()
+    }
+
     /// The table the pool observer keeps current; register it as (or call it from) the observer.
     pub fn memory(&self) -> Arc<PoolTable> {
         self.memory.clone()

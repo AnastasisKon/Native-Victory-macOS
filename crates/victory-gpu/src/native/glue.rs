@@ -197,7 +197,9 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
     let mut named = Default::default();
     if unlocked {
         let jobs = with_title(|t| {
-            named = t.keep_named(segments(t).iter().map(|(l, _)| l));
+            if t.names_wanted() {
+                named = t.keep_named(segments(t).iter().map(|(l, _)| l));
+            }
             t.sync_jobs()
         })
         .unwrap_or_default();

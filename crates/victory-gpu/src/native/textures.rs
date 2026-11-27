@@ -2071,12 +2071,18 @@ impl<B: PresentBackend> Title<B> {
     /// (`glue::submit` runs one submission at a time, so none goes over budget in between), unless
     /// the trace logs at this submission, so its figures match a run with the budget on.
     #[must_use = "the names stay kept until handed to `let_named_go`"]
+    /// Whether [`Self::keep_named`] has anything to do: over budget, a texture given up, or the
+    /// trace due. Checked before the lists' snapshots are taken for it.
+    pub(super) fn names_wanted(&self) -> bool {
+        let over = self.budget.limit > 0 && self.budget.live > self.budget.limit;
+        over || self.host.any_evicted() || self.budget.trace_due()
+    }
+
     pub(super) fn keep_named<'a>(&mut self, lists: impl Iterator<Item = &'a NativeList<B>>) -> HashSet<usize>
     where
         B: 'a,
     {
-        let over = self.budget.limit > 0 && self.budget.live > self.budget.limit;
-        if !over && !self.host.any_evicted() && !self.budget.trace_due() {
+        if !self.names_wanted() {
             return HashSet::new();
         }
         // shortcut: a record changed after this read (before held work is encoded) still gets the

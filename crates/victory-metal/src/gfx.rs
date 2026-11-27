@@ -831,6 +831,45 @@ impl ResourceBackend for Metal {
         self.heap_entry(heap, index, [0; 3], None);
     }
 
+    fn heap_allocations(&self, heap: &Heap, last_used: &[u32]) -> Option<Vec<HeapAllocation>> {
+        use objc2_foundation::NSObjectProtocol;
+        heap.set.as_ref()?;
+        // Each allocation's latest use over the entries naming it.
+        let mut latest = std::collections::HashMap::<usize, u32>::new();
+        for (&index, r) in heap.refs.borrow().iter() {
+            let ptr = (&**r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
+            let used = last_used.get(index).copied().unwrap_or(0);
+            let e = latest.entry(ptr).or_insert(0);
+            *e = (*e).max(used);
+        }
+        // A view's (or a texture over a buffer's) memory is its parent's: count the allocation under
+        // it, once, with the latest use over every object made of it.
+        let mut under = std::collections::HashMap::<usize, HeapAllocation>::new();
+        for (&id, (_, r)) in heap.alloc_counts.borrow().iter() {
+            let used = latest.get(&id).copied().unwrap_or(0);
+            let texture = r.respondsToSelector(objc2::sel!(textureType));
+            let root: Res = if texture {
+                // SAFETY: it answers `textureType`, so it is an MTLTexture.
+                let mut t: Retained<ProtocolObject<dyn MTLTexture>> = unsafe { Retained::cast_unchecked(r.clone()) };
+                while let Some(p) = t.parentTexture() {
+                    t = p;
+                }
+                match t.buffer() {
+                    Some(b) => ProtocolObject::from_retained(b),
+                    None => ProtocolObject::from_retained(t),
+                }
+            } else {
+                r.clone()
+            };
+            let rid = (&*root as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
+            under
+                .entry(rid)
+                .and_modify(|a| a.latest = a.latest.max(used))
+                .or_insert(HeapAllocation { id: rid, bytes: MTLResource::allocatedSize(&*root) as u64, latest: used, texture });
+        }
+        Some(under.into_values().collect())
+    }
+
     fn create_texture(&self, d: &TextureDesc) -> Result<Texture, String> {
         let td = MTLTextureDescriptor::new();
         td.setTextureType(tex_type(d.dim));
@@ -3221,5 +3260,39 @@ mod heap_set_tests {
         // SAFETY: the heap buffer holds four entries of `ENTRY` bytes.
         let bytes = unsafe { std::slice::from_raw_parts(heap.buf.contents().as_ptr().cast::<u8>(), 2 * ENTRY) };
         assert!(bytes.iter().all(|b| *b == 0), "a cleared entry reads as one never written");
+    }
+}
+
+#[cfg(test)]
+mod heap_usage_tests {
+    use super::*;
+
+    #[test]
+    fn heap_allocations_give_each_allocation_once_with_its_latest_use() {
+        use objc2_foundation::NSObjectProtocol;
+        let Ok(mut m) = Metal::new() else { return };
+        if !m.dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:)) {
+            return;
+        }
+        m.residency_sets = true;
+        let heap = m.create_heap(HeapKind::Resource, 8).unwrap();
+        let tex = |w| m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, w, w)).unwrap();
+        let (a, b, c) = (tex(64), tex(128), tex(256));
+        m.write_texture(&heap, 0, &a, 0.0);
+        m.write_texture(&heap, 1, &a, 0.0);
+        m.write_texture(&heap, 2, &b, 0.0);
+        m.write_texture(&heap, 3, &c, 0.0);
+        // A view of `c` is `c`'s memory: one allocation, its latest use theirs.
+        let view = m.create_texture_view(&c, &ViewDesc { format: Format::Rgba8Unorm, mips: (0, 1), slices: (0, 1) }).unwrap();
+        m.write_texture(&heap, 4, &view, 0.0);
+        // `a` is named by entries last used at frames 10 and 50, `b` at 20, `c` never, its view at 5.
+        let mut all = m.heap_allocations(&heap, &[10, 50, 20, 0, 5, 0, 0, 0]).unwrap();
+        all.sort_by_key(|a| a.bytes);
+        assert_eq!(all.iter().map(|a| a.latest).collect::<Vec<_>>(), [50, 20, 5], "{all:?}");
+        assert!(all.iter().all(|a| a.texture && a.bytes > 0), "{all:?}");
+        // Without a residency set nothing is kept resident by the heap.
+        m.residency_sets = false;
+        let plain = m.create_heap(HeapKind::Resource, 1).unwrap();
+        assert_eq!(m.heap_allocations(&plain, &[0]), None);
     }
 }

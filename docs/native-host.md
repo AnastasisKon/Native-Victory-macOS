@@ -791,12 +791,38 @@ into the same targets with a dropped dispatch between them stay two render
 passes (likewise two dispatches around a dropped draw, and blits), so the
 backend still orders their pool-buffer accesses; a dropped command of the same
 kind as both its neighbours parts nothing, as before. These two are counted
-per host (`NativeHost::unset_roots`, `NativeHost::no_targets`), not in the
-"native draws so far" line, and they warn (once each, "native host drops work:
-...") only with `VICTORY_TRACE_TARGETS=1`. Unknown: what the console gives a
-shader in a root slot the title set nothing in. A title shader's metadata can
-name such a slot (255 observed); the host draws nothing for it, which is a
-fallback, not the console's behaviour.
+per host (`NativeHost::unset_roots`, `NativeHost::no_targets`). The unset-root
+drops are in the "native draws so far" line as `dropped_unset_root` (with
+`dropped_unmapped` and `dropped_failed` for the kinds below) and warn without
+a switch, the first time for each root parameter (at most 16); the no-target
+drops warn once with `VICTORY_TRACE_TARGETS=1`. Unknown: what the console
+gives a shader in a root slot the title set nothing in; the host draws nothing
+for it, which is a fallback, not the console's behaviour.
+
+Root parameter 255 was not such a slot (#258). It is the translator's own
+view-stride table (`victory_shader::emit::VIEW_STRIDES`, root SRV `t255`): a
+shader that takes a buffer view from the resource heap itself looks up the
+entry's stride there before it reads the entry, and reads the host's null
+buffer view where the table holds 0 (`emit`, "Buffer views at computed heap
+indices"). The native host bound no such table, so every draw and dispatch of
+such a shader was dropped at submission, counted only in `unset_roots` and
+warned about only with `VICTORY_TRACE_TARGETS=1`; the title's culling shaders
+are among them. Now each resource heap has a stride table
+(`NativeHost::view_strides`: a dword per heap index up to `HEAP_VIEWS`, 8 MiB,
+from `descriptors::stride_word`, made the first time such a shader is bound
+with the heap, from the title's records, and kept current by
+`NativeHost::mirror`), bound where the shader's layout has `t255`. A resource
+heap is as long as the translator's index clamp (`HEAP_VIEWS` entries of 24
+bytes, 48 MiB of zeroed host memory a heap, as the D3D12 host's heaps are),
+with null buffer views at `NULL_BUFFER_VIEW` and below it: a shader's clamped
+index and its null view must be entries the heap has. shortcut: an entry the
+title copies as bytes outside a bound table keeps its old stride until it is
+mirrored, and a record the title zeroes keeps its stride (the table check
+skips empty records). Not measured: how much of the longer heap and of the
+table becomes resident. Tests:
+`heap_tests::a_compute_shader_stores_through_a_buffer_view_it_takes_from_the_heap`
+(a compute program stores through a buffer view it loads from the heap by
+index, on Metal) and `descriptors::tests::stride_words_of_buffer_views`.
 
 A third kind is dropped the same way: any command (draw, dispatch, copy, fill
 or value write) that names title memory outside every mapped pool ("title
@@ -852,6 +878,44 @@ A 2D shader resource view with `MipLevels = UINT_MAX` exposes every mip from
 views so Metal clamps it to the remaining levels. Previously the decoder returned zero and
 the host bound the whole texture, so a shader reading level 0 saw the base mip even when
 the view started farther down the chain.
+
+#### Typed and structured buffer views lazily carry a Metal `texture_buffer`
+
+`victory-shader` lowers MUBUF `buffer_load_format_*`, `buffer_store_format_*`, and their
+`getDimensions` size queries to DXIL `TypedBuffer` (`bufferLoad.f32` / `bufferStore.f32`), which the
+Metal Shader Converter compiles (tested on a small synthetic DXIL shader) to
+`air.read_texture_buffer_1d.v4f32`, `air.write_texture_buffer_1d.v4f32`, and
+`air.get_width_texture_buffer_1d` reading `textureViewID` (word 1) of the 24-byte
+`IRDescriptorTableEntry`. `Metal::write_buffer` previously left word 1 at `0` (null
+`MTLResourceID`) for every buffer view, so formatted buffer stores wrote nothing and formatted
+buffer loads and size queries returned `0` (`#255`).
+
+To keep `NativeHost::mirror` free of Metal texture allocations across ~40,000-entry world heaps,
+`mirror` continues to write `[gpu, 0, size]` via `write_buffer` and marks two pending bits per
+entry (`list::PendingTyped`, ~10 KiB for 40,000 entries, `descriptors::typed_buffer`) for typed
+buffer SRVs/UAVs and for 4-, 8-, and 16-byte structured buffer SRVs/UAVs (guess, marked in
+`descriptors.rs`: on RDNA2 a structured `V#` of 4-, 8-, or 16-byte elements carries a 1-, 2-, or
+4-dword 32-bit data format, so shaders may access the same descriptor with both
+`buffer_store_format_*` / `buffer_load_format_*` and `buffer_store_dword*` / `buffer_load_dword*`).
+`Binding::of` scans the module's DXIL symbol and constant tables once
+(`list::dxil_uses_typed_buffers`) to flag shaders that use `bufferLoad`, `bufferStore`, or
+`TypedBuffer` `getDimensions`. At draw/dispatch submission, `NativeHost::materialize_typed_buffers`
+is a no-op unless a bound stage sets `typed_buffers`; when set, it calls `Metal::write_typed_buffer`
+only for pending bits inside the draw or dispatch's bound `Root::Table` ranges (plus explicit
+`stride == 0` typed buffer views in the bound heap if the shader also indexes
+`ResourceDescriptorHeap` directly), leaving unbound structured buffers unmaterialized. If a view's pool offset is not a multiple of
+`minimumTextureBufferAlignmentForPixelFormat` (16 bytes on Apple Silicon), `write_typed_buffer`
+warns once and falls back to `write_buffer` so raw accesses in word 0 still work without tripping
+Metal validation. 32-bit `SINT` views (`4`, `18`, `43`) map to `Uint` because `victory-shader`
+passes raw 32-bit lane bits through `TypedBuffer<float4>` (`bitcast i32 <-> float`) while Metal's
+texture unit unpacks/packs by the view's `MTLPixelFormat` with no sub-32-bit extension; 8- and
+16-bit `SINT` stay unmapped so `Uint` does not zero-extend signed channels. Tested on the GPU in
+`native::tests::heap_tests::formatted_buffer_stores_and_loads_through_structured_and_typed_uavs` and
+`victory-metal` `gfx::heap_set_tests::a_heaps_set_follows_its_entries`.
+The "native draws so far" line counts the promotions so far as `typed_views`
+(an entry mirrored again and promoted again counts twice) and the title's
+resource heaps as `resource_heaps`, to weigh what the typed views and the
+longer heaps cost.
 
 #### A command buffer the GPU fails still pays its signals and value writes
 

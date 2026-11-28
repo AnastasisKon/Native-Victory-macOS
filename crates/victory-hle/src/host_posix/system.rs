@@ -568,6 +568,86 @@ pub extern "system" fn GlobalFree(memory: *mut c_void) -> *mut c_void {
     LocalFree(memory)
 }
 
+/// `GetConsoleWindow`: this host writes to the standard streams, so a console
+/// is here and its window is a handle of its own (as `CreateWindowExA` above
+/// answers for a library's message window). Nothing draws on it.
+static CONSOLE_WINDOW: AtomicU64 = AtomicU64::new(0x10);
+
+pub extern "system" fn GetConsoleWindow() -> *mut c_void {
+    CONSOLE_WINDOW.load(Ordering::Relaxed) as *mut c_void
+}
+
+/// `GetConsoleScreenBufferInfo`: the shape a title sizes its output to. The
+/// numbers are the ones a Windows console starts with.
+pub extern "system" fn GetConsoleScreenBufferInfo(
+    handle: *mut c_void,
+    info: *mut u8,
+) -> i32 {
+    if handle.is_null() || info.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: the title's CONSOLE_SCREEN_BUFFER_INFO, 22 bytes.
+    unsafe {
+        let put16 = |at: usize, v: i16| info.add(at).cast::<i16>().write_unaligned(v);
+        put16(0, 80); // dwSize.X
+        put16(2, 25); // dwSize.Y
+        put16(4, 0); // dwCursorPosition.X
+        put16(6, 0); // dwCursorPosition.Y
+        put16(8, 7); // wAttributes: grey on black
+        put16(10, 0); // srWindow.Left
+        put16(12, 0); // srWindow.Top
+        put16(14, 79); // srWindow.Right
+        put16(16, 24); // srWindow.Bottom
+        put16(18, 80); // dwMaximumWindowSize.X
+        put16(20, 25); // dwMaximumWindowSize.Y
+    }
+    1
+}
+
+/// `WriteConsoleW`: the text goes to the stream it was written to, as UTF-8,
+/// rather than nowhere. What a console would draw with attributes is not drawn.
+pub extern "system" fn WriteConsoleW(
+    handle: *mut c_void,
+    buffer: *const u16,
+    len: u32,
+    written: *mut u32,
+    _reserved: *const c_void,
+) -> i32 {
+    const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
+    if !written.is_null() {
+        // SAFETY: the title's count out-pointer.
+        unsafe { written.write(0) };
+    }
+    if handle.is_null() || (len > 0 && buffer.is_null()) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let text = if len == 0 {
+        std::borrow::Cow::Borrowed("")
+    } else {
+        // SAFETY: the title's buffer of `len` characters.
+        let units = unsafe { std::slice::from_raw_parts(buffer, len as usize) };
+        String::from_utf16_lossy(units).into()
+    };
+    let fd = if handle == files::GetStdHandle(STD_ERROR_HANDLE) {
+        2
+    } else {
+        1
+    };
+    let bytes = text.as_bytes();
+    // SAFETY: a plain write of the title's text to the host's stream.
+    let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+    if n < 0 {
+        return 0;
+    }
+    if !written.is_null() {
+        // SAFETY: the title's count out-pointer.
+        unsafe { written.write(len) };
+    }
+    1
+}
+
 /// `LocalAlloc`: the process heap's block, as `HeapAlloc` gives one. A movable
 /// block is refused rather than answered with a pointer, since a pointer is not
 /// a movable handle.
@@ -3013,6 +3093,9 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             GetUserDefaultGeoName,
             GetUserDefaultUILanguage,
             GetSystemTimeAdjustment,
+            GetConsoleWindow,
+            GetConsoleScreenBufferInfo,
+            WriteConsoleW,
             FlushProcessWriteBuffers,
             LocalAlloc,
             lstrlenW,
@@ -4266,6 +4349,79 @@ mod obsolete_and_system_info_tests {
                 "api-ms-win-core-processthreads-l1-1-0.dll",
                 "FlushProcessWriteBuffers",
             ),
+        ] {
+            assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
+        }
+    }
+}
+
+#[cfg(test)]
+mod console_tests {
+    use super::*;
+
+    /// The console is here: a window handle, and the shape a title sizes its
+    /// output to.
+    #[test]
+    fn the_console_answers_its_shape() {
+        assert!(!GetConsoleWindow().is_null());
+        // The same window on every call, as on Windows.
+        assert_eq!(GetConsoleWindow(), GetConsoleWindow());
+
+        let mut info = [0u8; 22];
+        let handle = files::GetStdHandle(0xFFFF_FFF5);
+        assert_eq!(GetConsoleScreenBufferInfo(handle, info.as_mut_ptr()), 1);
+        let field = |at: usize| i16::from_le_bytes([info[at], info[at + 1]]);
+        assert_eq!((field(0), field(2)), (80, 25));
+        assert_eq!((field(4), field(6)), (0, 0));
+        assert_eq!(field(8), 7);
+        assert_eq!((field(10), field(12), field(14), field(16)), (0, 0, 79, 24));
+        assert_eq!((field(18), field(20)), (80, 25));
+
+        assert_eq!(
+            GetConsoleScreenBufferInfo(std::ptr::null_mut(), info.as_mut_ptr()),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    /// A console write reaches a stream instead of going nowhere, and the count
+    /// it reports is characters, not bytes.
+    #[test]
+    fn text_written_to_the_console_reaches_a_stream() {
+        let out = files::GetStdHandle(0xFFFF_FFF5);
+        // One space: the write is real, and this does not fill the log the test
+        // runs in (the call writes to the descriptor, past the harness's capture).
+        let text: Vec<u16> = " ".encode_utf16().collect();
+        let mut written = u32::MAX;
+        assert_eq!(
+            WriteConsoleW(out, text.as_ptr(), text.len() as u32, &mut written, std::ptr::null()),
+            1
+        );
+        assert_eq!(written, 1, "the count is characters, not the bytes written");
+
+        let mut written = u32::MAX;
+        assert_eq!(
+            WriteConsoleW(out, std::ptr::null(), 0, &mut written, std::ptr::null()),
+            1
+        );
+        assert_eq!(written, 0);
+
+        assert_eq!(
+            WriteConsoleW(std::ptr::null_mut(), text.as_ptr(), 1, &mut written, std::ptr::null()),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn the_console_calls_are_answered_rather_than_stubbed() {
+        for (dll, name) in [
+            ("api-ms-win-core-console-l3-2-0.dll", "GetConsoleWindow"),
+            (
+                "api-ms-win-core-console-l2-1-0.dll",
+                "GetConsoleScreenBufferInfo",
+            ),
+            ("api-ms-win-core-console-l1-1-0.dll", "WriteConsoleW"),
         ] {
             assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
         }

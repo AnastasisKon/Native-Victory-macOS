@@ -36,7 +36,13 @@ pub fn translate(container: &[u8]) -> Result<HostShader, String> {
 
 /// Whether [`translate`]'s translation is in the disk cache already.
 pub fn cached(container: &[u8]) -> bool {
-    crate::shader_cache::native_present(container, &format!("{:?}", options()))
+    #[cfg(any(windows, target_os = "macos"))]
+    return crate::shader_cache::native_present(container, &format!("{:?}", options()));
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = container;
+        false
+    }
 }
 
 /// Keeps `container`, as the run is about to translate it, for later warm-ups

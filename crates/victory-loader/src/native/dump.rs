@@ -3,6 +3,7 @@
 //! or in title code, with a call chain from the unwind tables. A debugging
 //! aid for a title that stops making progress.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::bridge::traced_name;
@@ -444,21 +445,51 @@ pub fn write_trap(c: &Context, r: &super::seh::context::ExceptionRecord) -> bool
         return false;
     }
     let at = r.information[1] as usize;
-    let Some((page, watched)) = groups.iter().find(|(page, _)| *page == at & !0xfff) else {
+    let Some((i, (page, watched))) = groups.iter().enumerate().find(|(_, (page, _))| *page == at & !0xfff)
+    else {
         return false;
     };
+    // So a silent trap can be told from a trap that saw the page and the
+    // write was not watched: the first hit of a page is logged whatever it
+    // wrote, and every hit is counted.
+    let state = trap_state(groups);
+    let (_, hits, _) = &state[i];
+    let seen = hits.fetch_add(1, Ordering::Relaxed) + 1;
     if watched.contains(&(at & !7)) {
         let base = unwind::image_base_of(c.rip as usize).unwrap_or(0);
         let chain = super::seh::backtrace(*c, None);
         let chain: Vec<usize> = chain.iter().map(|&pc| pc.wrapping_sub(base)).collect();
-        tracing::warn!("write to {at:#x} from image+ {:x?}", chain);
+        tracing::warn!("write to {at:#x} from image+ {:x?} (hit {seen})", chain);
+    } else if seen == 1 {
+        tracing::warn!("write trap first hit: page {page:#x} at {at:#x}, not a watched address");
     }
     unsafe extern "C" {
         fn mprotect(addr: *mut std::ffi::c_void, len: usize, prot: i32) -> i32;
     }
     // SAFETY: the page is the image's own data.
-    unsafe { mprotect(*page as *mut _, 0x1000, 3) };
+    if unsafe { mprotect(*page as *mut _, 0x1000, 3) } != 0 {
+        // The write would fault again on resume, and again for ever: fail
+        // the run here, where the log says why, rather than spin silently.
+        tracing::error!("write trap: mprotect of page {page:#x} back to writable failed; giving up");
+        return false;
+    }
     true
+}
+
+/// Per trapped group, made from the spec once: whether the page's first hit
+/// was logged, how many hits it took, and whether a failed close was logged.
+fn trap_state(
+    groups: &'static Vec<(usize, Vec<usize>)>,
+) -> &'static Vec<(AtomicBool, AtomicU64, AtomicBool)> {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::OnceLock;
+    static STATE: OnceLock<Vec<(AtomicBool, AtomicU64, AtomicBool)>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        groups
+            .iter()
+            .map(|_| (AtomicBool::new(false), AtomicU64::new(0), AtomicBool::new(false)))
+            .collect()
+    })
 }
 
 /// The trapped pages and the addresses whose writes are logged, from `VICTORY_TRAP_WRITES`.
@@ -496,11 +527,49 @@ pub fn start_write_trap() {
     unsafe extern "C" {
         fn mprotect(addr: *mut std::ffi::c_void, len: usize, prot: i32) -> i32;
     }
+    // One pass before the title starts, checked: a page mprotect cannot
+    // make read-only (a wrong address, a mapping that refuses it) means a
+    // silent trap, and the log should say so rather than the run end with
+    // nothing to read either way.
+    let mut armed = Vec::new();
+    for (page, _) in groups.iter() {
+        // SAFETY: the image's own data page.
+        if unsafe { mprotect(*page as *mut _, 0x1000, 1) } == 0 {
+            armed.push(*page);
+        } else {
+            tracing::warn!(
+                "write trap: page {page:#x} could not be made read-only; its writes are not trapped"
+            );
+        }
+    }
+    if armed.is_empty() {
+        tracing::warn!("write trap: no page armed, VICTORY_TRAP_WRITES watches nothing");
+        return;
+    }
+    let watched: Vec<usize> = groups.iter().flat_map(|(_, w)| w.iter().copied()).collect();
+    tracing::warn!(
+        "write trap armed: pages {armed:#x?}, watched addresses {watched:#x?} (writes to other \
+         addresses log their page's first hit only)"
+    );
+    let state = trap_state(groups);
     std::thread::spawn(move || {
         loop {
-            for page in &pages {
+            for (i, page) in pages.iter().enumerate() {
                 // SAFETY: the image's own data page.
-                unsafe { mprotect(*page as *mut _, 0x1000, 1) };
+                if unsafe { mprotect(*page as *mut _, 0x1000, 1) } != 0 {
+                    // Once per page: the loop runs every 300 µs and the
+                    // failure would flood the log.
+                    let (_, _, failed) = &state[i];
+                    if !failed.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "write trap: closing page {page:#x} failed; its writes are not \
+                             trapped until it succeeds"
+                        );
+                    }
+                } else {
+                    let (_, _, failed) = &state[i];
+                    failed.store(false, Ordering::Relaxed);
+                }
             }
             std::thread::sleep(Duration::from_micros(300));
         }

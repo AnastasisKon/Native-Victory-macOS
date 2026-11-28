@@ -2551,3 +2551,33 @@ fn a_vccz_branch_where_the_lanes_disagree_answers_for_the_wave() {
     let want: Vec<u32> = vec![7; 128];
     assert_eq!(got, want, "the console takes the branch for the wave as a whole");
 }
+
+/// The same program in the paired form, which does not get it: `run_group` translates with
+/// `Options::paired_waves`, but lockstep is only tried after the fast path has *refused* a program
+/// (`emit`'s retry), and the fast path accepts this one - wrongly - so the paired lowering is never
+/// reached and the per-lane answer above comes back unchanged.
+///
+/// That is the shape of the fix for #527's second shape: make the fast path refuse a `vccz`/`vccnz`
+/// branch whose `vcc` is a per-lane mask it cannot test wave-wide (it refuses other cross-half
+/// reads that way), so the retry runs, and lockstep's `branches` - which turns the branch into
+/// `s_cmp_eq_u64 vcc, 0` and a scalar `s_cbranch_scc1` - then answers it for the wave. Ignored until
+/// that refusal exists; the assertion below is the answer to expect afterwards.
+#[test]
+#[ignore = "the fast path accepts this shape, so the lockstep retry (and the paired form) never runs (#527)"]
+fn a_vccz_branch_where_the_lanes_disagree_answers_for_the_wave_in_the_paired_form() {
+    let mut w = vec![
+        V_LSHLREV_V1_2_V0,
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D82_00A0, // v_cmp_lt_u32 vcc, 32, v0 (32 < lane: on from lane 33 up)
+        0x87EA_6A7E, // s_and_b64 vcc, exec, vcc
+        0xBF86_0001, // s_cbranch_vccz 1
+        0x7E04_0287, // v_mov_b32 v2, 7 (the body)
+    ];
+    w.extend(GLOBAL_STORE_V2_AT_V1);
+    w.push(S_ENDPGM);
+    // The fast path must refuse it for the paired form to be reached at all.
+    assert!(refusal(&w).is_some(), "the fast path still takes the shape");
+    let got = run_group(&w, 0, 128, 128);
+    assert_eq!(got.len(), 128);
+    assert_eq!(got, vec![7u32; 128], "the vote is the wave's own, so its lanes agree");
+}

@@ -1466,6 +1466,7 @@ mod tests {
     /// A read interrupted by a signal is tried again, and short reads go on, until `out` is full.
     #[test]
     fn reads_go_on_past_signals_and_short_reads() {
+        let _turn = turn();
         let file: Vec<u8> = (0..10).collect();
         let mut calls = Vec::new();
         let mut out = [0; 6];
@@ -1493,6 +1494,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn host_errors_map_to_their_win32_codes() {
+        let _turn = turn();
         let hr = |errno| from_win32(&std::io::Error::from_raw_os_error(errno)) as u32;
         for (errno, win32) in [
             (2, 2),    // ENOENT: ERROR_FILE_NOT_FOUND
@@ -1511,6 +1513,15 @@ mod tests {
         }
         let eof = std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
         assert_eq!(read_hresult(&eof), END_OF_FILE);
+    }
+
+    /// The scheduler's queue ids are one counter for the process, so a test that reads it before
+    /// and after a call takes this turn: another test's queue must not move it in between (the
+    /// tests run on several threads). The tests here create queues and files on every thread, so
+    /// every one of them takes it.
+    fn turn() -> std::sync::MutexGuard<'static, ()> {
+        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        TURN.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
@@ -1635,6 +1646,7 @@ mod tests {
 
     #[test]
     fn request_layout_is_the_titles() {
+        let _turn = turn();
         assert_eq!(size_of::<Request>(), 0x48);
         assert_eq!(std::mem::offset_of!(Request, destination_size), 0x18);
         assert_eq!(std::mem::offset_of!(Request, source), 0x20);
@@ -1645,6 +1657,7 @@ mod tests {
 
     #[test]
     fn raw_and_zlib_reads_from_a_file() {
+        let _turn = turn();
         let plain = pattern(300_000);
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
         let mut contents = plain.clone();
@@ -1677,6 +1690,7 @@ mod tests {
 
     #[test]
     fn memory_sources_inflate_too() {
+        let _turn = turn();
         let plain = pattern(70_000);
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
         let (queue, array) = (new_queue(1), status_array(1));
@@ -1699,6 +1713,7 @@ mod tests {
 
     #[test]
     fn statuses_complete_in_order_with_the_first_failure() {
+        let _turn = turn();
         let contents = pattern(4096);
         let (_dir, file) = file_with(&contents);
         let (queue, array) = (new_queue(0), status_array(3));
@@ -1732,6 +1747,7 @@ mod tests {
 
     #[test]
     fn half_a_queue_submits_itself() {
+        let _turn = turn();
         let (_dir, file) = file_with(&pattern(64));
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
@@ -1781,6 +1797,7 @@ mod tests {
 
     #[test]
     fn priorities_share_by_bytes_about_tenfold() {
+        let _turn = turn();
         let mut l = lanes(STAGING);
         l.lanes.insert(0, Lane::new(0, 4096));
         l.lanes.insert(1, Lane::new(1, 4096));
@@ -1805,6 +1822,7 @@ mod tests {
 
     #[test]
     fn staging_bounds_compressed_bytes_in_flight() {
+        let _turn = turn();
         let mut l = lanes(100);
         l.lanes.insert(0, Lane::new(0, 64));
         read(&mut l, 0, ZLIB, 60);
@@ -1827,6 +1845,7 @@ mod tests {
 
     #[test]
     fn a_status_waits_for_every_earlier_read() {
+        let _turn = turn();
         let mut l = lanes(STAGING);
         l.lanes.insert(0, Lane::new(0, 64));
         let array = status_array(2).cast::<Instance<StatusArray>>();
@@ -1858,6 +1877,7 @@ mod tests {
     /// on (#446). Before, the panic killed its worker and the entry stayed pending for good.
     #[test]
     fn a_panicking_request_fails_its_status_and_the_queue_goes_on() {
+        let _turn = turn();
         let contents = pattern(64);
         let (_dir, file) = file_with(&contents);
         let (queue, array) = (new_queue(0), status_array(2));
@@ -1879,6 +1899,7 @@ mod tests {
     /// read's staging is given back.
     #[test]
     fn a_worker_survives_a_panic() {
+        let _turn = turn();
         let contents = pattern(64);
         let (_dir, file) = file_with(&contents);
         let s: &'static Scheduler = Box::leak(Box::new(Scheduler {
@@ -1928,6 +1949,7 @@ mod tests {
     /// The pending warning names each running read: its file, offset, options and worker.
     #[test]
     fn running_reads_name_what_they_read() {
+        let _turn = turn();
         let (_dir, file) = file_with(&pattern(64));
         let mut l = lanes(STAGING);
         l.lanes.insert(0, Lane::new(0, 64));
@@ -1959,6 +1981,7 @@ mod tests {
     /// not be one of our files (bit 23: a source in physical pages).
     #[test]
     fn an_unsupported_source_is_not_read_for_its_name() {
+        let _turn = turn();
         let pages = 0x10 as *const c_void;
         let r = request(1 << 23, std::ptr::null_mut(), 16, pages, 0, 16);
         assert_eq!(source_name(&r), "<unsupported source>");
@@ -1966,6 +1989,7 @@ mod tests {
 
     #[test]
     fn zlib_then_bcpack() {
+        let _turn = turn();
         with_test_tables();
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&BC4_STREAM, 6);
         let (_dir, file) = file_with(&packed);
@@ -2027,6 +2051,7 @@ mod tests {
 
     #[test]
     fn bcpack_requests_unpack_into_the_destination() {
+        let _turn = turn();
         with_test_tables();
         let mut contents = pattern(100);
         contents.extend_from_slice(&BC4_STREAM);
@@ -2045,6 +2070,7 @@ mod tests {
 
     #[test]
     fn a_closed_queue_completes_nothing() {
+        let _turn = turn();
         let (_dir, file) = file_with(&pattern(64));
         let (queue, array) = (new_queue(0), status_array(1));
         let mut out = [0u8; 16];
@@ -2059,6 +2085,7 @@ mod tests {
 
     #[test]
     fn physical_page_destinations() {
+        let _turn = turn();
         use crate::modules::xmem;
         let mut pages = [0usize; 2];
         let mut n = 2;
@@ -2104,6 +2131,7 @@ mod tests {
     /// view), several at once on two queues, each signalling its own status.
     #[test]
     fn file_reads_land_in_memory_and_in_physical_pages() {
+        let _turn = turn();
         use crate::modules::xmem;
         let plain = pattern(3 * PAGE + 1234);
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain[..100_000], 6);
@@ -2203,6 +2231,7 @@ mod tests {
 
     #[test]
     fn opening_a_missing_file_reports_not_found() {
+        let _turn = turn();
         let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
             call(factory(), 0x20);
         let dir = tempfile::tempdir().unwrap();
@@ -2218,6 +2247,7 @@ mod tests {
 
     #[test]
     fn a_page_list_filled_after_its_request_starts() {
+        let _turn = turn();
         use crate::modules::xmem;
         let (mut given, mut page) = (1usize, [0usize; 1]);
         assert_eq!(
@@ -2265,6 +2295,7 @@ mod tests {
 
     #[test]
     fn a_page_list_never_filled_fails_its_request() {
+        let _turn = turn();
         let list = [0usize; 1];
         let plain = pattern(4096);
         let (queue, array) = (new_queue(1), status_array(1));
@@ -2283,6 +2314,7 @@ mod tests {
     }
     #[test]
     fn a_queue_that_submits_itself_holds_reads_into_pages() {
+        let _turn = turn();
         let mut l = lanes(STAGING);
         l.lanes.insert(0, Lane::new(0, 64));
         let array = status_array(1).cast::<Instance<StatusArray>>();
@@ -2312,6 +2344,7 @@ mod tests {
 
     #[test]
     fn held_auto_submits_keep_sequence_order_status_boundaries_and_errors() {
+        let _turn = turn();
         let mut l = lanes(STAGING);
         l.lanes.insert(0, Lane::new(0, 64));
         let array = status_array(2).cast::<Instance<StatusArray>>();
@@ -2370,6 +2403,7 @@ mod tests {
 
     #[test]
     fn a_page_list_the_title_changes_before_its_submit() {
+        let _turn = turn();
         use crate::modules::xmem;
         let (mut given, mut pages) = (2usize, [0usize; 2]);
         assert_eq!(
@@ -2447,6 +2481,7 @@ mod tests {
 
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
+        let _turn = turn();
         use crate::modules::xmem;
         let allocate = |n: usize| {
             let (mut pages, mut given) = (vec![0usize; n], n);
@@ -2506,6 +2541,7 @@ mod tests {
 
     #[test]
     fn null_out_pointers_fail_without_leaking_lanes_or_handles() {
+        let _turn = turn();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.bin");
         std::fs::write(&path, b"abc").unwrap();
@@ -2560,6 +2596,7 @@ mod tests {
 
     #[test]
     fn null_source_and_overflowing_file_offset_fail_safely() {
+        let _turn = turn();
         let mut dst = [0u8; 4];
         let req = request(0, dst.as_mut_ptr().cast(), 4, std::ptr::null(), 0, 4);
         assert_eq!(source_name(&req), "<null>");

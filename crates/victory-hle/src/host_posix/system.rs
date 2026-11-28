@@ -3269,8 +3269,90 @@ pub extern "system" fn FlsSetValue(index: u32, value: usize) -> i32 {
     1
 }
 
-// One worker per submission or timer arm. Callbacks use the Windows ABI
-// (instance, context, object).
+// Submitted callbacks run on the pool's workers (`MIN_STACK` each: title code runs there, and a
+// guessed draw builds Metal pipelines), and a timer or wait that has to sit and wait keeps a
+// thread of its own. Callbacks use the Windows ABI (instance, context, object).
+
+/// One queued call of a pool worker.
+type PoolJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// The workers submitted callbacks run on. A work item is queued and a worker that is not
+/// already running one takes it, so a title that submits thousands in a frame pays for the
+/// callbacks and not for a thread each time (nor for the TEB that comes with it).
+struct Workers {
+    queue: Mutex<Queue>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct Queue {
+    jobs: std::collections::VecDeque<PoolJob>,
+    /// Workers waiting for a job.
+    idle: usize,
+    /// Workers alive, whether they are running a job or waiting for one.
+    alive: usize,
+}
+
+/// How many workers the pool starts at most: a title that submits from every thread fills them,
+/// and a grain of the pool size keeps a machine of many cores from being all stack.
+const MAX_WORKERS: usize = 12;
+
+static WORKERS: LazyLock<Workers> = LazyLock::new(Workers::new);
+
+impl Workers {
+    fn new() -> Workers {
+        Workers {
+            queue: Mutex::default(),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Queues `job`, starting a worker for it when none is waiting and the pool is under
+    /// [`MAX_WORKERS`]: the job then waits for whichever worker finishes first.
+    fn push(&'static self, job: PoolJob) {
+        let mut queue = lock(&self.queue);
+        queue.jobs.push_back(job);
+        if queue.idle > 0 {
+            self.wake.notify_one();
+            return;
+        }
+        if queue.alive >= MAX_WORKERS {
+            return;
+        }
+        queue.alive += 1;
+        drop(queue);
+        if thread::spawn("threadpool-worker", super::MIN_STACK, move || {
+            self.run();
+            0
+        })
+        .is_err()
+        {
+            // The job stays queued for the next worker that finishes.
+            lock(&self.queue).alive -= 1;
+            self.wake.notify_all();
+        }
+    }
+
+    /// Runs queued jobs until the process ends: a worker keeps its stack and its TEB for the
+    /// next one.
+    fn run(&'static self) {
+        loop {
+            let job = {
+                let mut queue = lock(&self.queue);
+                loop {
+                    if let Some(job) = queue.jobs.pop_front() {
+                        break job;
+                    }
+                    queue.idle += 1;
+                    queue = self.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
+                    queue.idle -= 1;
+                }
+            };
+            job();
+        }
+    }
+}
+
 pub(crate) struct PoolObject {
     callback: usize,
     context: usize,
@@ -3325,7 +3407,9 @@ impl PoolObject {
         let armed = Instant::now();
         // An immediately due callback is queued before the submitting call returns.
         let mut ticket = delay.is_zero().then(|| state.queue_callback());
-        std::thread::spawn(move || {
+        // Work, and a timer that is already due and does not repeat, can go to a pool worker.
+        let immediate = delay.is_zero() && period.is_zero();
+        let mut run = move || {
             let mut state = lock(&self.state);
             let mut delay = delay.saturating_sub(armed.elapsed());
             loop {
@@ -3365,7 +3449,19 @@ impl PoolObject {
                 }
                 delay = period;
             }
-        });
+        };
+        // A timer that has to wait for its deadline keeps a thread of its own, so it cannot hold
+        // a worker the title's work items need.
+        if immediate {
+            WORKERS.push(Box::new(run));
+        } else if thread::spawn("threadpool-callback", super::MIN_STACK, move || {
+            run();
+            0
+        })
+        .is_err()
+        {
+            tracing::warn!("threadpool: no thread to wait on a timer's deadline");
+        }
     }
 
     /// Arms one wait on `object`: the callback runs once when the object is
@@ -3385,7 +3481,7 @@ impl PoolObject {
         let generation = state.timer_generation;
         state.armed += 1;
         let armed_at = Instant::now();
-        std::thread::spawn(move || {
+        let spawned = thread::spawn("threadpool-wait", super::MIN_STACK, move || {
             // In slices, so a disarm need not wait for the object to change.
             const SLICE: Duration = Duration::from_millis(20);
             let deadline = timeout.map(|t| armed_at + t);
@@ -3414,7 +3510,7 @@ impl PoolObject {
                 Some(result) if state.timer_generation == generation => result,
                 _ => {
                     self.changed.notify_all();
-                    return;
+                    return 0;
                 }
             };
             state.running += 1;
@@ -3435,7 +3531,14 @@ impl PoolObject {
             let mut state = lock(&self.state);
             state.running -= 1;
             self.changed.notify_all();
+            0
         });
+        if spawned.is_err() {
+            // Nothing is armed: `WaitForThreadpoolWaitCallbacks` must not wait for a thread that
+            // was never started.
+            state.armed -= 1;
+            self.changed.notify_all();
+        }
     }
 
     fn wait_idle(&self, cancel: bool) {
@@ -5301,6 +5404,109 @@ mod tests {
         assert_eq!(FlsGetValue(slot), 9);
         assert_eq!(FlsFree(slot), 1);
         assert_eq!(CALLS.load(Ordering::Relaxed), 5, "freeing runs it once more");
+    }
+
+    /// A worker keeps its stack and its TEB for the next job: with one job in flight at a time
+    /// the second runs on the thread that ran the first, and that thread's stack is a title
+    /// thread's (`MIN_STACK`), not the 2 MiB a bare `std::thread::spawn` gives.
+    #[test]
+    fn pool_workers_are_reused_and_get_a_title_stack() {
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        static REUSED: AtomicU32 = AtomicU32::new(0);
+        static SMALL_STACK: AtomicU32 = AtomicU32::new(0);
+        std::thread_local! {
+            static JOBS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+
+        // A pool of this test's own: the shared one is busy with other tests.
+        let pool: &'static Workers = Box::leak(Box::new(Workers::new()));
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let mut submit = |done: std::sync::mpsc::Sender<()>| {
+            pool.push(Box::new(move || {
+                JOBS.with(|jobs| {
+                    if jobs.get() > 0 {
+                        REUSED.store(1, Ordering::Relaxed);
+                    }
+                    jobs.set(jobs.get() + 1);
+                });
+                RAN.fetch_add(1, Ordering::Relaxed);
+                let teb = teb::current();
+                // SAFETY: inside this thread's own TEB block, at the offsets the loader keeps.
+                let (base, limit) = unsafe {
+                    (
+                        teb.add(teb::OFF_STACK_BASE).cast::<usize>().read(),
+                        teb.add(teb::OFF_STACK_LIMIT).cast::<usize>().read(),
+                    )
+                };
+                if base - limit < super::super::MIN_STACK {
+                    SMALL_STACK.fetch_add(1, Ordering::Relaxed);
+                }
+                let _ = done.send(());
+            }));
+            finished
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a worker ran the job");
+        };
+        submit(done.clone());
+        // The worker is idle only once the job's closure has returned: wait for that, so the
+        // second job is queued for it rather than for a worker started to take it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock(&pool.queue).idle == 0 {
+            assert!(Instant::now() < deadline, "the worker never went idle");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        submit(done);
+        assert_eq!(RAN.load(Ordering::Relaxed), 2);
+        assert_eq!(REUSED.load(Ordering::Relaxed), 1, "the worker runs the next job");
+        assert_eq!(SMALL_STACK.load(Ordering::Relaxed), 0, "a worker has MIN_STACK");
+        assert_eq!(lock(&pool.queue).alive, 1, "one worker took both jobs");
+    }
+
+    /// Submitted work runs on the pool's workers, and each of them has a title thread's stack.
+    #[test]
+    fn submitted_work_runs_on_workers_with_a_title_stack() {
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        static SMALL_STACK: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn work(_instance: usize, _context: usize, _work: usize) {
+            RAN.fetch_add(1, Ordering::Relaxed);
+            let teb = teb::current();
+            // SAFETY: inside this thread's own TEB block, at the offsets the loader keeps.
+            let (base, limit) = unsafe {
+                (
+                    teb.add(teb::OFF_STACK_BASE).cast::<usize>().read(),
+                    teb.add(teb::OFF_STACK_LIMIT).cast::<usize>().read(),
+                )
+            };
+            if base - limit < super::super::MIN_STACK {
+                SMALL_STACK.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let callback = native::host_callbacks(&[(work as *const () as usize, false)]).unwrap()[0];
+        let item = CreateThreadpoolWork(callback, 0, std::ptr::null());
+        SubmitThreadpoolWork(item);
+        WaitForThreadpoolWorkCallbacks(item, 0);
+        CloseThreadpoolWork(item);
+        assert_eq!(RAN.load(Ordering::Relaxed), 1);
+        assert_eq!(SMALL_STACK.load(Ordering::Relaxed), 0, "a worker has MIN_STACK");
+    }
+
+    /// A burst of submitted items all run, on the workers the pool starts for them.
+    #[test]
+    fn a_burst_of_submitted_items_all_run() {
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn work(_instance: usize, _context: usize, _work: usize) {
+            RAN.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let callback = native::host_callbacks(&[(work as *const () as usize, false)]).unwrap()[0];
+        let item = CreateThreadpoolWork(callback, 0, std::ptr::null());
+        for _ in 0..64 {
+            SubmitThreadpoolWork(item);
+        }
+        WaitForThreadpoolWorkCallbacks(item, 0);
+        CloseThreadpoolWork(item);
+        assert_eq!(RAN.load(Ordering::Relaxed), 64);
     }
 
     const ONE_HOUR_DUE: i64 = -3600 * TICKS_PER_SECOND as i64;

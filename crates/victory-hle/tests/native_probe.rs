@@ -246,14 +246,15 @@ mod run {
 
     #[test]
     fn threads_notices_suspension_and_context() {
-        // Bits 19, 20 and 21 are `T_EXIT_THREAD` (a thread that calls `ExitThread` ends there,
-        // with that code, and the store after the call never runs), `T_FLS_DESTRUCTOR` (the
-        // slot's destructor runs on the thread that ends holding a value in it) and
-        // `T_FLS_FREE_DESTRUCTOR` (and for the thread that frees the slot). Bits 8 and up are
-        // probe_sync's, which shifts its own down.
+        // Bits 19 up are `T_EXIT_THREAD` (a thread that calls `ExitThread` ends there, with that
+        // code, and the store after the call never runs), `T_FLS_DESTRUCTOR` (the slot's
+        // destructor runs on the thread that ends holding a value in it), `T_FLS_FREE_DESTRUCTOR`
+        // (and for the thread that frees the slot) and `T_THREADPOOL_WORK` (submitted work runs
+        // on a pool worker whose stack is a title thread's). Bits 8 and up are probe_sync's,
+        // which shifts its own down.
         assert_all(
             run_probe("probe_threads", 0),
-            0xFF | 1 << 19 | 1 << 20 | 1 << 21,
+            0xFF | 0xF << 19,
             "probe_threads",
         );
     }

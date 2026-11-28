@@ -155,8 +155,46 @@ fn cache_hint_loop(code: &[u8]) -> Option<(usize, usize, bool, usize)> {
     ok.then_some((p, limit, jump == 0x76, hint + 9))
 }
 
+/// `rdpru` (`0f 01 fd`): MPERF (`ecx` 0) or APERF (1) into `edx:eax`, as 32-bit halves. The
+/// host has no such counters, so the time-stamp counter stands in for both: a caller that takes
+/// the difference of two reads sees cycles at one frequency, which is a core that never changes
+/// it. A counter it does not know reads 0, as it does on the console.
+fn rdpru(ecx: u64) -> (u32, u32) {
+    let cycles = if ecx <= 1 {
+        // SAFETY: rdtsc reads the core's time-stamp counter; it needs no memory or state.
+        unsafe { std::arch::x86_64::_rdtsc() }
+    } else {
+        0
+    };
+    (cycles as u32, (cycles >> 32) as u32)
+}
+
 /// Instructions emulated so far (`clzero`), for the thread dump.
 pub static EMULATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `rdpid r32` (`f3 [rex] 0f c7 /7`, the only form there is: a register, in r/m, with
+/// `/7` as the opcode extension): the thread's TSC_AUX into that register, zero-extended.
+/// Rosetta does not run it. Returns its length and the register's encoding number.
+fn rdpid(code: &[u8]) -> Option<(usize, usize)> {
+    if *code.first()? != 0xF3 {
+        return None;
+    }
+    let mut i = 1;
+    let rex = code.get(i).copied().filter(|b| *b & 0xF0 == 0x40);
+    if rex.is_some() {
+        i += 1;
+    }
+    if [*code.get(i)?, *code.get(i + 1)?] != [0x0F, 0xC7] {
+        return None;
+    }
+    i += 2;
+    let modrm = *code.get(i)?;
+    // `mod` 11 (a register operand) and `reg` 7 (the opcode extension).
+    (modrm >> 6 == 3 && (modrm >> 3) & 7 == 7).then(|| {
+        let reg = usize::from(modrm & 7) | usize::from(rex.unwrap_or(0) & 1) << 3;
+        (i + 1, reg)
+    })
+}
 
 /// Runs an SSE4a `insertq` or `extrq` (AMD, not in Rosetta; register forms
 /// only, as the instructions have no others) at the start of `code` on the
@@ -340,6 +378,33 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
             unsafe { mc.add(MC_THREAD + T_RIP * 8).cast::<u64>().write(rip + 3) };
             return;
         }
+        if let Some((len, reg)) = rdpid(code) {
+            // rdpid (AMD, not in Rosetta): TSC_AUX into the register. Nothing here pins a
+            // thread to a core, so every thread reports processor 0: a valid number, and the
+            // same one for as long as the thread runs, which is what the title's per-processor
+            // state is indexed by.
+            EMULATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: inside the thread state.
+            unsafe {
+                let set = |i: usize, v: u64| mc.add(MC_THREAD + i * 8).cast::<u64>().write(v);
+                set(slot(reg), 0);
+                set(T_RIP, rip + len as u64);
+            }
+            return;
+        }
+        if code.starts_with(&[0x0F, 0x01, 0xFD]) {
+            // rdpru (AMD, not in Rosetta): a performance counter into edx:eax (see `rdpru`).
+            EMULATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (lo, hi) = rdpru(word(slot(1)));
+            // SAFETY: inside the thread state.
+            unsafe {
+                let set = |i: usize, v: u64| mc.add(MC_THREAD + i * 8).cast::<u64>().write(v);
+                set(0, u64::from(lo)); // eax, zero-extended
+                set(3, u64::from(hi)); // edx
+                set(T_RIP, rip + 3);
+            }
+            return;
+        }
         // The XMM registers in the float state's FXSAVE image (after its 8-byte header).
         // SAFETY: 16 registers of 16 bytes at offset 160 of the image.
         let xmm = unsafe { &mut *mc.add(MC_FLOAT + 8 + 160).cast::<[[u8; 16]; 16]>() };
@@ -521,7 +586,36 @@ unsafe fn chain(signal: i32, info: *mut u8, uc: *mut u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_hint_len, cache_hint_loop, clzero_loop_limit, sse4a};
+    use super::{cache_hint_len, cache_hint_loop, clzero_loop_limit, rdpid, rdpru, sse4a};
+
+    #[test]
+    fn rdpid_is_recognised_in_its_register_form() {
+        // rdpid rax: f3 0f c7 f8, mod 11 /7, r/m 0.
+        assert_eq!(rdpid(&[0xF3, 0x0F, 0xC7, 0xF8]), Some((4, 0)));
+        // rdpid rdi: r/m 7.
+        assert_eq!(rdpid(&[0xF3, 0x0F, 0xC7, 0xFF]), Some((4, 7)));
+        // rdpid r9: the same r/m 1 with REX.B, one byte longer.
+        assert_eq!(rdpid(&[0xF3, 0x41, 0x0F, 0xC7, 0xF9]), Some((5, 9)));
+        // A memory operand (mod 00) is not the register form, nor is /6 another extension.
+        assert_eq!(rdpid(&[0xF3, 0x0F, 0xC7, 0x38]), None);
+        assert_eq!(rdpid(&[0xF3, 0x0F, 0xC7, 0xF0]), None);
+        // Truncated, or not rdpid at all.
+        assert_eq!(rdpid(&[0xF3, 0x0F, 0xC7]), None);
+        assert_eq!(rdpid(&[0x0F, 0xC7, 0xF8]), None);
+    }
+
+    #[test]
+    fn rdpru_reads_a_counter_for_the_counters_it_knows_and_zero_otherwise() {
+        // MPERF (ecx 0) and APERF (1) are the counters it knows; anything else reads 0, as on
+        // the console, including a counter named in the upper half of ecx.
+        assert_eq!(rdpru(2), (0, 0));
+        assert_eq!(rdpru(0x1_0000_0000), (0, 0));
+        // The two it knows read the time-stamp counter, split into edx:eax.
+        for ecx in [0, 1] {
+            let (lo, hi) = rdpru(ecx);
+            assert!(lo != 0 || hi != 0, "ecx {ecx}: a counter, not silence");
+        }
+    }
 
     #[test]
     fn cache_hint_loops_are_recognised() {

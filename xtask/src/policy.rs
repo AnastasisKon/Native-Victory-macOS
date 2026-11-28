@@ -16,6 +16,9 @@ const MAX_ENCODED_RUN: usize = 512;
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh", "c",
     "def",
+    // The recompiler writes C, its runtime and harness are C with headers, and its tests build
+    // C++ fixtures (MSVC exception tables) — all of it our own source, none of it data.
+    "h", "hpp", "cpp",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",

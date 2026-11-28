@@ -25,6 +25,9 @@ pub fn options() -> Options {
     Options {
         wave32_host: true,
         zero_copy_memory: true,
+        // VICTORY_PAIRED_WAVES=1: lockstep in the paired form for compute groups of several
+        // console waves (#376; off by default). Part of the options, so of the shader cache key.
+        paired_waves: std::env::var("VICTORY_PAIRED_WAVES").is_ok_and(|v| v.trim() == "1"),
         ..Options::default()
     }
 }
@@ -114,6 +117,23 @@ pub fn translate_targets(container: &[u8], integer: u8) -> Result<HostShader, St
 /// Whether [`translate_targets`]'s translation is in the disk cache already.
 pub fn targets_cached(container: &[u8], integer: u8) -> bool {
     let o = Options { integer_targets: integer, ..options() };
+    #[cfg(any(windows, target_os = "macos"))]
+    return crate::shader_cache::native_present(container, &format!("{o:?}"));
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (container, o);
+        false
+    }
+}
+
+/// A mesh shader's container translated with generic outputs trimmed to what the pixel shader reads.
+pub fn translate_trim_mesh(container: &[u8], trim: (u32, u64)) -> Result<HostShader, String> {
+    translate_cached(container, Options { trim_outputs: Some(trim), ..options() })
+}
+
+/// Whether [`translate_trim_mesh`]'s translation is in the disk cache already.
+pub fn trim_mesh_cached(container: &[u8], trim: (u32, u64)) -> bool {
+    let o = Options { trim_outputs: Some(trim), ..options() };
     #[cfg(any(windows, target_os = "macos"))]
     return crate::shader_cache::native_present(container, &format!("{o:?}"));
     #[cfg(not(any(windows, target_os = "macos")))]

@@ -306,6 +306,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         narrow_waves: narrow_waves(),
         // The host's waves are the console's size.
         wave32_host: false,
+        // The paired form is for 32-lane hosts.
+        paired_waves: false,
         // The D3D12 host copies title memory: it needs the pages marked.
         zero_copy_memory: false,
         rect_list: false,
@@ -313,6 +315,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         extra_params: 0,
         // `DispatchX` runs thread counts as group counts here (`list::dispatch_x`).
         thread_counts: false,
+        trim_outputs: None,
         // shortcut: this key has no options; integer targets are made on the native host only.
         integer_targets: 0,
     };

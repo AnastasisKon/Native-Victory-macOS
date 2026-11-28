@@ -466,6 +466,12 @@ pub struct Options {
     /// memory (module notes, "Wave64 on a 32-lane host"). Implies
     /// [`Self::narrow_waves`]. Off for D3D12.
     pub wave32_host: bool,
+    /// Lockstep (`lockstep.rs`) also for compute groups of several console waves, in the paired
+    /// form: each host thread runs two console lanes (n and n + 32), so a console wave is one host
+    /// wave and the group's barriers fall as on the console, with no wait between host waves
+    /// (#376; after TaynanGT/Vice-Tay 5e588e8). Off by default; the native host sets it from
+    /// `VICTORY_PAIRED_WAVES=1`.
+    pub paired_waves: bool,
     /// The host's title memory is the memory the GPU reads and writes (the native Metal
     /// host: one buffer per pool, no copies): accesses at computed addresses still go through
     /// the page table of "Title memory" to find the host view, but mark nothing, so the
@@ -497,6 +503,10 @@ pub struct Options {
     /// are declared uint and store the exported dwords' bits as they are. D3D12 wants a target's
     /// output type to match its format, and the console exports integer bits in float registers.
     pub integer_targets: u8,
+    /// For mesh shaders paired with a pixel shader: `Some((texcoords, halves))` trims `OSG1`
+    /// generic outputs to only `TEXCOORD` `< 32` in `texcoords` and `HALF` `< 64` in `halves`
+    /// so unused interpolants do not count against Metal's 32 KiB mesh output limit.
+    pub trim_outputs: Option<(u32, u64)>,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -621,6 +631,17 @@ fn emit_fast(
             });
             row += 1;
         }
+    }
+    if native.stage == HwStage::Ms
+        && let Some((texcoords_mask, halves_mask)) = options.trim_outputs
+    {
+        outputs.retain(|e| match e.name.as_str() {
+            "TEXCOORD" if e.kind == 0 && e.index < 32 => (texcoords_mask >> e.index) & 1 != 0,
+            name if name == graphics::HALF && e.kind == 0 && e.index < 64 => {
+                (halves_mask >> e.index) & 1 != 0
+            }
+            _ => true,
+        });
     }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.

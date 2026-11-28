@@ -1491,6 +1491,20 @@ fn crash_key(d: &RenderPipelineDesc<'_>) -> String {
     crate::disk::key(&[d.vs, d.ps.unwrap_or_default()])
 }
 
+/// How many draws/dispatches/ops the passes hold, for the `VICTORY_PASS_TIMING=draw` sample
+/// budget of one command buffer.
+fn ops_in(passes: &[Pass<'_, Metal>]) -> usize {
+    passes
+        .iter()
+        .map(|p| match p {
+            Pass::Compute(ds) => ds.len(),
+            Pass::Render(rp) => rp.draws.len(),
+            Pass::Blit(ops) => ops.len(),
+            Pass::ClearColorRects { .. } => 0,
+        })
+        .sum()
+}
+
 impl GraphicsBackend for Metal {
     type RenderPipeline = RenderPipeline;
 
@@ -1577,8 +1591,9 @@ impl GraphicsBackend for Metal {
         let mut first_error: Option<String> = None;
         let mut attached_heaps = Vec::new();
         // `VICTORY_PASS_TIMING`: one sample buffer for this command buffer, sampled at each
-        // pass encoder's start and end; resolved when the buffer completes (`completed`).
-        let mut timing = self.pass_timing.as_ref().and_then(|t| t.begin(work.passes.len()));
+        // pass encoder's start and end (and at each draw/dispatch in `draw` mode); resolved when
+        // the buffer completes (`completed`).
+        let mut timing = self.pass_timing.as_ref().and_then(|t| t.begin(work.passes.len(), ops_in(&work.passes)));
         // Fills of passes refused at encode time, re-encoded below as one blit pass of the same
         // command buffer (#80): on the console a refused pass's value write ran in the GPU's
         // order — after the submission's earlier passes, before its fence signals — and a queue
@@ -1658,7 +1673,7 @@ impl GraphicsBackend for Metal {
                 });
                 let piece_owed = self.commit_piece(queue, &cb, owed, piece, tinfo, timing.take());
                 first = n + 1;
-                timing = self.pass_timing.as_ref().and_then(|t| t.begin(work.passes.len() - first));
+                timing = self.pass_timing.as_ref().and_then(|t| t.begin(work.passes.len() - first, ops_in(&work.passes[first..])));
                 cb = match self.next_piece(queue, work.waits, &mut attached_heaps, Some((&**event, piece))) {
                     Ok(cb) => cb,
                     Err(e) => {
@@ -2924,8 +2939,11 @@ impl Metal {
             let fills = ops.iter().filter(|o| matches!(o, BlitOp::Fill { .. })).count();
             e.setLabel(Some(&self.cap_label(format!("blit: {} ops ({fills} fills)", ops.len()))));
         }
-        if let (Some(t), Some(i)) = (timing.as_mut(), t0) {
-            sample!(e, t, i + 1);
+        if t0.is_some()
+            && let Some(t) = timing.as_mut()
+        {
+            let e0 = t.end_pass();
+            sample!(e, t, e0);
         }
         e.endEncoding();
         Ok(())
@@ -3173,6 +3191,12 @@ impl Metal {
                 },
                 None => e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group)),
             }
+            // `VICTORY_PASS_TIMING=draw`: one sample at this dispatch's boundary.
+            if let Some(t) = timing.as_mut()
+                && let Some(m) = t.sample_mid("compute")
+            {
+                sample!(e, t, m);
+            }
         }
         if let Some((f, started)) = order {
             e.updateFence(f);
@@ -3200,8 +3224,11 @@ impl Metal {
             }
             e.setLabel(Some(&self.cap_label(l)));
         }
-        if let (Some(t), Some(i)) = (timing.as_mut(), t0) {
-            sample!(e, t, i + 1);
+        if t0.is_some()
+            && let Some(t) = timing.as_mut()
+        {
+            let e0 = t.end_pass();
+            sample!(e, t, e0);
         }
         e.endEncoding();
         Ok(())
@@ -3658,6 +3685,12 @@ impl Metal {
                             threads,
                         )
                     };
+                    // `VICTORY_PASS_TIMING=draw`: one sample at this draw's boundary.
+                    if let Some(t) = timing.as_mut()
+                        && let Some(m) = t.sample_mid("render")
+                    {
+                        sample!(e, t, m);
+                    }
                     continue;
                 }
                 // SAFETY: the record is inside the live buffer (the caller resolved it).
@@ -3786,6 +3819,12 @@ impl Metal {
                     };
                 }
             }
+            // `VICTORY_PASS_TIMING=draw`: one sample at this draw's boundary.
+            if let Some(t) = timing.as_mut()
+                && let Some(m) = t.sample_mid("render")
+            {
+                sample!(e, t, m);
+            }
         }
         if let Some((f, started)) = order {
             e.updateFence_afterStages(f, MTLRenderStages::Fragment);
@@ -3812,8 +3851,11 @@ impl Metal {
             drop(names);
             e.setLabel(Some(&self.cap_label(l)));
         }
-        if let (Some(t), Some(i)) = (timing.as_mut(), t0) {
-            sample!(e, t, i + 1);
+        if t0.is_some()
+            && let Some(t) = timing.as_mut()
+        {
+            let e0 = t.end_pass();
+            sample!(e, t, e0);
         }
         e.endEncoding();
         Ok(())

@@ -32,6 +32,7 @@ const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_NOT_OWNER: u32 = 288;
 const ERROR_INVALID_FLAGS: u32 = 1004;
+const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
 
@@ -565,6 +566,118 @@ pub extern "system" fn LocalFree(memory: *mut c_void) -> *mut c_void {
 
 pub extern "system" fn GlobalFree(memory: *mut c_void) -> *mut c_void {
     LocalFree(memory)
+}
+
+/// `LocalAlloc`: the process heap's block, as `HeapAlloc` gives one. A movable
+/// block is refused rather than answered with a pointer, since a pointer is not
+/// a movable handle.
+///
+/// Note that `LocalFree` keeps nothing to free (see its note), so what this
+/// allocates is never returned: a title that allocates in a loop would grow.
+pub extern "system" fn LocalAlloc(flags: u32, bytes: usize) -> *mut c_void {
+    const LMEM_ZEROINIT: u32 = 0x0040;
+    const LMEM_MOVEABLE: u32 = 0x0002;
+    if flags & LMEM_MOVEABLE != 0 {
+        tracing::warn!("LocalAlloc: a movable block is not answered");
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    if bytes == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a non-zero size; the block is the title's.
+    let block = unsafe { libc::malloc(bytes) };
+    if block.is_null() {
+        set_error(ERROR_NOT_ENOUGH_MEMORY);
+        return std::ptr::null_mut();
+    }
+    if flags & LMEM_ZEROINIT != 0 {
+        // SAFETY: `bytes` of the block this call just allocated.
+        unsafe { std::ptr::write_bytes(block.cast::<u8>(), 0, bytes) };
+    }
+    block
+}
+
+/// `lstrlenW`: the length in characters, not counting the terminator.
+pub extern "system" fn lstrlenW(text: *const u16) -> i32 {
+    if text.is_null() {
+        return 0;
+    }
+    let mut n = 0usize;
+    // SAFETY: the title's NUL-terminated string.
+    unsafe {
+        while *text.add(n) != 0 {
+            n += 1;
+        }
+    }
+    n as i32
+}
+
+/// `lstrcmpiW`: case-insensitive comparison, as Windows makes it, by folding
+/// case rather than by the host's locale.
+pub extern "system" fn lstrcmpiW(left: *const u16, right: *const u16) -> i32 {
+    if left.is_null() || right.is_null() {
+        // Windows compares a null string as empty.
+        return i32::from(left.is_null() as i32 as u8) - i32::from(right.is_null() as i32 as u8);
+    }
+    let mut at = 0usize;
+    loop {
+        // SAFETY: the title's NUL-terminated strings, read to their end.
+        let (a, b) = unsafe { (*left.add(at), *right.add(at)) };
+        if a == 0 || b == 0 {
+            return i32::from(a != 0) - i32::from(b != 0);
+        }
+        let fold = |c: u16| -> u32 {
+            char::from_u32(u32::from(c))
+                .map(|ch| {
+                    ch.to_lowercase()
+                        .next()
+                        .map_or(u32::from(c), |lower| lower as u32)
+                })
+                .unwrap_or(u32::from(c))
+        };
+        let (fa, fb) = (fold(a), fold(b));
+        if fa != fb {
+            return if fa < fb { -1 } else { 1 };
+        }
+        at += 1;
+    }
+}
+
+/// `GetUserDefaultUILanguage`: the language of the interface, which for this
+/// host is the one its locale answers with.
+pub extern "system" fn GetUserDefaultUILanguage() -> u16 {
+    0x0409
+}
+
+/// `GetSystemTimeAdjustment`: the clock is not adjusted here, and the increment
+/// is the timer's period on Windows (15.625 ms in 100 ns units).
+pub extern "system" fn GetSystemTimeAdjustment(
+    adjustment: *mut u32,
+    increment: *mut u32,
+    disabled: *mut i32,
+) -> i32 {
+    // SAFETY: the title's out parameters, each optional.
+    unsafe {
+        if !adjustment.is_null() {
+            adjustment.write(0);
+        }
+        if !increment.is_null() {
+            increment.write(156_250);
+        }
+        if !disabled.is_null() {
+            disabled.write(1);
+        }
+    }
+    1
+}
+
+/// `FlushProcessWriteBuffers`: on Windows this makes every thread's earlier
+/// writes visible to every other. The fence is what that means here; the host's
+/// memory is already coherent.
+pub extern "system" fn FlushProcessWriteBuffers() {
+    std::sync::atomic::fence(Ordering::SeqCst);
 }
 
 pub extern "system" fn EncodePointer(pointer: *mut c_void) -> *mut c_void {
@@ -2898,6 +3011,12 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             LCMapStringEx,
             GetUserDefaultLocaleName,
             GetUserDefaultGeoName,
+            GetUserDefaultUILanguage,
+            GetSystemTimeAdjustment,
+            FlushProcessWriteBuffers,
+            LocalAlloc,
+            lstrlenW,
+            lstrcmpiW,
             LocaleNameToLCID,
             GetLocaleInfoEx,
             FormatMessageA,
@@ -4057,5 +4176,98 @@ mod exit_process_tests {
             "ExitProcess"
         )
         .is_some());
+    }
+}
+
+#[cfg(test)]
+mod obsolete_and_system_info_tests {
+    use super::*;
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain([0]).collect()
+    }
+
+    /// `LocalAlloc` is the process heap's block, zeroed when asked, and a
+    /// movable block is refused rather than answered with a pointer.
+    #[test]
+    fn local_alloc_gives_a_block_or_says_why_not() {
+        let block = LocalAlloc(0x0040, 16).cast::<u8>();
+        assert!(!block.is_null());
+        // SAFETY: the 16 bytes this call allocated.
+        unsafe {
+            for i in 0..16 {
+                assert_eq!(*block.add(i), 0, "byte {i} was not zeroed");
+            }
+            *block = 7;
+        }
+        assert_eq!(LocalFree(block.cast()), std::ptr::null_mut());
+
+        assert!(LocalAlloc(0, 0).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert!(LocalAlloc(0x0002, 16).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn the_obsolete_strings_measure_and_compare() {
+        let a = wide("h\u{e9}llo");
+        assert_eq!(lstrlenW(a.as_ptr()), 5);
+        assert_eq!(lstrlenW(std::ptr::null()), 0);
+        let empty = wide("");
+        assert_eq!(lstrlenW(empty.as_ptr()), 0);
+
+        let mixed = wide("AbC");
+        let folded = wide("aBc");
+        assert_eq!(lstrcmpiW(mixed.as_ptr(), folded.as_ptr()), 0);
+        let earlier = wide("abc");
+        let later = wide("abd");
+        assert_eq!(lstrcmpiW(earlier.as_ptr(), later.as_ptr()), -1);
+        assert_eq!(lstrcmpiW(later.as_ptr(), earlier.as_ptr()), 1);
+        // A shorter string that is a prefix comes first.
+        let short = wide("ab");
+        assert_eq!(lstrcmpiW(short.as_ptr(), earlier.as_ptr()), -1);
+        // The accents fold too, since case folding is by character and not by
+        // the host's locale.
+        let accented = wide("\u{c9}cole");
+        let accented_lower = wide("\u{e9}COLE");
+        assert_eq!(lstrcmpiW(accented.as_ptr(), accented_lower.as_ptr()), 0);
+    }
+
+    /// The clock is not adjusted, and the language is the one the locale answers
+    /// with.
+    #[test]
+    fn the_system_answers_what_this_host_is() {
+        let (mut adjustment, mut increment, mut disabled) = (u32::MAX, u32::MAX, -1);
+        assert_eq!(
+            GetSystemTimeAdjustment(&mut adjustment, &mut increment, &mut disabled),
+            1
+        );
+        assert_eq!((adjustment, increment, disabled), (0, 156_250, 1));
+        assert_eq!(GetUserDefaultUILanguage(), 0x0409);
+        // A fence with nothing to order is the call's whole effect.
+        FlushProcessWriteBuffers();
+    }
+
+    #[test]
+    fn the_six_calls_are_answered_rather_than_stubbed() {
+        for (dll, name) in [
+            ("api-ms-win-core-heap-l2-1-0.dll", "LocalAlloc"),
+            ("api-ms-win-core-string-obsolete-l1-1-0.dll", "lstrlenW"),
+            ("api-ms-win-core-string-obsolete-l1-1-0.dll", "lstrcmpiW"),
+            (
+                "api-ms-win-core-localization-obsolete-l1-2-0.dll",
+                "GetUserDefaultUILanguage",
+            ),
+            (
+                "api-ms-win-core-sysinfo-l1-1-0.dll",
+                "GetSystemTimeAdjustment",
+            ),
+            (
+                "api-ms-win-core-processthreads-l1-1-0.dll",
+                "FlushProcessWriteBuffers",
+            ),
+        ] {
+            assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
+        }
     }
 }

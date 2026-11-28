@@ -2585,6 +2585,188 @@ pub extern "system" fn CertFreeCertificateContext(_context: *const c_void) -> i3
     1
 }
 
+// The crypt32 string codecs. `XCurl` decodes the user and password out of the
+// proxy URL before it builds the auth header, so this one has to be right
+// rather than plausible: a wrong decode corrupts the header silently.
+
+const CRYPT_STRING_BASE64: u32 = 0x1;
+const CRYPT_STRING_BINARY: u32 = 0x2;
+const CRYPT_STRING_BASE64HEADER: u32 = 0x4;
+const CRYPT_STRING_BASE64REQUEST: u32 = 0x8;
+const CRYPT_STRING_BASE64_ANY: u32 = 0x6;
+const ERROR_INVALID_DATA: u32 = 13;
+const ERROR_MORE_DATA: u32 = 234;
+
+/// What the text encodes: the bytes, which encoding it turned out to be, and how
+/// many characters of preamble were skipped to reach it.
+type Decoded = (Vec<u8>, u32, u32);
+
+fn decode_crypt_string(text: &[u8], flags: u32) -> Result<Decoded, u32> {
+    // The format is a value, not a bit: `CRYPT_STRING_BASE64_ANY` is six, so a
+    // bit test would read it as binary.
+    match flags & 0xF {
+        CRYPT_STRING_BINARY => return Ok((text.to_vec(), CRYPT_STRING_BINARY, 0)),
+        CRYPT_STRING_BASE64
+        | CRYPT_STRING_BASE64HEADER
+        | CRYPT_STRING_BASE64REQUEST
+        | CRYPT_STRING_BASE64_ANY => {}
+        // Hex and the other encodings are not what this title asks for, and a
+        // decoder guessed at is worse than a refusal that shows up in a log.
+        other => {
+            tracing::warn!("CryptStringToBinary: flags {other:#x} are not answered");
+            return Err(ERROR_INVALID_PARAMETER);
+        }
+    }
+    let armored = flags & (CRYPT_STRING_BASE64HEADER | CRYPT_STRING_BASE64REQUEST | CRYPT_STRING_BASE64_ANY) != 0;
+    let body_of = |text: &[u8]| -> (Vec<u8>, u32) {
+        if !armored {
+            return (text.to_vec(), 0);
+        }
+        // Line by line: the dashes of the armor and the header lines before the
+        // body are not part of the encoded data, and a body line holds nothing
+        // but the alphabet.
+        let (mut body, mut skipped, mut at) = (Vec::new(), 0u32, 0u32);
+        for line in text.split(|&b| b == b'\n') {
+            let holds_body = line.iter().all(|&b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(b, b'+' | b'/' | b'=' | b'\r' | b'\t' | b' ')
+            }) && line.iter().any(|&b| !matches!(b, b'\r' | b'\t' | b' '));
+            if holds_body {
+                if body.is_empty() {
+                    let lead = line
+                        .iter()
+                        .position(|&b| !matches!(b, b'\r' | b'\t' | b' '))
+                        .unwrap_or(0);
+                    skipped = at + lead as u32;
+                }
+                body.extend_from_slice(line);
+            }
+            at += line.len() as u32 + 1;
+        }
+        (body, skipped)
+    };
+    let (body, skipped) = body_of(text);
+    let bytes = base64_body(&body)?;
+    // Which flavour the text turned out to be: the armor is what the dashes say.
+    let opened_with_dashes = text
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'-');
+    let used = if opened_with_dashes {
+        CRYPT_STRING_BASE64HEADER
+    } else {
+        CRYPT_STRING_BASE64
+    };
+    Ok((bytes, used, skipped))
+}
+
+/// RFC 4648 base64: four characters to three bytes, `=` once at the end, and
+/// whitespace anywhere as the encoder writes it at line ends.
+fn base64_body(body: &[u8]) -> Result<Vec<u8>, u32> {
+    let mut out = Vec::with_capacity(body.len() / 4 * 3 + 3);
+    let (mut bits, mut held) = (0u32, 0u32);
+    let mut padded = false;
+    for &b in body {
+        let value = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                padded = true;
+                continue;
+            }
+            b' ' | b'\t' | b'\r' | b'\n' => continue,
+            // Not an alphabet character and not padding: this is not base64.
+            _ => return Err(ERROR_INVALID_DATA),
+        };
+        if padded {
+            // Data after the padding is not a base64 string.
+            return Err(ERROR_INVALID_DATA);
+        }
+        bits = (bits << 6) | u32::from(value);
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            out.push((bits >> held) as u8);
+        }
+    }
+    // Six bits left over is one character of a group of four, not a byte.
+    if held >= 6 {
+        return Err(ERROR_INVALID_DATA);
+    }
+    Ok(out)
+}
+
+pub extern "system" fn CryptStringToBinaryW(
+    string: *const u16,
+    length: u32,
+    flags: u32,
+    binary: *mut u8,
+    size: *mut u32,
+    skip: *mut u32,
+    used: *mut u32,
+) -> i32 {
+    if string.is_null() || size.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: the title's string, `length` characters or NUL-terminated.
+    let wide = unsafe {
+        let mut n = 0usize;
+        if length == u32::MAX {
+            while *string.add(n) != 0 {
+                n += 1;
+            }
+        } else {
+            n = length as usize;
+        }
+        std::slice::from_raw_parts(string, n)
+    };
+    // Every encoding answered here is ASCII, so a character above that is not
+    // one of them whatever the flags say.
+    let mut text = Vec::with_capacity(wide.len());
+    for &c in wide {
+        match u8::try_from(c) {
+            Ok(b) => text.push(b),
+            Err(_) => {
+                set_error(ERROR_INVALID_DATA);
+                return 0;
+            }
+        }
+    }
+    let (bytes, reported, skipped) = match decode_crypt_string(&text, flags) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            set_error(error);
+            return 0;
+        }
+    };
+    let needed = bytes.len() as u32;
+    // SAFETY: the title's out parameters, each optional.
+    unsafe {
+        if !skip.is_null() {
+            skip.write(skipped);
+        }
+        if !used.is_null() {
+            used.write(reported);
+        }
+        let room = *size;
+        size.write(needed);
+        if binary.is_null() {
+            // The size query: how much a buffer would need.
+            return 1;
+        }
+        if room < needed {
+            set_error(ERROR_MORE_DATA);
+            return 0;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), binary, bytes.len());
+    }
+    1
+}
+
 /// `RaiseFailFastException`: the process ends here, which is what fail-fast
 /// means — the record's code becomes the exit status, and nothing after the
 /// call runs (no unwinding, no exit handlers, as on Windows).
@@ -2856,6 +3038,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             CertOpenSystemStoreW,
             CertOpenStore,
             CertCloseStore,
+            CryptStringToBinaryW,
             CertFindChainInStore,
             CertFindCertificateInStore,
             CertFreeCertificateContext,
@@ -3715,5 +3898,136 @@ mod threadpool_wait_tests {
                 "{name} is not answered"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod crypt_string_tests {
+    use super::*;
+
+    /// Calls the way a title calls it: a NUL-terminated UTF-16 string, and a
+    /// buffer the caller believes is big enough.
+    fn decode(text: &str, flags: u32) -> (i32, Vec<u8>, u32, u32) {
+        let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        let mut buffer = [0u8; 128];
+        let mut size = buffer.len() as u32;
+        let mut skip = u32::MAX;
+        let mut used = u32::MAX;
+        let ok = CryptStringToBinaryW(
+            wide.as_ptr(),
+            u32::MAX,
+            flags,
+            buffer.as_mut_ptr(),
+            &mut size,
+            &mut skip,
+            &mut used,
+        );
+        (ok, buffer[..size as usize].to_vec(), skip, used)
+    }
+
+    /// The vectors from RFC 4648 section 10, which is what "base64" means.
+    #[test]
+    fn the_rfc_vectors_decode_to_their_bytes() {
+        for (text, bytes) in [
+            ("", &b""[..]),
+            ("Zg==", b"f"),
+            ("Zm8=", b"fo"),
+            ("Zm9v", b"foo"),
+            ("Zm9vYg==", b"foob"),
+            ("Zm9vYmE=", b"fooba"),
+            ("Zm9vYmFy", b"foobar"),
+        ] {
+            let (ok, decoded, _, used) = decode(text, CRYPT_STRING_BASE64);
+            assert_eq!((ok, decoded.as_slice()), (1, bytes), "{text}");
+            assert_eq!(used, CRYPT_STRING_BASE64);
+        }
+    }
+
+    /// The encoder writes the body across lines, and a proxy URL is not line
+    /// wrapped at all: both are the same bytes.
+    #[test]
+    fn line_ends_and_spaces_are_not_part_of_the_data() {
+        let (ok, decoded, _, _) = decode("Zm9v\r\nYmFy\n", CRYPT_STRING_BASE64);
+        assert_eq!((ok, decoded.as_slice()), (1, &b"foobar"[..]));
+        let (ok, decoded, _, _) = decode(" Zm9v YmFy ", CRYPT_STRING_BASE64);
+        assert_eq!((ok, decoded.as_slice()), (1, &b"foobar"[..]));
+    }
+
+    /// Armored text carries the header lines and the dashes, and says how far in
+    /// the body began.
+    #[test]
+    fn armored_text_is_read_past_its_header() {
+        let armored = "-----BEGIN CERTIFICATE-----\r\nProc-Type: 4,ENCRYPTED\r\n\r\nZm9vYmFy\r\n-----END CERTIFICATE-----\r\n";
+        let (ok, decoded, skip, used) = decode(armored, CRYPT_STRING_BASE64_ANY);
+        assert_eq!((ok, decoded.as_slice()), (1, &b"foobar"[..]));
+        assert_eq!(used, CRYPT_STRING_BASE64HEADER);
+        // The body starts after the second header line's CRLF.
+        let expected = armored.find("Zm9v").unwrap() as u32;
+        assert_eq!(skip, expected);
+    }
+
+    /// A buffer too small is told how much it needs, and a null buffer is the
+    /// size query rather than a failure.
+    #[test]
+    fn a_short_buffer_is_told_the_size_it_needs() {
+        let wide: Vec<u16> = "Zm9vYmFy".encode_utf16().chain([0]).collect();
+        let mut size = 2u32;
+        let mut small = [0u8; 2];
+        assert_eq!(
+            CryptStringToBinaryW(
+                wide.as_ptr(),
+                u32::MAX,
+                CRYPT_STRING_BASE64,
+                small.as_mut_ptr(),
+                &mut size,
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!((size, super::super::GetLastError()), (6, ERROR_MORE_DATA));
+
+        let mut size = 0u32;
+        assert_eq!(
+            CryptStringToBinaryW(
+                wide.as_ptr(),
+                u32::MAX,
+                CRYPT_STRING_BASE64,
+                std::ptr::null_mut(),
+                &mut size,
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            1
+        );
+        assert_eq!(size, 6);
+    }
+
+    /// What is not base64 is refused as invalid data, not decoded into
+    /// something that looks like bytes.
+    #[test]
+    fn what_is_not_base64_is_refused() {
+        for text in ["Zm9v!", "Z", "Zm9vY", "Zg==Zm9v"] {
+            let (ok, _, _, _) = decode(text, CRYPT_STRING_BASE64);
+            assert_eq!(ok, 0, "{text} was accepted");
+            assert_eq!(super::super::GetLastError(), ERROR_INVALID_DATA, "{text}");
+        }
+        // An encoding this host does not decode says so instead of guessing.
+        let (ok, _, _, _) = decode("6d396f", 0x10);
+        assert_eq!(ok, 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    /// `CRYPT_STRING_BINARY` is the copy: the bytes are already bytes.
+    #[test]
+    fn binary_is_a_copy() {
+        let (ok, decoded, _, used) = decode("Zm9v", CRYPT_STRING_BINARY);
+        assert_eq!((ok, decoded.as_slice()), (1, &b"Zm9v"[..]));
+        assert_eq!(used, CRYPT_STRING_BINARY);
+    }
+
+    #[test]
+    fn the_codec_is_answered_rather_than_stubbed() {
+        assert!(lookup("crypt32.dll", "CryptStringToBinaryW").is_some());
     }
 }

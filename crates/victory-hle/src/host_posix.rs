@@ -470,6 +470,8 @@ pub(crate) enum Object {
     Find(Arc<Mutex<files::Find>>),
     Mutex(Arc<system::MutexObject>),
     Timer(Arc<system::TimerObject>),
+    /// A file mapping (`files::Section`).
+    Section(Arc<files::Section>),
 }
 
 /// A title thread: its end, its suspension count and its Mach port.

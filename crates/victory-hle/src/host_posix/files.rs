@@ -12,10 +12,13 @@
 //! `GetFileAttributes(W|A|ExW)`, `FindFirstFile(W|ExW)`, `FindNextFileW`,
 //! `FindClose`, `DeleteFileW`, `CreateDirectoryW`, `RemoveDirectoryW`,
 //! `GetOverlappedResult`. Overlapped reads and writes complete before the call
-//! returns, which is a legal outcome.
+//! returns, which is a legal outcome. `CreateFileMapping(W)`,
+//! `OpenFileMappingW`, `MapViewOfFile(Ex)`, `FlushViewOfFile` and
+//! `UnmapViewOfFile` are here too, as a copy of the file in title memory (see
+//! "File mappings" below).
 //!
 //! Not done: the C runtime's file functions (`fopen`, `_wopen`, `_stat64`,
-//! ...), `MoveFileEx`, `GetDiskFreeSpace`, `CreateFile2`, file mappings,
+//! ...), `MoveFileEx`, `GetDiskFreeSpace`, `CreateFile2`, `CreateFileMappingA`,
 //! share modes and locking, and `dstorage.rs` (see `docs/native-host.md`).
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -24,8 +27,9 @@ use std::ffi::{CStr, c_char, c_void};
 use std::fs::{DirEntry, File, OpenOptions, ReadDir};
 use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::SystemTime;
 
 use super::{HANDLES, Object, lock, new_handle, set_error};
@@ -34,6 +38,7 @@ const INVALID_HANDLE_VALUE: usize = usize::MAX;
 const INVALID_FILE_SIZE: u32 = 0xFFFF_FFFF;
 const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
@@ -982,6 +987,389 @@ pub extern "system" fn FindClose(handle: *mut c_void) -> i32 {
     }
 }
 
+// File mappings: `CreateFileMapping` makes a section over a file (or the
+// pagefile) and `MapViewOfFile` makes a view of it.
+//
+// A view is title memory, not the host's own mapping of the file, because
+// everything that reads title memory here - the GPU's page table, the descriptor
+// readers, the tracing - knows the ranges `VirtualAlloc` makes and nothing else.
+// The cost is one copy per view, which a title that maps a data file pays once
+// where it would otherwise fault a page at a time.
+
+/// What `CreateFileMapping` made: a file, or the pagefile, and its size.
+pub(crate) struct Section {
+    /// `None` for the pagefile-backed section.
+    file: Option<Arc<FileObject>>,
+    size: u64,
+    /// The protection the caller asked for, which a view must fit.
+    protect: u32,
+    /// The pagefile's memory, made at its first view: every view of a pagefile
+    /// section is a window on this one allocation, which is what makes it shared.
+    backing: Mutex<Option<usize>>,
+}
+
+/// A view of a section, at the address the title was given.
+struct View {
+    section: Arc<Section>,
+    offset: u64,
+    len: usize,
+    /// The title asked to write through, so the bytes go back to the file.
+    write_back: bool,
+    /// The view's memory is its own (`VirtualFree` on unmap); a pagefile view is
+    /// part of its section's backing instead.
+    owned: bool,
+}
+
+impl Drop for Section {
+    fn drop(&mut self) {
+        let Some(backing) = self.backing.lock().ok().and_then(|b| *b) else {
+            return;
+        };
+        super::VirtualFree(backing as *mut c_void, 0, super::MEM_RELEASE);
+    }
+}
+
+/// An offset `MapViewOfFile` accepts, as Windows requires.
+const GRANULARITY: u64 = 64 << 10;
+const FILE_MAP_COPY: u32 = 0x1;
+const FILE_MAP_WRITE: u32 = 0x2;
+const FILE_MAP_READ: u32 = 0x4;
+const PAGE_READONLY: u32 = 0x02;
+const PAGE_READWRITE: u32 = 0x04;
+const PAGE_WRITECOPY: u32 = 0x08;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+const ERROR_MAPPED_ALIGNMENT: u32 = 1136;
+
+/// Views by address. A list, because two views of one section may land on the
+/// same address: a pagefile section's views are windows on one allocation.
+static VIEWS: LazyLock<Mutex<HashMap<usize, Vec<View>>>> = LazyLock::new(Default::default);
+/// Named sections, so a second `CreateFileMapping` of a name finds the first.
+static SECTIONS: LazyLock<Mutex<HashMap<Vec<u16>, Weak<Section>>>> = LazyLock::new(Default::default);
+
+/// Whether a section's protection lets a view write through to the file.
+fn writes_through(protect: u32) -> bool {
+    matches!(
+        protect & 0xFF,
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    )
+}
+
+pub(crate) fn section_of(handle: *mut c_void) -> Option<Arc<Section>> {
+    match lock(&HANDLES).get(&(handle as usize)) {
+        Some(Object::Section(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// A section name as the wide string a title passes, `None` when it passes none.
+fn wide_name(name: *const u16) -> Option<Vec<u16>> {
+    if name.is_null() {
+        return None;
+    }
+    let mut units = Vec::new();
+    // SAFETY: the title's NUL-terminated wide string, read up to 32 KiB of units
+    // so a missing terminator cannot walk off the mapping.
+    unsafe {
+        for i in 0..(32 << 10) {
+            let unit = *name.add(i);
+            if unit == 0 {
+                break;
+            }
+            units.push(unit);
+        }
+    }
+    (!units.is_empty()).then_some(units)
+}
+
+/// `CreateFileMappingW`: a section over a file, or over the pagefile for
+/// `INVALID_HANDLE_VALUE` and a size. A name that is already taken is the same
+/// section, with `ERROR_ALREADY_EXISTS` set, as Windows reports it.
+pub extern "system" fn CreateFileMappingW(
+    file: *mut c_void,
+    _security: *const c_void,
+    protect: u32,
+    high: u32,
+    low: u32,
+    name: *const u16,
+) -> *mut c_void {
+    if !matches!(
+        protect & 0xFF,
+        PAGE_READONLY
+            | PAGE_READWRITE
+            | PAGE_WRITECOPY
+            | 0x20 // PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE
+            | PAGE_EXECUTE_WRITECOPY
+    ) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let named = wide_name(name);
+    let existing = named.as_ref().and_then(|name| {
+        let sections = lock(&SECTIONS);
+        sections.get(name).and_then(Weak::upgrade)
+    });
+    if let Some(section) = existing {
+        set_error(ERROR_ALREADY_EXISTS);
+        return new_handle(Object::Section(section));
+    }
+    let asked = (u64::from(high) << 32) | u64::from(low);
+    let (file, size) = if file as usize == INVALID_HANDLE_VALUE {
+        // The pagefile: its size is the caller's to give, since there is no file.
+        if asked == 0 {
+            set_error(ERROR_INVALID_PARAMETER);
+            return std::ptr::null_mut();
+        }
+        (None, asked)
+    } else {
+        let Some(object) = file_of(file) else {
+            set_error(ERROR_INVALID_HANDLE);
+            return std::ptr::null_mut();
+        };
+        let length = object.file.metadata().map_or(0, |m| m.len());
+        (Some(object), if asked == 0 { length } else { asked })
+    };
+    if size == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let section = Arc::new(Section {
+        file,
+        size,
+        protect,
+        backing: Mutex::new(None),
+    });
+    if let Some(name) = named {
+        let mut sections = lock(&SECTIONS);
+        sections.retain(|_, s| s.strong_count() > 0);
+        sections.insert(name, Arc::downgrade(&section));
+    }
+    new_handle(Object::Section(section))
+}
+
+/// `OpenFileMappingW`: the section a name already made, for a title that maps
+/// memory another part of it named.
+pub extern "system" fn OpenFileMappingW(_access: u32, _inherit: i32, name: *const u16) -> *mut c_void {
+    let Some(name) = wide_name(name) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    };
+    // The guard is dropped before the miss path takes the lock again.
+    let found = lock(&SECTIONS).get(&name).and_then(Weak::upgrade);
+    match found {
+        Some(section) => new_handle(Object::Section(section)),
+        None => {
+            lock(&SECTIONS).remove(&name);
+            set_error(ERROR_FILE_NOT_FOUND);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn map_view(
+    section: *mut c_void,
+    access: u32,
+    offset: u64,
+    count: usize,
+    at: *mut c_void,
+) -> *mut c_void {
+    let Some(section) = section_of(section) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return std::ptr::null_mut();
+    };
+    if offset % GRANULARITY != 0 {
+        set_error(ERROR_MAPPED_ALIGNMENT);
+        return std::ptr::null_mut();
+    }
+    if offset >= section.size {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let rest = (section.size - offset) as usize;
+    let len = if count == 0 { rest } else { count };
+    let write_back = access & FILE_MAP_WRITE != 0 && access & FILE_MAP_COPY == 0;
+    if write_back && !writes_through(section.protect) {
+        set_error(ERROR_ACCESS_DENIED);
+        return std::ptr::null_mut();
+    }
+    if section.file.is_none() {
+        // A pagefile section: the views are windows on the one allocation, so a
+        // title that shares memory through it shares the bytes.
+        let base = {
+            let mut backing = lock(&section.backing);
+            match *backing {
+                Some(base) => base,
+                None => {
+                    // SAFETY: title memory, through the allocator every reader of it knows.
+                    let base = super::VirtualAlloc(
+                        std::ptr::null_mut(),
+                        section.size as usize,
+                        super::MEM_RESERVE | super::MEM_COMMIT,
+                        PAGE_READWRITE,
+                    ) as usize;
+                    if base == 0 {
+                        set_error(ERROR_NOT_ENOUGH_MEMORY);
+                        return std::ptr::null_mut();
+                    }
+                    *backing = Some(base);
+                    base
+                }
+            }
+        };
+        let view = (base + offset as usize) as *mut c_void;
+        lock(&VIEWS).entry(view as usize).or_default().push(View {
+            section,
+            offset,
+            len: len.min(rest),
+            write_back,
+            owned: false,
+        });
+        return view;
+    }
+    // SAFETY: title memory, through the same allocator every reader of title
+    // memory knows, so the GPU and the descriptor readers see the view.
+    let base = super::VirtualAlloc(
+        at,
+        len,
+        super::MEM_RESERVE | super::MEM_COMMIT,
+        PAGE_READWRITE,
+    );
+    if base.is_null() {
+        return base;
+    }
+    if let Some(file) = &section.file {
+        // SAFETY: the view just allocated, `len` bytes and ours to fill.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), len) };
+        let mut filled = 0;
+        while filled < len {
+            match file.file.read_at(&mut bytes[filled..], offset + filled as u64) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    set_error(win32_error(&e, Path::new("")));
+                    // SAFETY: the view this call made.
+                    super::VirtualFree(base, 0, super::MEM_RELEASE);
+                    return std::ptr::null_mut();
+                }
+            }
+        }
+    }
+    lock(&VIEWS).entry(base as usize).or_default().push(View {
+        section,
+        offset,
+        len,
+        write_back,
+        owned: true,
+    });
+    base
+}
+
+/// `MapViewOfFile`: a view of a section at an offset, `count` bytes of it, or the
+/// rest of the section when `count` is 0.
+pub extern "system" fn MapViewOfFile(
+    section: *mut c_void,
+    access: u32,
+    high: u32,
+    low: u32,
+    count: usize,
+) -> *mut c_void {
+    map_view(
+        section,
+        access,
+        (u64::from(high) << 32) | u64::from(low),
+        count,
+        std::ptr::null_mut(),
+    )
+}
+
+/// `MapViewOfFileEx`: as [`MapViewOfFile`], at `at` if that address is free.
+pub extern "system" fn MapViewOfFileEx(
+    section: *mut c_void,
+    access: u32,
+    high: u32,
+    low: u32,
+    count: usize,
+    at: *mut c_void,
+) -> *mut c_void {
+    map_view(
+        section,
+        access,
+        (u64::from(high) << 32) | u64::from(low),
+        count,
+        at,
+    )
+}
+
+/// Writes a write-through view's bytes back to the file, clamped to what the
+/// file had: Windows keeps the bytes past its end in memory only.
+fn write_back(view: &View, base: usize) {
+    let Some(file) = &view.section.file else {
+        return;
+    };
+    let length = file.file.metadata().map_or(0, |m| m.len());
+    let Some(after) = length.checked_sub(view.offset) else {
+        return;
+    };
+    let len = view.len.min(after as usize);
+    if len == 0 {
+        return;
+    }
+    // SAFETY: the view is still mapped, `view.len` bytes, and `len` of them.
+    let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, len) };
+    let mut done = 0;
+    while done < len {
+        match file.file.write_at(&bytes[done..], view.offset + done as u64) {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+/// `FlushViewOfFile`: the file gets what the view holds now, rather than at the
+/// unmap. `FlushFileBuffers` on the file would be the caller's next call.
+pub extern "system" fn FlushViewOfFile(base: *const c_void, _count: usize) -> i32 {
+    let views = lock(&VIEWS);
+    let Some(list) = views.get(&(base as usize)) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    for view in list {
+        if view.write_back {
+            write_back(view, base as usize);
+        }
+    }
+    1
+}
+
+/// `UnmapViewOfFile`: the view's bytes go back to the file if it writes through,
+/// and the memory is given up.
+pub extern "system" fn UnmapViewOfFile(base: *const c_void) -> i32 {
+    let mut views = lock(&VIEWS);
+    let Some(list) = views.get_mut(&(base as usize)) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let Some(view) = list.pop() else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    if list.is_empty() {
+        views.remove(&(base as usize));
+    }
+    drop(views);
+    if view.write_back {
+        write_back(&view, base as usize);
+    }
+    if view.owned {
+        super::VirtualFree(base as *mut c_void, 0, super::MEM_RELEASE);
+    }
+    1
+}
+
 /// Names this module answers for.
 pub(super) fn lookup(name: &str) -> Option<usize> {
     macro_rules! table {
@@ -1015,6 +1403,12 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
         FindFirstFileExW,
         FindNextFileW,
         FindClose,
+        CreateFileMappingW,
+        OpenFileMappingW,
+        MapViewOfFile,
+        MapViewOfFileEx,
+        UnmapViewOfFile,
+        FlushViewOfFile,
     )
 }
 
@@ -1153,6 +1547,177 @@ mod tests {
         // The DOS wildcards may be written directly.
         assert_eq!(matches("<.a"), ["a.a", "a..a", "a.a.a", ".a"]);
         assert_eq!(matches(r#"a"*"a"#), ["a..a", "a.a.a"]);
+    }
+
+    fn mapped_file(bytes: &[u8]) -> (tempfile::TempDir, PathBuf, *mut c_void) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pak.bin");
+        std::fs::write(&path, bytes).unwrap();
+        let name = wide(path.to_str().unwrap());
+        let handle = CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        assert_ne!(handle, invalid_handle());
+        (dir, path, handle)
+    }
+
+    /// A view holds the file's bytes at its offset, reads the whole rest of the
+    /// file when asked for 0 bytes, and closing the section leaves the view alive.
+    #[test]
+    fn a_view_holds_the_file_at_its_offset() {
+        let pattern: Vec<u8> = (0..(3 * 64 * 1024)).map(|i| (i % 251) as u8).collect();
+        let (_dir, path, file) = mapped_file(&pattern);
+        let section = CreateFileMappingW(
+            file,
+            std::ptr::null(),
+            PAGE_READONLY,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        assert!(!section.is_null());
+        set_error(0);
+        assert_eq!(super::super::CloseHandle(file), 1, "the section keeps the file");
+
+        let view = MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0);
+        assert!(!view.is_null());
+        // SAFETY: the view of the whole file this call made.
+        let seen = unsafe { std::slice::from_raw_parts(view.cast::<u8>(), pattern.len()) };
+        assert_eq!(seen, &pattern[..]);
+
+        // A view at the second 64 KiB sees the file from there.
+        let later = MapViewOfFile(section, FILE_MAP_READ, 0, 64 * 1024, 4096);
+        assert!(!later.is_null());
+        // SAFETY: 4096 bytes of the view this call made.
+        let seen = unsafe { std::slice::from_raw_parts(later.cast::<u8>(), 4096) };
+        assert_eq!(seen, &pattern[64 * 1024..64 * 1024 + 4096]);
+
+        assert_eq!(UnmapViewOfFile(later), 1);
+        assert_eq!(UnmapViewOfFile(view), 1);
+        assert_eq!(super::super::CloseHandle(section), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), pattern);
+    }
+
+    /// A view that writes through puts its bytes back in the file when it is
+    /// unmapped or flushed, and not past the file's end.
+    #[test]
+    fn a_write_view_writes_through_to_the_file() {
+        let (_dir, path, file) = mapped_file(&[0u8; 128 * 1024]);
+        let section = CreateFileMappingW(
+            file,
+            std::ptr::null(),
+            PAGE_READWRITE,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        assert!(!section.is_null());
+        let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0);
+        assert!(!view.is_null());
+        assert_eq!(super::super::GetLastError(), 0);
+        // SAFETY: the view of the whole file.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(view.cast::<u8>(), 128 * 1024) };
+        bytes[0] = 0xAA;
+        bytes[70 * 1024] = 0xBB;
+        assert_eq!(FlushViewOfFile(view, 0), 1);
+        assert_eq!(std::fs::read(&path).unwrap()[70 * 1024], 0xBB, "flush");
+        bytes[1] = 0xCC;
+        assert_eq!(UnmapViewOfFile(view), 1);
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!((on_disk[0], on_disk[1]), (0xAA, 0xCC), "unmap");
+        assert_eq!(on_disk.len(), 128 * 1024, "the file did not grow");
+        assert_eq!(super::super::CloseHandle(section), 1);
+    }
+
+    /// The refusals: a view may not write a read-only section, an offset has to be
+    /// a multiple of 64 KiB, and a range outside the section is no view.
+    #[test]
+    fn a_view_that_cannot_be_made_is_refused_with_reasons() {
+        let (_dir, _path, file) = mapped_file(&[1u8; 4096]);
+        let read_only = CreateFileMappingW(
+            file,
+            std::ptr::null(),
+            PAGE_READONLY,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        assert!(MapViewOfFile(read_only, FILE_MAP_WRITE, 0, 0, 0).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_ACCESS_DENIED);
+        assert!(MapViewOfFile(read_only, FILE_MAP_READ, 0, 4096, 0).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_MAPPED_ALIGNMENT);
+        assert!(MapViewOfFile(read_only, FILE_MAP_READ, 0, 64 * 1024, 0).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        // Past the file's end is zero, as the last page of a view is on Windows.
+        let past = MapViewOfFile(read_only, FILE_MAP_READ, 0, 0, 64 * 1024);
+        assert!(!past.is_null());
+        // SAFETY: the view of the whole 64 KiB.
+        let seen = unsafe { std::slice::from_raw_parts(past.cast::<u8>(), 64 * 1024) };
+        assert_eq!(&seen[..4096], &[1u8; 4096]);
+        assert!(seen[4096..].iter().all(|&b| b == 0));
+        assert_eq!(UnmapViewOfFile(past), 1);
+        assert!(MapViewOfFile(std::ptr::null_mut(), FILE_MAP_READ, 0, 0, 0).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
+        assert_eq!(UnmapViewOfFile(std::ptr::null()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(super::super::CloseHandle(read_only), 1);
+        assert_eq!(super::super::CloseHandle(file), 1);
+    }
+
+    /// The pagefile section: zeroed, sized by the caller, one memory however many
+    /// views are mapped, and found again by its name.
+    #[test]
+    fn the_pagefile_section_is_shared_by_its_views_and_its_name() {
+        let name = wide(r"Local\victory-pagefile-test");
+        let size = 128 * 1024;
+        let section = CreateFileMappingW(
+            invalid_handle(),
+            std::ptr::null(),
+            PAGE_READWRITE,
+            0,
+            size as u32,
+            name.as_ptr(),
+        );
+        assert!(!section.is_null());
+        assert_eq!(super::super::GetLastError(), 0);
+
+        let first = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0);
+        // SAFETY: the view of the whole section.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(first.cast::<u8>(), size as usize) };
+        assert!(bytes.iter().all(|&b| b == 0), "a fresh section is zeroed");
+        bytes[1234] = 7;
+
+        let again = CreateFileMappingW(
+            invalid_handle(),
+            std::ptr::null(),
+            PAGE_READWRITE,
+            0,
+            size as u32,
+            name.as_ptr(),
+        );
+        assert!(!again.is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_ALREADY_EXISTS);
+        let opened = OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr());
+        assert!(!opened.is_null());
+
+        let second = MapViewOfFile(opened, FILE_MAP_READ, 0, 0, 0);
+        // SAFETY: the view of the whole section.
+        let seen = unsafe { std::slice::from_raw_parts(second.cast::<u8>(), size as usize) };
+        assert_eq!(seen[1234], 7, "two views, one memory");
+
+        assert_eq!(UnmapViewOfFile(second), 1);
+        assert_eq!(UnmapViewOfFile(first), 1);
+        for handle in [section, again, opened] {
+            assert_eq!(super::super::CloseHandle(handle), 1);
+        }
+        assert!(OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr()).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_FILE_NOT_FOUND);
     }
 
     #[test]

@@ -2893,6 +2893,261 @@ pub extern "system" fn CoCreateInstance(
     0x8004_0154_u32 as i32 // REGDB_E_CLASSNOTREG
 }
 
+/// `CoTaskMemAlloc`: a block from the process heap, as `LocalAlloc` gives one.
+///
+/// `CoTaskMemFree` keeps nothing to free (see its note), so what this allocates
+/// is not returned.
+pub extern "system" fn CoTaskMemAlloc(bytes: usize) -> *mut c_void {
+    if bytes == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a non-zero size; the block is the title's.
+    unsafe { libc::malloc(bytes) }
+}
+
+/// `CoGetApartmentType`: every thread of this host is in the multithreaded
+/// apartment, which is the model `CoInitializeEx` is answered with.
+pub extern "system" fn CoGetApartmentType(kind: *mut u32, qualifier: *mut u32) -> i32 {
+    const APTTYPE_MTA: u32 = 1;
+    const APTTYPEQUALIFIER_IMPLICIT_MTA: u32 = 1;
+    // SAFETY: the title's out words, each optional.
+    unsafe {
+        if !kind.is_null() {
+            kind.write(APTTYPE_MTA);
+        }
+        if !qualifier.is_null() {
+            qualifier.write(APTTYPEQUALIFIER_IMPLICIT_MTA);
+        }
+    }
+    0
+}
+
+/// The count `CoAddRefServerProcess` keeps: nothing here shuts down with it, so
+/// it is a count of callers and no more.
+static SERVER_REFS: AtomicU32 = AtomicU32::new(0);
+
+pub extern "system" fn CoAddRefServerProcess() -> u32 {
+    SERVER_REFS.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+pub extern "system" fn CoReleaseServerProcess() -> u32 {
+    SERVER_REFS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            Some(n.saturating_sub(1))
+        })
+        .map_or(0, |before| before.saturating_sub(1))
+}
+
+/// The object-context calls are answered as a machine with no COM+ context
+/// answers them: there is no context to describe, and saying so is the answer a
+/// caller checks for.
+pub extern "system" fn CoGetObjectContext(_interface: *const c_void, out: *mut *mut c_void) -> i32 {
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { out.write(std::ptr::null_mut()) };
+    }
+    0x8000_4002_u32 as i32 // E_NOINTERFACE
+}
+
+pub extern "system" fn CoGetContextToken(out: *mut usize) -> i32 {
+    if !out.is_null() {
+        // SAFETY: the title's out word.
+        unsafe { out.write(0) };
+    }
+    0x8000_4002_u32 as i32 // E_NOINTERFACE
+}
+
+/// The free-threaded marshaler and the stream marshaling are refused with
+/// `E_NOTIMPL`, which is a legal answer for a class that does not aggregate one:
+/// a refused hand-off is visible, while a marshaler that marshals nothing would
+/// hand the other apartment a pointer to it that does not work.
+pub extern "system" fn CoCreateFreeThreadedMarshaler(
+    _outer: *mut c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    tracing::warn!("CoCreateFreeThreadedMarshaler: no marshaler is created here");
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { out.write(std::ptr::null_mut()) };
+    }
+    0x8000_4001_u32 as i32 // E_NOTIMPL
+}
+
+pub extern "system" fn CoMarshalInterThreadInterfaceInStream(
+    _interface: *const c_void,
+    _unknown: *mut c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    tracing::warn!("CoMarshalInterThreadInterfaceInStream: interfaces are not marshaled here");
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { out.write(std::ptr::null_mut()) };
+    }
+    0x8000_4001_u32 as i32 // E_NOTIMPL
+}
+
+pub extern "system" fn CoGetInterfaceAndReleaseStream(
+    _stream: *mut c_void,
+    _interface: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    tracing::warn!("CoGetInterfaceAndReleaseStream: no stream was made here");
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { out.write(std::ptr::null_mut()) };
+    }
+    0x8000_4001_u32 as i32 // E_NOTIMPL
+}
+
+// WinRT: initialization, the apartment, and the errors a call's failure carries.
+
+/// The model this thread was initialised with, and how many times: `RoInitialize`
+/// answers `S_FALSE` for the same model again and `RPC_E_CHANGED_MODE` for a
+/// different one, as COM does.
+thread_local! {
+    static RO_APARTMENT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+pub extern "system" fn RoInitialize(model: u32) -> i32 {
+    const RO_INIT_MULTITHREADED: u32 = 1;
+    const S_FALSE: i32 = 1;
+    const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+    // This host has one apartment, so a request for it is honoured and a request
+    // for another model is told the model changed.
+    if model != RO_INIT_MULTITHREADED {
+        return RPC_E_CHANGED_MODE;
+    }
+    RO_APARTMENT.with(|apartment| match apartment.get() {
+        Some(_) => S_FALSE,
+        None => {
+            apartment.set(Some(model));
+            0
+        }
+    })
+}
+
+pub extern "system" fn RoUninitialize() {
+    RO_APARTMENT.with(|apartment| apartment.set(None));
+}
+
+/// `RoGetApartmentIdentifier`: the one apartment, which every thread is in.
+pub extern "system" fn RoGetApartmentIdentifier(out: *mut u64) -> i32 {
+    if out.is_null() {
+        return 0x8000_4003_u32 as i32; // E_POINTER
+    }
+    // SAFETY: the title's out word.
+    unsafe { out.write(1) };
+    0
+}
+
+/// `RoRegisterForApartmentShutdown` and its inverse: nothing shuts an apartment
+/// down here, so the registration is answered and never called back.
+pub extern "system" fn RoRegisterForApartmentShutdown(
+    _callback: *const c_void,
+    _context: *mut c_void,
+    registration: *mut u64,
+) -> i32 {
+    if registration.is_null() {
+        return 0x8000_4003_u32 as i32; // E_POINTER
+    }
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    // SAFETY: the title's out registration id.
+    unsafe { registration.write(NEXT.fetch_add(1, Ordering::Relaxed)) };
+    0
+}
+
+pub extern "system" fn RoUnregisterForApartmentShutdown(_registration: u64) {}
+
+/// The activation factories: no runtime class is implemented by this host, and
+/// the name is logged so a title asking for one says which.
+pub extern "system" fn RoGetActivationFactory(
+    class: usize,
+    _interface: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { out.write(std::ptr::null_mut()) };
+    }
+    // SAFETY: the caller's `HSTRING`.
+    let name = unsafe {
+        let mut len = 0u32;
+        let data = super::winrt::WindowsGetStringRawBuffer(class as *mut u8, &mut len);
+        String::from_utf16_lossy(std::slice::from_raw_parts(data, len as usize))
+    };
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&name) {
+        seen.push(name.clone());
+        tracing::info!(class = %name, "RoGetActivationFactory: no such runtime class");
+    }
+    drop(seen);
+    0x8004_0154_u32 as i32 // REGDB_E_CLASSNOTREG
+}
+
+pub extern "system" fn RoRegisterActivationFactories(
+    _classes: *const usize,
+    _factories: *const usize,
+    count: u32,
+    cookie: *mut u32,
+) -> i32 {
+    if cookie.is_null() {
+        return 0x8000_4003_u32 as i32; // E_POINTER
+    }
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    tracing::info!(count, "RoRegisterActivationFactories: activation is not served here");
+    // SAFETY: the title's out cookie.
+    unsafe { cookie.write(NEXT.fetch_add(1, Ordering::Relaxed)) };
+    0
+}
+
+pub extern "system" fn RoRevokeActivationFactories(_cookie: u32) {}
+
+/// The error a failed WinRT call carries: the message is kept per thread and
+/// logged at once, so a failure inside the title is readable in the log even
+/// though no `IRestrictedErrorInfo` object is handed out.
+thread_local! {
+    static RO_ERROR: std::cell::RefCell<Option<(i32, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn record_error(code: i32, message: usize) -> i32 {
+    // SAFETY: the caller's optional `HSTRING`.
+    let text = unsafe {
+        let mut len = 0u32;
+        let data = super::winrt::WindowsGetStringRawBuffer(message as *mut u8, &mut len);
+        String::from_utf16_lossy(std::slice::from_raw_parts(data, len as usize))
+    };
+    tracing::warn!("WinRT error {code:#010x}: {text}");
+    RO_ERROR.with(|slot| *slot.borrow_mut() = Some((code, text)));
+    1
+}
+
+pub extern "system" fn RoOriginateError(code: i32, message: usize) -> i32 {
+    record_error(code, message)
+}
+
+pub extern "system" fn RoTransformError(old: i32, new: i32, message: usize) -> i32 {
+    let _ = old;
+    record_error(new, message)
+}
+
+/// No `IRestrictedErrorInfo` object exists here, so setting one is refused and
+/// getting one answers nothing: `S_FALSE` is what Windows answers when there is
+/// no error to report.
+pub extern "system" fn SetRestrictedErrorInfo(_info: *mut c_void) -> i32 {
+    0x8000_4001_u32 as i32 // E_NOTIMPL
+}
+
+pub extern "system" fn GetRestrictedErrorInfo(out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return 0x8000_4003_u32 as i32; // E_POINTER
+    }
+    // SAFETY: the title's out pointer.
+    unsafe { out.write(std::ptr::null_mut()) };
+    1 // S_FALSE: there is none
+}
+
 pub extern "system" fn CoTaskMemFree(_memory: *mut c_void) {}
 
 pub extern "system" fn CoCreateGuid(out: *mut u8) -> i32 {
@@ -3639,6 +3894,27 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             CoInitializeEx,
             CoUninitialize,
             CoCreateInstance,
+            CoTaskMemAlloc,
+            CoGetApartmentType,
+            CoAddRefServerProcess,
+            CoReleaseServerProcess,
+            CoGetObjectContext,
+            CoGetContextToken,
+            CoCreateFreeThreadedMarshaler,
+            CoMarshalInterThreadInterfaceInStream,
+            CoGetInterfaceAndReleaseStream,
+            RoInitialize,
+            RoUninitialize,
+            RoGetApartmentIdentifier,
+            RoRegisterForApartmentShutdown,
+            RoUnregisterForApartmentShutdown,
+            RoGetActivationFactory,
+            RoRegisterActivationFactories,
+            RoRevokeActivationFactories,
+            RoOriginateError,
+            RoTransformError,
+            SetRestrictedErrorInfo,
+            GetRestrictedErrorInfo,
             CoTaskMemFree,
             CoCreateGuid,
             StringFromGUID2,
@@ -5332,6 +5608,185 @@ mod resource_tests {
                 lookup("api-ms-win-core-libraryloader-l1-2-0.dll", name).is_some(),
                 "{name} is not answered"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod apartment_and_winrt_tests {
+    use super::*;
+
+    const S_FALSE: i32 = 1;
+    const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
+    const E_NOTIMPL: i32 = 0x8000_4001u32 as i32;
+    const E_POINTER: i32 = 0x8000_4003u32 as i32;
+    const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+    const REGDB_E_CLASSNOTREG: i32 = 0x8004_0154u32 as i32;
+
+    /// This host has one apartment, and the calls that describe it say the same
+    /// thing rather than leaving it unanswered.
+    #[test]
+    fn the_apartment_is_the_multithreaded_one() {
+        let (mut kind, mut qualifier) = (u32::MAX, u32::MAX);
+        assert_eq!(CoGetApartmentType(&mut kind, &mut qualifier), 0);
+        assert_eq!((kind, qualifier), (1, 1));
+
+        // Initialising again with the same model is S_FALSE, with another model
+        // is a mode change, as COM answers it. Each thread has its own answer, so
+        // this runs on one.
+        std::thread::spawn(|| {
+            assert_eq!(RoInitialize(1), 0);
+            assert_eq!(RoInitialize(1), S_FALSE);
+            assert_eq!(RoInitialize(0), RPC_E_CHANGED_MODE);
+            let mut apartment = 0u64;
+            assert_eq!(RoGetApartmentIdentifier(&mut apartment), 0);
+            assert_eq!(apartment, 1);
+            let mut registration = 0u64;
+            assert_eq!(
+                RoRegisterForApartmentShutdown(std::ptr::null(), std::ptr::null_mut(), &mut registration),
+                0
+            );
+            assert_ne!(registration, 0);
+            RoUnregisterForApartmentShutdown(registration);
+            RoUninitialize();
+            // The next initialisation is the first one again.
+            assert_eq!(RoInitialize(1), 0);
+            RoUninitialize();
+        })
+        .join()
+        .unwrap();
+
+        // A count of callers, which never goes below zero.
+        assert_eq!(CoAddRefServerProcess(), 1);
+        assert_eq!(CoAddRefServerProcess(), 2);
+        assert_eq!(CoReleaseServerProcess(), 1);
+        assert_eq!(CoReleaseServerProcess(), 0);
+        assert_eq!(CoReleaseServerProcess(), 0);
+        CoAddRefServerProcess();
+    }
+
+    /// What needs an object behind it is refused with the reason, so a caller's
+    /// failure is visible rather than silent.
+    #[test]
+    fn what_needs_an_object_is_refused_with_its_reason() {
+        let mut context: *mut c_void = 1 as *mut c_void;
+        assert_eq!(CoGetObjectContext(std::ptr::null(), &mut context), E_NOINTERFACE);
+        assert!(context.is_null());
+        let mut token = usize::MAX;
+        assert_eq!(CoGetContextToken(&mut token), E_NOINTERFACE);
+        assert_eq!(token, 0);
+
+        let mut marshaler: *mut c_void = 1 as *mut c_void;
+        assert_eq!(
+            CoCreateFreeThreadedMarshaler(std::ptr::null_mut(), &mut marshaler),
+            E_NOTIMPL
+        );
+        assert!(marshaler.is_null());
+        let mut stream: *mut c_void = 1 as *mut c_void;
+        assert_eq!(
+            CoMarshalInterThreadInterfaceInStream(std::ptr::null(), std::ptr::null_mut(), &mut stream),
+            E_NOTIMPL
+        );
+        assert!(stream.is_null());
+        assert_eq!(
+            CoGetInterfaceAndReleaseStream(std::ptr::null_mut(), std::ptr::null(), &mut stream),
+            E_NOTIMPL
+        );
+
+        // No error-info object is handed out, and none is claimed when there is
+        // nothing to report.
+        let mut info: *mut c_void = 1 as *mut c_void;
+        assert_eq!(GetRestrictedErrorInfo(&mut info), S_FALSE);
+        assert!(info.is_null());
+        assert_eq!(SetRestrictedErrorInfo(std::ptr::null_mut()), E_NOTIMPL);
+        assert_eq!(GetRestrictedErrorInfo(std::ptr::null_mut()), E_POINTER);
+    }
+
+    /// A task block is the process heap's, and the constants of the calls are the
+    /// ones Windows uses.
+    #[test]
+    fn task_memory_comes_from_the_heap() {
+        let block = CoTaskMemAlloc(16).cast::<u8>();
+        assert!(!block.is_null());
+        // SAFETY: the 16 bytes this call allocated.
+        unsafe {
+            std::ptr::write_bytes(block, 0xAB, 16);
+            assert_eq!(*block, 0xAB);
+        }
+        // Freeing it is the documented shortcut, so this only checks the call is
+        // answered.
+        CoTaskMemFree(block.cast());
+        assert!(CoTaskMemAlloc(0).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    /// A runtime class this host does not implement is reported as not
+    /// registered, and its name comes out of the `HSTRING` the caller passed.
+    #[test]
+    fn a_runtime_class_is_reported_as_not_registered() {
+        let wide: Vec<u16> = "Windows.Foundation.Uri".encode_utf16().collect();
+        let mut class = std::ptr::null_mut();
+        assert_eq!(
+            super::super::winrt::WindowsCreateString(wide.as_ptr(), wide.len() as u32, &mut class),
+            0
+        );
+        let mut factory: *mut c_void = 1 as *mut c_void;
+        assert_eq!(
+            RoGetActivationFactory(class as usize, std::ptr::null(), &mut factory),
+            REGDB_E_CLASSNOTREG
+        );
+        assert!(factory.is_null());
+
+        // Registering factories is answered with a cookie, and the cookie is
+        // revocable.
+        let mut cookie = 0u32;
+        assert_eq!(
+            RoRegisterActivationFactories(std::ptr::null(), std::ptr::null(), 0, &mut cookie),
+            0
+        );
+        assert_ne!(cookie, 0);
+        RoRevokeActivationFactories(cookie);
+
+        // An error's message is read out of its `HSTRING` and kept, which is what
+        // makes a failure inside the title readable.
+        let message: Vec<u16> = "no".encode_utf16().collect();
+        let mut text = std::ptr::null_mut();
+        assert_eq!(
+            super::super::winrt::WindowsCreateString(message.as_ptr(), message.len() as u32, &mut text),
+            0
+        );
+        assert_eq!(RoOriginateError(0x8000_0001u32 as i32, text as usize), 1);
+        assert_eq!(RoTransformError(0x8000_0001u32 as i32, 0x8000_0005u32 as i32, text as usize), 1);
+        assert_eq!(super::super::winrt::WindowsDeleteString(text), 0);
+        assert_eq!(super::super::winrt::WindowsDeleteString(class), 0);
+    }
+
+    #[test]
+    fn the_com_and_winrt_names_are_answered_rather_than_stubbed() {
+        for (dll, name) in [
+            ("api-ms-win-core-com-l1-1-0.dll", "CoTaskMemAlloc"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoGetApartmentType"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoAddRefServerProcess"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoReleaseServerProcess"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoGetObjectContext"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoGetContextToken"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoCreateFreeThreadedMarshaler"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoMarshalInterThreadInterfaceInStream"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoGetInterfaceAndReleaseStream"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoInitialize"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoUninitialize"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoGetApartmentIdentifier"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoRegisterForApartmentShutdown"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoUnregisterForApartmentShutdown"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoGetActivationFactory"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoRegisterActivationFactories"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoRevokeActivationFactories"),
+            ("api-ms-win-core-winrt-error-l1-1-0.dll", "RoOriginateError"),
+            ("api-ms-win-core-winrt-error-l1-1-0.dll", "RoTransformError"),
+            ("api-ms-win-core-winrt-error-l1-1-0.dll", "GetRestrictedErrorInfo"),
+            ("api-ms-win-core-winrt-error-l1-1-0.dll", "SetRestrictedErrorInfo"),
+        ] {
+            assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
         }
     }
 }

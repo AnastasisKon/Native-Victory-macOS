@@ -83,6 +83,124 @@ pub struct Surface {
     frames: std::cell::Cell<u64>,
     /// `VICTORY_COUNT_GREEN` state: pixel probes of frames the GPU has not finished, and pacing.
     green: RefCell<GreenCount>,
+    /// The MetalFX spatial scaler of the last sizes and formats seen, with the texture it scales
+    /// into (`VICTORY_METALFX=spatial`).
+    metalfx: RefCell<Option<Scaled>>,
+}
+
+/// A MetalFX spatial scaler and the texture it writes: one per input and output size and format.
+struct Scaled {
+    input: (usize, usize),
+    output: (usize, usize),
+    color: MTLPixelFormat,
+    out: MTLPixelFormat,
+    scaler: crate::metalfx::Spatial,
+    target: Retained<ProtocolObject<dyn MTLTexture>>,
+}
+
+/// `VICTORY_METALFX=spatial`: the title's plane is scaled up by MetalFX instead of being sampled
+/// by the present pass's bilinear triangle. Off unless set; read once.
+fn metalfx_spatial() -> bool {
+    #[cfg(test)]
+    if TEST_METALFX.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_METALFX").as_deref() {
+        Ok("spatial") | Ok("1") => crate::metalfx::spatial(),
+        Ok(other) => {
+            tracing::warn!(
+                value = other,
+                "VICTORY_METALFX: expected `spatial` (the temporal scaler and the frame interpolator need the title's depth and motion vectors, which this backend does not have)"
+            );
+            false
+        }
+        Err(_) => false,
+    })
+}
+
+#[cfg(test)]
+static TEST_METALFX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+fn set_metalfx_for_test(on: bool) {
+    TEST_METALFX.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The texture the present pass should sample: `src` scaled up by MetalFX when the switch is on
+/// and the sizes differ, else `None` (the caller samples `src` itself). A format MetalFX or the
+/// present triangle cannot take falls back, once, with a line saying why.
+fn metalfx_up(
+    m: &Metal,
+    surface: &Surface,
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    target: &ProtocolObject<dyn MTLTexture>,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    if !metalfx_spatial() {
+        return None;
+    }
+    let input = (src.width(), src.height());
+    let output = (target.width(), target.height());
+    if input == output {
+        return None;
+    }
+    let (color, out) = (src.pixelFormat(), target.pixelFormat());
+    // What MetalFX takes and the present pass can sample. Anything else keeps the triangle.
+    let taken = |f: MTLPixelFormat| {
+        matches!(
+            f,
+            MTLPixelFormat::BGRA8Unorm | MTLPixelFormat::RGBA8Unorm
+        )
+    };
+    if !taken(color) || !taken(out) {
+        warn_fallback(format!("formats {color:?} to {out:?}"));
+        return None;
+    }
+    let mut cache = surface.metalfx.borrow_mut();
+    let stale = cache.as_ref().is_none_or(|c| {
+        c.input != input || c.output != output || c.color != color || c.out != out
+    });
+    if stale {
+        let scaler = match crate::metalfx::Spatial::new(&m.dev, input, output, color, out) {
+            Ok(Some(scaler)) => scaler,
+            Ok(None) => {
+                warn_fallback("no MetalFX spatial upscaler on this system".into());
+                return None;
+            }
+            Err(e) => {
+                warn_fallback(e);
+                return None;
+            }
+        };
+        // SAFETY: a fresh descriptor; Metal validates the sizes at creation.
+        let d = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                out,
+                output.0,
+                output.1,
+                false,
+            )
+        };
+        d.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
+        d.setStorageMode(MTLStorageMode::Private);
+        let Some(texture) = m.dev.newTextureWithDescriptor(&d) else {
+            warn_fallback("no texture for the scaled frame".into());
+            return None;
+        };
+        *cache = Some(Scaled { input, output, color, out, scaler, target: texture });
+    }
+    let scaled = cache.as_ref()?;
+    scaled.scaler.encode(cb, src, &scaled.target);
+    Some(scaled.target.clone())
+}
+
+/// One line the first time MetalFX cannot be used, then silence: a per-frame warning would bury
+/// the log.
+fn warn_fallback(why: String) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(why, "present: MetalFX spatial upscaling is off, the bilinear triangle draws the plane");
+    }
 }
 
 /// `VICTORY_COUNT_GREEN=1`: each presented frame has nine pixels (a 3 by 3 grid at a quarter, a
@@ -298,6 +416,7 @@ impl PresentBackend for Metal {
             library,
             pipelines: RefCell::default(),
             last: RefCell::default(),
+            metalfx: RefCell::default(),
             frames: Default::default(),
             green: Default::default(),
         })
@@ -349,13 +468,19 @@ impl PresentBackend for Metal {
             // An sRGB source is shown as the bytes it holds when the layer is not sRGB (the title's
             // swap chain holds display values).
             let src = first.view_without_srgb(self);
+            let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
+            // The plane scaled up by MetalFX, when it is asked for: the triangle then samples that
+            // instead of taking the plane with its bilinear fetch.
+            let src = match metalfx_up(self, surface, &cb, &src, &target) {
+                Some(scaled) => scaled,
+                None => src,
+            };
             let pass = MTLRenderPassDescriptor::new();
             // SAFETY: colour attachment 0 always exists.
             let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
             a.setTexture(Some(&target));
             a.setLoadAction(MTLLoadAction::DontCare);
             a.setStoreAction(MTLStoreAction::Store);
-            let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
             let e = cb
                 .renderCommandEncoderWithDescriptor(&pass)
                 .ok_or("no render encoder")?;
@@ -462,6 +587,52 @@ mod tests {
             let px = |x: usize| &bgra[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4];
             assert_eq!(px(0), [0, 0, 255, 255], "red picture at x 0, row {y}");
             assert_eq!(px(3), [255, 0, 0, 255], "blue overlay at x 3, row {y}");
+        }
+    }
+
+    /// `VICTORY_METALFX=spatial` (`set_metalfx_for_test`): a 2x2 red plane reaches an 8x8 drawable
+    /// through MetalFX instead of the triangle's bilinear fetch. MetalFX may soften the seams
+    /// between a plane's texels; the middle of each one stays red.
+    #[test]
+    fn metalfx_scales_the_plane_up_into_the_drawable() {
+        use crate::backend::Submission;
+        let _turn = PRESENTING.lock().unwrap_or_else(|e| e.into_inner());
+        if !crate::metalfx::spatial() {
+            return;
+        }
+        let Ok(metal) = Metal::new() else { return };
+        let layer = metal.create_layer(8, 8);
+        let surface = metal.create_surface(layer.as_ptr()).unwrap();
+        let queue = metal.create_queue().unwrap();
+        let picture = metal
+            .create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2))
+            .unwrap();
+        metal.upload_texture(&picture, 0, 0, &[255, 0, 0, 255].repeat(4), 8, 16);
+        set_metalfx_for_test(true);
+        let presented = metal.present(&queue, &surface, &[&picture]);
+        set_metalfx_for_test(false);
+        presented.unwrap();
+        let fence = metal.create_fence(0).unwrap();
+        metal
+            .submit(
+                &queue,
+                &Submission {
+                    waits: &[],
+                    dispatches: &[],
+                    signals: &[(&fence, 1)],
+                },
+            )
+            .unwrap();
+        assert!(metal.wait(&fence, 1, 5000));
+        let (w, h, bgra) = surface.read_last().unwrap();
+        assert_eq!((w, h), (8, 8));
+        for (x, y) in [(2, 2), (5, 2), (2, 5), (5, 5)] {
+            let at = (y * w + x) * 4;
+            let px = &bgra[at..at + 4];
+            assert!(
+                px[2] > 200 && px[0] < 60 && px[1] < 60,
+                "the plane at ({x}, {y}) is red: {px:?}"
+            );
         }
     }
 

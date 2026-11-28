@@ -1554,11 +1554,6 @@ pub extern "system" fn GetProcessId(_process: isize) -> u32 {
     std::process::id()
 }
 
-pub extern "system" fn OpenThread(_access: u32, _inherit: i32, _id: u32) -> *mut c_void {
-    set_error(ERROR_ACCESS_DENIED);
-    std::ptr::null_mut()
-}
-
 pub extern "system" fn GetThreadPriority(_thread: *mut c_void) -> i32 {
     0
 }
@@ -3664,7 +3659,6 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             GetCurrentProcess,
             GetCurrentThread,
             GetProcessId,
-            OpenThread,
             GetThreadPriority,
             SetThreadPriority,
             SetProcessPriorityBoost,

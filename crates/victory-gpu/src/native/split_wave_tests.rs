@@ -1881,6 +1881,24 @@ fn a_lane_holding_half_a_wave_maximum_is_refused() {
     assert!(why.as_deref().is_some_and(|w| w.contains("no reduction or prefix")), "{why:?}");
 }
 
+/// The program above, but read at lane 0, which the fast path refuses ("no reduction or prefix"),
+/// in the paired form where a console wave is one host wave. The DPP chain reduces within each
+/// 32-lane half - `quad_perm` pairs, then `row_half_mirror`, `row_mirror` and `v_permlanex16_b32`,
+/// none of which crosses the halves - so lane 0 holds the lower half's maximum, 31, and lane 63 the
+/// upper half's, 39. The scalar step shifts the lane-63 read (`39 >> 1` = 19) and the lane-0 read
+/// (`31 << 8` = 7936), so lanes 0..39 store `19 | 31 << 8` = 7955. The second wave's lanes are all
+/// past the `40 > v0` compare, so its mask is empty and it stores nothing.
+#[test]
+fn a_wave_maximum_read_at_lane_0_answers_the_wave_in_the_paired_form() {
+    let w = max_read_at_lane(0);
+    let why = refusal(&w).expect("the fast path takes it, so this is not the shape");
+    assert!(why.contains("no reduction or prefix"), "{why}");
+    let got = run_group(&w, 0, 128, 128);
+    assert_eq!(got.len(), 128);
+    assert_eq!(got[..40], [19 | 31 << 8; 40], "wave 0: 19 | 31 << 8");
+    assert_eq!(got[40..], [CANARY; 88], "wave 1 has an empty mask, wave 0's lanes 40..63 are off");
+}
+
 /// A wave32 prefix sum as the title's compute programs end it: an inclusive sum in each row of 16
 /// lanes (`row_shr` 1, 2, 4, 8), then the upper row alone, under `s_bfm_b32 exec_lo, 16, 16`,
 /// adds lane 15 through `v_permlanex16_b32`. The `s_bfm` is a constant lane set, as an `s_mov` of

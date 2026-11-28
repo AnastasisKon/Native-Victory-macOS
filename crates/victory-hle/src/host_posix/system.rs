@@ -1566,6 +1566,57 @@ pub extern "system" fn SetProcessPriorityBoost(_process: isize, _disable: i32) -
     1
 }
 
+/// `ALL_PROCESSOR_GROUPS`: the group number that asks for every processor.
+const ALL_PROCESSOR_GROUPS: u16 = 0xFFFF;
+/// Windows puts at most 64 processors in a group.
+const GROUP_SIZE: u32 = 64;
+
+/// `GetActiveProcessorCount`: how many processors a title picks up here. A title
+/// that sizes its worker pool by this answers `cpus()`, where the stub answered 0.
+pub extern "system" fn GetActiveProcessorCount(group: u16) -> u32 {
+    let n = cpus();
+    let groups = n.div_ceil(GROUP_SIZE);
+    if group == ALL_PROCESSOR_GROUPS {
+        return n;
+    }
+    let group = u32::from(group);
+    if group >= groups {
+        return 0;
+    }
+    n.saturating_sub(group * GROUP_SIZE).min(GROUP_SIZE)
+}
+
+/// `GetCurrentProcessorNumber`: a hint on Windows, and a hint here too, from the
+/// calling thread's id (the host gives no cheaper way to ask which CPU is running).
+pub extern "system" fn GetCurrentProcessorNumber() -> u32 {
+    thread::current_id() % cpus()
+}
+
+// shortcut: the boost setting is remembered, not applied; this host has no per-thread
+// priority boost to turn off, and a title only reads back what it set.
+static NO_BOOST: AtomicU32 = AtomicU32::new(0);
+
+pub extern "system" fn GetThreadPriorityBoost(_thread: *mut c_void, disable: *mut i32) -> i32 {
+    // SAFETY: the title's out word.
+    unsafe { disable.write(NO_BOOST.load(Ordering::Relaxed) as i32) };
+    1
+}
+
+pub extern "system" fn SetThreadPriorityBoost(_thread: *mut c_void, disable: i32) -> i32 {
+    NO_BOOST.store(u32::from(disable != 0), Ordering::Relaxed);
+    1
+}
+
+/// `SetThreadStackGuarantee`: the title's stack is a fixed reservation here, so the
+/// guarantee is accepted and left as the caller set it.
+pub extern "system" fn SetThreadStackGuarantee(guarantee: *mut u32) -> i32 {
+    if guarantee.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    1
+}
+
 pub extern "system" fn SetThreadIdealProcessorEx(
     _thread: *mut c_void,
     _ideal: *const u8,
@@ -3916,6 +3967,11 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             GetProcessId,
             GetThreadPriority,
             SetThreadPriority,
+            GetThreadPriorityBoost,
+            SetThreadPriorityBoost,
+            SetThreadStackGuarantee,
+            GetActiveProcessorCount,
+            GetCurrentProcessorNumber,
             SetProcessPriorityBoost,
             SetThreadIdealProcessorEx,
             GetThreadGroupAffinity,
@@ -5951,6 +6007,64 @@ mod apartment_and_winrt_tests {
             ("api-ms-win-core-winrt-error-l1-1-0.dll", "SetRestrictedErrorInfo"),
         ] {
             assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
+        }
+    }
+}
+
+#[cfg(test)]
+mod processor_tests {
+    use super::*;
+
+    /// A title that sizes a worker pool by the processor count gets the host's
+    /// processors, in groups of 64 as Windows lays them out, and not the 0 a stub
+    /// would answer.
+    #[test]
+    fn the_processor_count_is_the_hosts_and_the_groups_add_up() {
+        let n = cpus();
+        assert_eq!(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS), n);
+        assert_eq!(GetActiveProcessorCount(0), n.min(GROUP_SIZE));
+        let groups = n.div_ceil(GROUP_SIZE);
+        let mut total = 0;
+        for group in 0..groups {
+            let in_group = GetActiveProcessorCount(group as u16);
+            assert!(in_group > 0 && in_group <= GROUP_SIZE, "group {group}");
+            total += in_group;
+        }
+        assert_eq!(total, n, "the groups do not add up to the count");
+        assert_eq!(GetActiveProcessorCount(groups as u16), 0, "a group that is not there");
+
+        let number = GetCurrentProcessorNumber();
+        assert!(number < n, "{number} is not one of {n} processors");
+    }
+
+    /// The boost setting is remembered rather than applied, and the stack
+    /// guarantee is accepted as the title wrote it.
+    #[test]
+    fn the_priority_boost_round_trips_and_the_stack_guarantee_is_left_alone() {
+        assert_eq!(SetThreadPriorityBoost(std::ptr::null_mut(), 1), 1);
+        let mut disable = -1;
+        assert_eq!(GetThreadPriorityBoost(std::ptr::null_mut(), &mut disable), 1);
+        assert_eq!(disable, 1);
+        assert_eq!(SetThreadPriorityBoost(std::ptr::null_mut(), 0), 1);
+        assert_eq!(GetThreadPriorityBoost(std::ptr::null_mut(), &mut disable), 1);
+        assert_eq!(disable, 0);
+
+        let mut guarantee = 0x1_0000u32;
+        assert_eq!(SetThreadStackGuarantee(&mut guarantee), 1);
+        assert_eq!(guarantee, 0x1_0000);
+        assert_eq!(SetThreadStackGuarantee(std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        for dll in ["kernel32.dll", "api-ms-win-core-processthreads-l1-1-0.dll"] {
+            for name in [
+                "GetActiveProcessorCount",
+                "GetCurrentProcessorNumber",
+                "GetThreadPriorityBoost",
+                "SetThreadPriorityBoost",
+                "SetThreadStackGuarantee",
+            ] {
+                assert!(super::super::lookup(dll, name).is_some(), "{dll}!{name}");
+            }
         }
     }
 }

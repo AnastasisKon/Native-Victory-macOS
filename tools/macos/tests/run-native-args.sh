@@ -61,17 +61,17 @@ refused "--console requires a model" "--console=-h" "$dir"
 not_a_file "$dir/not-here.exe"
 not_a_file "not-here-either.exe"
 
-# A folder that exists but holds no game_*master.exe: the partial download and the wrong folder
+# A folder that exists but holds no executable: the partial download and the wrong folder
 # both land here, and the message says which folder was searched.
 try "$dir"
 [ "$rc" = 2 ] || fail "empty folder: exit $rc, expected 2"
-case "$out" in *"No game_*master.exe found in $dir"*) ;; *) fail "empty folder: expected \"No game_*master.exe found in $dir\"" ;; esac
+case "$out" in *"No executable found in $dir"*) ;; *) fail "empty folder: expected \"No executable found in $dir\"" ;; esac
 
 # Nor does a file of another name count, even in the right folder.
 : > "$dir/game_scarlett_master.txt"
 try "$dir"
 [ "$rc" = 2 ] || fail "wrong file name: exit $rc, expected 2"
-case "$out" in *"No game_*master.exe found in $dir"*) ;; *) fail "wrong file name: expected the folder message" ;; esac
+case "$out" in *"No executable found in $dir"*) ;; *) fail "wrong file name: expected the folder message" ;; esac
 
 # VICTORY_BINARY names the build to run, so the diagnostics build can be used without renaming
 # anything. A path that is not executable stops the run and names the variable, rather than sending
@@ -90,6 +90,37 @@ root="$(cd "$(dirname "$script")/../.." && pwd)"
 out=$(VICTORY_BINARY=/opt/somewhere/victory-diag bash -c "cd '$root' && source tools/macos/native-binary.sh && native_binary")
 [ "$out" = /opt/somewhere/victory-diag ] || fail "native_binary: printed \"$out\", expected the path VICTORY_BINARY names"
 rm -f "$dir/game_scarlett_master.exe"
+
+
+# The manifest's `ExecutableList` names the executable, so a title whose name is not the usual
+# `game_*master.exe` is found by it. Discovery runs before the build is looked up, so a run that
+# finds one goes on to the VICTORY_BINARY check, and one that finds nothing stops with the folder
+# message -- which is what these cases read.
+cat > "$dir/MicrosoftGame.Config" <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<Game configVersion="1">
+  <ExecutableList>
+    <Executable Name="some_title.exe" Id="GTAO" TargetDeviceFamily="Scarlett" />
+  </ExecutableList>
+</Game>
+XML
+# Named by the manifest and there: found, so the run stops at the binary instead of the folder.
+: > "$dir/some_title.exe"
+out=$(VICTORY_BINARY="$dir/no-such-victory" "$script" "$dir" 2>&1)
+case "$out" in
+  *"No executable found"*) fail "manifest: expected some_title.exe to be found, got: $out" ;;
+  *"VICTORY_BINARY points at"*) ;;
+  *) fail "manifest: expected the run to get past discovery, got: $out" ;;
+esac
+# Named by the manifest and not there: the name pattern finds nothing either, so the message says
+# which folder was searched and what it looked for.
+rm -f "$dir/some_title.exe"
+out=$(VICTORY_BINARY="$dir/no-such-victory" "$script" "$dir" 2>&1)
+case "$out" in
+  *"No executable found in $dir"*MicrosoftGame.Config*) ;;
+  *) fail "missing from the manifest: expected the folder message, got: $out" ;;
+esac
+rm -f "$dir/MicrosoftGame.Config"
 
 [ "$ok" = 1 ] || exit 1
 echo "run-native arguments: ok"

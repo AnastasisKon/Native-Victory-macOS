@@ -42,8 +42,22 @@ ram_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 
 target="$1"
 if [[ -d "$target" ]]; then
-  exe=$(find "$target" -maxdepth 1 -iname 'game_*master.exe' | head -1)
-  [[ -n "$exe" ]] || { echo "No game_*master.exe found in $target"; exit 2; }
+  # The title's manifest names its executable (`ExecutableList`), which is how a title whose name is
+  # not the usual `game_*master.exe` is found; the name pattern stays for a folder without one.
+  exe=""
+  for manifest in "$target/MicrosoftGame.Config" "$target/MicrosoftGame.config"; do
+    [[ -f "$manifest" ]] || continue
+    name=$(sed -n 's/.*<Executable[^>]*[[:space:]]Name="\([^"]*\)".*/\1/p' "$manifest" | head -1)
+    [[ -n "$name" && -f "$target/$name" ]] && exe="$target/$name"
+    break
+  done
+  if [[ -z "$exe" ]]; then
+    exe=$(find "$target" -maxdepth 1 -iname 'game_*master.exe' | head -1)
+  fi
+  [[ -n "$exe" ]] || {
+    echo "No executable found in $target (MicrosoftGame.Config's ExecutableList, or game_*master.exe)"
+    exit 2
+  }
 else
   exe="$target"
 fi

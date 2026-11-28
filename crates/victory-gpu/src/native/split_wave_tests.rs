@@ -2492,3 +2492,32 @@ fn a_mask_anded_with_exec_into_vcc_under_an_exec_skip_skips_only_waves_without_a
     assert_eq!(got[64..128], [99; 64], "wave 1: its lane 35 (thread 99)");
     assert_eq!(got[128..], [CANARY; 128], "waves 2 and 3 skip");
 }
+
+/// #527's shape in lockstep's paired form: a vote read as a number and used as a branch, in a group
+/// of two console waves whose waves vote differently. `v_cmp_lt_u32 vcc, 64, v0` leaves wave 0
+/// whole (threads 0..63) and wave 1 empty (64..127), so `s_bcnt1_i32_b64 s6, vcc` counts 64 there
+/// and 0 here: the two waves follow different arms of one `s_cbranch_scc0`, as on the console, and
+/// the 32 lanes of a host wave must not disagree about it.
+#[test]
+fn a_vote_used_as_a_branch_follows_each_console_wave_in_the_paired_form() {
+    let mut w = vec![
+        V_LSHLREV_V1_2_V0,
+        0x7E04_0281,       // v_mov_b32 v2, 1 (left in place when the branch is taken)
+        0x7D88_00FF, 100,  // v_cmp_gt_u32 vcc, 100, v0
+        0xBF88_0004,       // s_cbranch_execz 4 (the block is not one every thread runs once)
+        0x7D82_00FF, 64,   // v_cmp_lt_u32 vcc, 64, v0
+        0xBE86_106A,       // s_bcnt1_i32_b64 s6, vcc    (the vote as a number)
+        0xBF84_0001,       // s_cbranch_scc0 1           (used as a branch)
+        0x7E04_0282,       // v_mov_b32 v2, 2 (skipped when the branch is taken)
+    ];
+    w.extend(GLOBAL_STORE_V2_AT_V1);
+    w.push(S_ENDPGM);
+    // The fast path refuses it (`DIVERGENT_EXCHANGE`): that is what #527 is about.
+    assert!(refusal(&w).is_some(), "the fast path takes it, so this is not the shape");
+    let got = run_group(&w, 0, 128, 128);
+    assert_eq!(got.len(), 128);
+    // `s_bcnt1` leaves SCC set when the count is zero: wave 0's is 64, so SCC is clear, its
+    // `s_cbranch_scc0` is taken and it keeps 1; wave 1's is 0, so SCC is set and it takes 2.
+    let want: Vec<u32> = (0..128).map(|i| if i < 64 { 1 } else { 2 }).collect();
+    assert_eq!(got, want, "each console wave follows its own vote");
+}

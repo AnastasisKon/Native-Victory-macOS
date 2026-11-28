@@ -128,20 +128,54 @@ mod tests {
         assert_eq!(parse("ff0:10", 0x1000), [(0xff0, 0x10)]);
     }
 
-    /// The handler's path end to end: the ranges the switch names are written,
-    /// from the addresses they name, when the process reports a crash. This test
-    /// stands in the title image with a static array, so it names its own memory.
+    /// The handler's path end to end: the ranges the switch named are written, from the addresses
+    /// they name, when the process dies by a fault. The ranges are set before the fork, so the
+    /// child has no setup of its own to do (a `OnceLock` cannot be set twice, and a fork inherits
+    /// the list as it is).
     #[test]
-    fn a_saved_range_is_the_memory_it_named() {
+    fn a_crash_saves_the_ranges_the_switch_named() {
+        use std::os::fd::FromRawFd;
         static MEMORY: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
         let dir = std::env::temp_dir().join(format!("victory-crash-save-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         set(MEMORY.as_ptr() as usize, MEMORY.len(), &dir, "2:4");
-        // SAFETY: the range is this test's own array, which outlives the call.
-        unsafe { write_all() };
+        let mut pipe = [0; 2];
+        // SAFETY: a two-word buffer for two fds.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        // SAFETY: the test's own process; the child takes the calls below.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            // SAFETY: the child takes only async-signal-safe calls from here on.
+            unsafe {
+                libc::close(pipe[0]);
+                libc::dup2(pipe[1], 2);
+            }
+            crate::log_fatal_signals();
+            // SAFETY: the handler saves the ranges and re-raises; it does not return.
+            unsafe { libc::raise(libc::SIGSEGV) };
+            // SAFETY: unreachable; the default action kills the child.
+            unsafe { libc::_exit(0) };
+        }
+        // SAFETY: the write end is the child's now.
+        unsafe { libc::close(pipe[1]) };
+        // SAFETY: the read end is ours alone; the File closes it.
+        let read = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let mut line = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::BufReader::new(read), &mut line).unwrap();
+        let mut status = 0;
+        // SAFETY: a one-word status for this child.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSEGV);
+        assert!(
+            line.starts_with(b"victory: fatal signal 11 (code "),
+            "{:?}",
+            String::from_utf8_lossy(&line)
+        );
         assert_eq!(
             std::fs::read(dir.join("crash-2.bin")).unwrap(),
-            [3, 4, 5, 6]
+            [3, 4, 5, 6],
+            "the range the switch named, written by the handler"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

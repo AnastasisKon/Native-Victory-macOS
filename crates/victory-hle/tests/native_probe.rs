@@ -313,6 +313,15 @@ mod run {
     }
 
     #[test]
+    fn the_instructions_rosetta_rejects_are_emulated() {
+        // The SIGILL path carries the two instructions Rosetta rejects that the probe runs:
+        // `rdseed`, and the SSE4a stores `movntss`/`movntsd`. The probe sets a bit per wrong
+        // answer, so 0 is each of them behaving as the instruction does. `adcx`/`adox` are not
+        // there: they add a flag Rosetta does not give the handler (docs/native-host.md).
+        assert_all(run_probe("probe_isa", 0), 0, "probe_isa");
+    }
+
+    #[test]
     fn exceptions_reach_seh_scopes_and_vectored_handlers() {
         // The probe's vectored handler hears every thread's exceptions.
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());

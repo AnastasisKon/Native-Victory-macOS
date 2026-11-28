@@ -196,6 +196,108 @@ fn rdpid(code: &[u8]) -> Option<(usize, usize)> {
     })
 }
 
+/// Where a two-operand instruction reads or writes: a register (by its encoding number) or a
+/// memory operand, as the effective address that naming it computed from the saved registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    Reg(usize),
+    Mem(u64),
+}
+
+/// Reads the `modrm` operand of an instruction whose opcode ends at `at`: its `reg` field as a
+/// register's encoding number, and the `r/m` operand as a [`Place`], with a memory operand's
+/// effective address computed from `regs` (a register's value by encoding number) and `rip` (the
+/// address of the instruction, for a `rip`-relative one). Returns the length past the operands.
+fn rm(code: &[u8], at: usize, rex: u8, regs: &[u64; 16], rip: u64) -> Option<(usize, usize, Place)> {
+    let modrm = *code.get(at)?;
+    let (md, rm_low) = (modrm >> 6, usize::from(modrm & 7));
+    let reg = usize::from(modrm >> 3 & 7) | usize::from(rex & 4) << 1;
+    let mut len = at + 1;
+    if md == 3 {
+        return Some((len, reg, Place::Reg(rm_low | usize::from(rex & 1) << 3)));
+    }
+    // `base` and `index` are registers to add, `index` shifted by the SIB byte's scale.
+    let (mut base, mut index, mut rip_relative, mut disp) = (None, None, false, 0usize);
+    let mut scale = 0u32;
+    if rm_low == 4 {
+        let sib = *code.get(len)?;
+        len += 1;
+        let (scale_bits, index_low, base_low) = (sib >> 6, usize::from(sib >> 3 & 7), usize::from(sib & 7));
+        // `index` 4 is "none" unless REX.X makes it r12, and base 5 with no displacement is "none".
+        if index_low != 4 || rex & 2 != 0 {
+            index = Some(index_low | usize::from(rex & 2) << 2);
+            scale = u32::from(scale_bits);
+        }
+        if base_low == 5 && md == 0 {
+            disp = 4;
+        } else {
+            base = Some(base_low | usize::from(rex & 1) << 3);
+        }
+    } else if rm_low == 5 && md == 0 {
+        rip_relative = true;
+        disp = 4;
+    } else {
+        base = Some(rm_low | usize::from(rex & 1) << 3);
+    }
+    if disp == 0 {
+        disp = [0, 1, 4][md as usize];
+    }
+    let delta = match disp {
+        0 => 0,
+        1 => (*code.get(len)? as i8 as i64) as u64,
+        _ => u64::from(u32::from_le_bytes(code.get(len..len + 4)?.try_into().ok()?)),
+    };
+    len += disp;
+    let mut addr = delta;
+    if let Some(b) = base {
+        addr = addr.wrapping_add(regs[b]);
+    }
+    if let Some(i) = index {
+        addr = addr.wrapping_add(regs[i].wrapping_shl(scale));
+    }
+    if rip_relative {
+        addr = addr.wrapping_add(rip + len as u64);
+    }
+    Some((len, reg, Place::Mem(addr)))
+}
+
+/// `rdseed r32|r64` (`0f c7 /7`, register form; `rdrand` is `/6` and Rosetta runs it, and the
+/// `f3`-prefixed `/7` is `rdpid`): a hardware seed into the register and CF saying whether it is
+/// valid. Returns its length, the register's encoding number, and whether it is the 64-bit form.
+fn rdseed(code: &[u8]) -> Option<(usize, usize, bool)> {
+    let rex = code.first().copied().filter(|b| *b & 0xF0 == 0x40);
+    let i = usize::from(rex.is_some());
+    if [*code.get(i)?, *code.get(i + 1)?] != [0x0F, 0xC7] {
+        return None;
+    }
+    let modrm = *code.get(i + 2)?;
+    (modrm >> 6 == 3 && (modrm >> 3) & 7 == 7).then(|| {
+        let reg = usize::from(modrm & 7) | usize::from(rex.unwrap_or(0) & 1) << 3;
+        (i + 3, reg, rex.unwrap_or(0) & 8 != 0)
+    })
+}
+
+/// `movntss` (`f3 0f 2b /r`) and `movntsd` (`f2 0f 2b /r`): the low 32 or 64 bits of an XMM
+/// register stored to memory, from AMD's SSE4a. Rosetta rejects both (`movntps` and `movntpd`,
+/// whose opcode this is without their mandatory prefix, run). Non-temporal is a hint, so a plain
+/// store is the whole instruction. Returns its length, where it stores, the register, and the
+/// bytes stored.
+fn movnt(code: &[u8], regs: &[u64; 16], rip: u64) -> Option<(usize, Place, usize, usize)> {
+    let bytes = match code.first()? {
+        0xF3 => 4,
+        0xF2 => 8,
+        _ => return None,
+    };
+    let rex = code.get(1).copied().filter(|b| *b & 0xF0 == 0x40);
+    let i = 1 + usize::from(rex.is_some());
+    if [*code.get(i)?, *code.get(i + 1)?] != [0x0F, 0x2B] {
+        return None;
+    }
+    let (len, xmm, dst) = rm(code, i + 2, rex.unwrap_or(0), regs, rip)?;
+    // Both store: a register destination is not a form of either.
+    matches!(dst, Place::Mem(_)).then_some((len, dst, xmm, bytes))
+}
+
 /// Runs an SSE4a `insertq` or `extrq` (AMD, not in Rosetta; register forms
 /// only, as the instructions have no others) at the start of `code` on the
 /// 16 XMM registers, and returns its length. The upper halves of the
@@ -418,6 +520,53 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
             };
             return;
         }
+        if let Some((len, reg, wide)) = rdseed(code) {
+            // rdseed (not in Rosetta): a hardware seed, which the host's `rdrand` supplies. CF says
+            // it is valid; OF, ZF, SF, PF and AF are cleared, as the instruction does.
+            EMULATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut seed = 0u64;
+            // SAFETY: `rdrand` runs under Rosetta and needs no memory; a host without it gets a
+            // value built from the time-stamp counter instead, which is a seed of the same kind.
+            let valid = std::arch::is_x86_feature_detected!("rdrand")
+                && unsafe { std::arch::x86_64::_rdrand64_step(&mut seed) } == 1;
+            if !valid {
+                // SAFETY: reads the core's counter.
+                seed = unsafe { std::arch::x86_64::_rdtsc() }.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            }
+            // SAFETY: inside the thread state.
+            unsafe {
+                let set = |i: usize, v: u64| mc.add(MC_THREAD + i * 8).cast::<u64>().write(v);
+                set(slot(reg), if wide { seed } else { u64::from(seed as u32) });
+                set(T_RFLAGS, word(T_RFLAGS) & !0x8d5 | 1 | 0x2);
+                set(T_RIP, rip + len as u64);
+            }
+            return;
+        }
+        // The registers by their encoding numbers: the store's address names them.
+        let regs: [u64; 16] = std::array::from_fn(|r| word(slot(r)));
+        if let Some((len, dst, xmm_reg, bytes)) = movnt(code, &regs, rip) {
+            // movntss/movntsd (SSE4a stores, not in Rosetta): the low bytes of the register, stored
+            // plainly. The non-temporal part is a cache hint and changes no value.
+            EMULATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Place::Mem(at) = dst {
+                // SAFETY: `xmm` is the float state's 16 registers; the destination is the range the
+                // store would have written.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (*xmm).get_unchecked(xmm_reg).as_ptr(),
+                        at as *mut u8,
+                        bytes,
+                    )
+                };
+            }
+            // SAFETY: the saved rip, past the store.
+            unsafe {
+                mc.add(MC_THREAD + T_RIP * 8)
+                    .cast::<u64>()
+                    .write(rip + len as u64)
+            };
+            return;
+        }
         if let Some((p, limit, inclusive, len)) = cache_hint_loop(code) {
             // Write-backs do nothing here: the loop ends where it would have.
             let (start, limit) = (word(slot(p)), word(slot(limit)));
@@ -586,7 +735,10 @@ unsafe fn chain(signal: i32, info: *mut u8, uc: *mut u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_hint_len, cache_hint_loop, clzero_loop_limit, rdpid, rdpru, sse4a};
+    use super::{
+        Place, cache_hint_len, cache_hint_loop, clzero_loop_limit, movnt, rdpid, rdpru, rdseed,
+        sse4a,
+    };
 
     #[test]
     fn rdpid_is_recognised_in_its_register_form() {
@@ -668,6 +820,33 @@ mod tests {
         assert_eq!(xmm[3][..8], 0x1234u64.to_le_bytes());
         assert_eq!(sse4a(&[0xF2, 0x0F, 0x78, 0x01, 0x10, 0x10], &mut xmm), None); // memory form
         assert_eq!(sse4a(&[0x66, 0x0F, 0x78, 0xC8, 0x10, 0x10], &mut xmm), None); // extrq /1
+    }
+
+    #[test]
+    fn rdseed_is_told_apart_from_rdpid_by_its_prefix() {
+        // rdseed eax: 0f c7 f8, mod 11 /7 with r/m 0.
+        assert_eq!(rdseed(&[0x0F, 0xC7, 0xF8]), Some((3, 0, false)));
+        // rdseed r9: REX.W with REX.B, 64 bits into r9.
+        assert_eq!(rdseed(&[0x49, 0x0F, 0xC7, 0xF9]), Some((4, 9, true)));
+        // The same opcode with `f3` is rdpid, not a seed.
+        assert_eq!(rdseed(&[0xF3, 0x0F, 0xC7, 0xF8]), None);
+        // /6 is rdrand, which Rosetta runs, and a memory operand is not the register form.
+        assert_eq!(rdseed(&[0x0F, 0xC7, 0xF1]), None);
+        assert_eq!(rdseed(&[0x0F, 0xC7, 0x38]), None);
+    }
+
+    #[test]
+    fn movntss_and_movntsd_store_the_low_bytes_of_a_register() {
+        let mut regs = [0u64; 16];
+        regs[3] = 0x2000;
+        // movntss [rbx], xmm0: f3 0f 2b 03.
+        assert_eq!(movnt(&[0xF3, 0x0F, 0x2B, 0x03], &regs, 0), Some((4, Place::Mem(0x2000), 0, 4)));
+        // movntsd [rbx+0x10], xmm1: f2 0f 2b 4b 10.
+        assert_eq!(movnt(&[0xF2, 0x0F, 0x2B, 0x4B, 0x10], &regs, 0), Some((5, Place::Mem(0x2010), 1, 8)));
+        // Both store, so a register destination is neither.
+        assert_eq!(movnt(&[0xF3, 0x0F, 0x2B, 0xC1], &regs, 0), None);
+        // `movntps` (no prefix) is a different instruction and runs under Rosetta.
+        assert_eq!(movnt(&[0x0F, 0x2B, 0x03], &regs, 0), None);
     }
 
     #[test]

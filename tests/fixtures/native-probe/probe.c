@@ -175,6 +175,49 @@ __attribute__((section(".rdata$T"), used)) const struct tls_directory _tls_used 
     (u64)&_tls_start, (u64)&_tls_end, (u64)&_tls_index, (u64)tls_callbacks, 0, 0,
 };
 
+/* The instructions Rosetta rejects that the SIGILL path emulates: `rdseed` (`rdrand` runs, the
+ * seed instruction does not) and the SSE4a stores `movntss` and `movntsd`. Each check sets its bit
+ * when the answer is not the one the instruction gives, so 0 is all working.
+ *
+ * `adcx` and `adox` are NOT here, and cannot be: they add the incoming CF or OF, and Rosetta hands
+ * the signal handler a saved RFLAGS with every arithmetic flag cleared (`0x206` for a thread that
+ * arrived with OF set), so the flag they add cannot be read. See docs/native-host.md. */
+u32 probe_isa(ptr unused)
+{
+    u32 bad = 0;
+    (void)unused;
+
+    /* rdseed: a seed, and CF saying it is valid. */
+    {
+        u64 seed = 0;
+        u8 cf = 0;
+        __asm__ volatile("stc\n\t"
+                         "rdseed %0\n\t"
+                         "setc %1"
+                         : "=r"(seed), "=q"(cf)
+                         :
+                         : "cc");
+        if (!cf)
+            bad |= 1;
+    }
+
+    /* movntsd then movntss: the low 8 and 4 bytes of a register, stored to memory. */
+    {
+        u64 out[2] = {0, 0};
+        u64 low = 0x1122334455667788ull;
+        __asm__ volatile("movq %1, %%xmm0\n\t"
+                         "movntsd %%xmm0, (%0)\n\t"
+                         "movntss %%xmm0, 8(%0)"
+                         :
+                         : "r"(out), "r"(low)
+                         : "xmm0", "memory");
+        if (out[0] != low || out[1] != (low & 0xffffffffull))
+            bad |= 2;
+    }
+
+    return bad;
+}
+
 u32 probe_main(ptr unused)
 {
     u32 ok = 0;

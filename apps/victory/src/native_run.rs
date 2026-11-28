@@ -257,6 +257,11 @@ pub fn run(
                 image.base(),
                 image.info().size_of_image as usize,
             );
+            // `VICTORY_PATCH`: bytes a reader worked out, at the offsets it names.
+            victory_loader::resolution::apply_patch(
+                image.base(),
+                image.info().size_of_image as usize,
+            );
         }
     }
     if let Some(tls) = image.tls() {

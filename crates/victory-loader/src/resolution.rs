@@ -372,6 +372,74 @@ pub unsafe fn apply_break_at(base: usize, size: usize) {
     }
 }
 
+/// `VICTORY_PATCH=<rva>:<hex bytes>[,...]`: writes those bytes at those image offsets before the
+/// title runs. Nothing is compared first and nothing is put back, unlike the sites above: this is
+/// for an experiment on one instruction or one table entry a reader worked out, and a wrong patch
+/// is a run that does not start. Off unless set.
+///
+/// # Safety
+/// The image of `size` bytes at `base` stays mapped and is writable, and no thread runs its code:
+/// before `NativeImage::finalize`, as the sites are.
+#[cfg(any(windows, target_os = "macos"))]
+pub unsafe fn apply_patch(base: usize, size: usize) {
+    for (offset, bytes) in patches(&std::env::var("VICTORY_PATCH").unwrap_or_default()) {
+        match offset.checked_add(bytes.len()) {
+            Some(end) if end <= size => {
+                // SAFETY: inside the mapped, writable image, with no thread running it yet.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), (base + offset) as *mut u8, bytes.len())
+                };
+                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                tracing::info!(
+                    rva = format_args!("{offset:#x}"),
+                    bytes = %hex,
+                    "patched before the run (VICTORY_PATCH)"
+                );
+            }
+            _ => tracing::warn!(
+                rva = format_args!("{offset:#x}"),
+                len = bytes.len(),
+                "patch: outside the image, left alone"
+            ),
+        }
+    }
+}
+
+/// The `offset:bytes` pairs a `VICTORY_PATCH` list names: hex offsets and an even number of hex
+/// digits each (`0x` optional). An entry that is not one, or that has an odd number of digits, is
+/// left out rather than half written.
+pub fn patches(spec: &str) -> Vec<(usize, Vec<u8>)> {
+    let mut out = Vec::new();
+    for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((offset, hex)) = entry.split_once(':') else {
+            continue;
+        };
+        let Some(offset) = usize::from_str_radix(offset.trim().trim_start_matches("0x"), 16).ok()
+        else {
+            continue;
+        };
+        let hex: Vec<char> = hex.trim().trim_start_matches("0x").chars().filter(|c| !c.is_whitespace()).collect();
+        if hex.is_empty() || !hex.len().is_multiple_of(2) {
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        let mut ok = true;
+        for pair in hex.chunks(2) {
+            match u8::from_str_radix(&pair.iter().collect::<String>(), 16) {
+                Ok(byte) => bytes.push(byte),
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            out.push((offset, bytes));
+        }
+    }
+    out
+}
+
 /// The image offsets in a comma-separated hex list (`0x` optional), the spelling the other
 /// switches take; an entry that is no hex is left out.
 pub fn parse_rvas(spec: &str) -> Vec<usize> {
@@ -440,6 +508,35 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patch_entries_are_an_offset_and_whole_bytes_then_written() {
+        assert_eq!(
+            patches("674c370:02f0221f, 0x10:90"),
+            vec![(0x674c370, vec![0x02, 0xf0, 0x22, 0x1f]), (0x10, vec![0x90])]
+        );
+        // An entry with no colon, no bytes, or half a byte is left out; an odd number of digits is
+        // the last one, where a half-written byte would be a surprise.
+        assert!(patches("").is_empty());
+        assert!(patches("10").is_empty());
+        assert!(patches("10:").is_empty());
+        assert!(patches("10:9").is_empty());
+        assert!(patches("10:zz").is_empty());
+        assert!(patches(":90").is_empty());
+        #[cfg(target_os = "macos")]
+        {
+            let mut image = [0u8; 8];
+            let base = image.as_mut_ptr() as usize;
+            // SAFETY: a writable byte array, with no code executing.
+            unsafe {
+                // The last entry runs past the image, so it is left alone: half a write is worse.
+                std::env::set_var("VICTORY_PATCH", "2:dead,7:ff,9:aabb");
+                apply_patch(base, image.len());
+                std::env::remove_var("VICTORY_PATCH");
+            }
+            assert_eq!(image, [0, 0, 0xde, 0xad, 0, 0, 0, 0xff]);
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

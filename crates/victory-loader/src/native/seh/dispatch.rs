@@ -478,16 +478,6 @@ fn step_over_assert(ctx: &mut Context, rec: &ExceptionRecord) -> bool {
     }
 }
 
-/// The addresses in a `VICTORY_PEEK` list: hex, `0x` optional as for every other switch here, and
-/// comma-separated. An entry that does not parse is left out rather than ending the run: it is a
-/// debugging aid, and a typo in one address should not cost the addresses after it.
-fn peek_list(value: &str) -> Vec<usize> {
-    value
-        .split(',')
-        .filter_map(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
-        .collect()
-}
-
 /// # Safety
 /// `ctx` and `rec` stay valid until the thread is resumed.
 unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
@@ -523,7 +513,6 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
             // VICTORY_DUMP_THREADS=0: at a breakpoint (the title's asserts). An access violation
             // waits for `unhandled`: the title's handlers take some and go on.
             super::super::dump::report_at_fault(r.code, false);
-<<<<<<< HEAD
             // Debugging aid: VICTORY_PEEK=<entry>,... prints a qword for each: an RVA of the
             // faulting image, an absolute address, or `reg+offset` in the faulting frame, which
             // reads a field of the object a fault is about without knowing where the heap put it.
@@ -531,17 +520,6 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
             if let Ok(list) = std::env::var("VICTORY_PEEK") {
                 for entry in list.split(',') {
                     let Some(at) = crate::peek::address(entry, &c.gpr, base) else { continue };
-=======
-            // Debugging aid: VICTORY_PEEK=rva,rva,... prints those qwords of
-            // the faulting image.
-            if let (Ok(list), Some(base)) = (
-                std::env::var("VICTORY_PEEK"),
-                unwind::image_base_of(c.rip as usize),
-            ) {
-                for rva in peek_list(&list) {
-                    // Beyond the image: an absolute address.
-                    let at = if rva > 0x1000_0000 { rva } else { base + rva };
->>>>>>> origin/main
                     // An address written down by hand can name nothing, and a fault taken here
                     // would be a second one inside this dispatch, not the one being reported.
                     match super::super::dump::read_checked(at) {
@@ -1038,17 +1016,4 @@ pub mod api {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `VICTORY_PEEK` takes hex with or without the prefix, as the other switches do, and an
-    /// entry that does not parse costs only itself.
-    #[test]
-    fn a_peek_list_takes_hex_addresses() {
-        assert_eq!(peek_list("1817c2a50"), vec![0x1_817c_2a50]);
-        assert_eq!(
-            peek_list("0x1817c2a50, 1330a44"),
-            vec![0x1_817c_2a50, 0x0133_0a44]
-        );
-        assert_eq!(peek_list("1817c2a50,zz,0x"), vec![0x1_817c_2a50]);
-        assert!(peek_list("").is_empty());
-    }
 }

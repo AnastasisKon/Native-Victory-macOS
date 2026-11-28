@@ -522,8 +522,10 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+/// The `VICTORY_SKIP_PIPELINES` list: lower-case 16-digit shader hashes, others warned about and
+/// left out (the D3D12 path and the native host read it alike).
+#[cfg(any(target_os = "macos", all(windows, feature = "diagnostics")))]
+pub(crate) fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -1382,7 +1384,7 @@ mod changed_descriptor_tests {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(any(target_os = "macos", all(windows, feature = "diagnostics")))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());

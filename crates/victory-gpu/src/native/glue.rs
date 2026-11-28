@@ -576,17 +576,22 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
 /// One texel of an HDR or 10-bit colour target (DXGI 2, 10, 24, 26) as linear RGB.
 fn decode_hdr(format: u32, p: &[u8]) -> [f32; 3] {
     let word = |i: usize| u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
-    // An unsigned small float: `mbits` mantissa bits over a 5-bit exponent.
+    // The magnitude of a small float with `mbits` mantissa bits and a 5-bit exponent.
     let small = |v: u32, mbits: u32| {
         let (e, m) = ((v >> mbits) & 0x1f, v & ((1 << mbits) - 1));
-        if e == 0 { m as f32 * 2f32.powi(-14 - mbits as i32) } else { (1.0 + m as f32 / (1 << mbits) as f32) * 2f32.powi(e as i32 - 15) }
+        match (e, m) {
+            (0, m) => m as f32 * 2f32.powi(-14 - mbits as i32),
+            (31, 0) => f32::INFINITY,
+            (31, _) => f32::NAN,
+            _ => (1.0 + m as f32 / (1 << mbits) as f32) * 2f32.powi(e as i32 - 15),
+        }
     };
     match format {
         2 => [0, 4, 8].map(|i| f32::from_bits(word(i))),
         10 => [0, 2, 4].map(|i| {
             let h = u32::from(u16::from_le_bytes([p[i], p[i + 1]]));
             let v = small(h & 0x7fff, 10);
-            if h >> 15 == 1 { -v } else if (h >> 10) & 0x1f == 0x1f { f32::NAN } else { v }
+            if h >> 15 == 1 { -v } else { v }
         }),
         24 => [0, 10, 20].map(|s| ((word(0) >> s) & 0x3ff) as f32 / 1023.0),
         _ => {
@@ -594,6 +599,29 @@ fn decode_hdr(format: u32, p: &[u8]) -> [f32; 3] {
             [small(v & 0x7ff, 6), small((v >> 11) & 0x7ff, 6), small(v >> 22, 5)]
         }
     }
+}
+
+#[test]
+fn hdr_dump_preserves_non_finite_channels() {
+    let rgba16 = |words: [u16; 4]| {
+        let bytes: Vec<u8> = words.into_iter().flat_map(u16::to_le_bytes).collect();
+        decode_hdr(10, &bytes)
+    };
+    let rgb11 = |r: u32, g: u32, b: u32| {
+        decode_hdr(26, &(r | (g << 11) | (b << 22)).to_le_bytes())
+    };
+
+    let [r, g, b] = rgba16([0x7c00, 0xfc00, 0xfe00, 0]);
+    assert_eq!(r, f32::INFINITY);
+    assert_eq!(g, f32::NEG_INFINITY);
+    assert!(b.is_nan());
+    assert_eq!(rgba16([0x3c00, 0xb800, 1, 0]), [1.0, -0.5, 2f32.powi(-24)]);
+
+    let [r, g, b] = rgb11(0x7c0, 0x7e0, 0x3e0);
+    assert_eq!(r, f32::INFINITY);
+    assert!(g.is_nan());
+    assert_eq!(b, f32::INFINITY);
+    assert_eq!(rgb11(0x3c0, 1, 0x1c0), [1.0, 2f32.powi(-20), 0.5]);
 }
 
 /// A texture operation the native host does not do (copies, resolves), counted by the trace.
@@ -1724,6 +1752,7 @@ pub(crate) fn install_test_render_pipeline(
 
 pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
     with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
+        _ if skipped_dispatch(t, l, &format!("groups [{x}, {y}, {z}]")) => {}
         Pipe::Compute(pso) => {
             trace_record_dispatch(t, l, "ran");
             if pass_on() {
@@ -1769,11 +1798,38 @@ fn stage_hashes(pipeline: usize) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `VICTORY_SKIP_PIPELINES=<hash>[,<hash>...]` (debugging): whether title pipeline `pipeline`
+/// has a shader of one of the listed 16-digit hashes, so that its draws and dispatches are
+/// dropped (to see which work makes a fault in the picture). Read once; off when unset.
+fn skipped_pipeline(pipeline: usize) -> bool {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        crate::pipeline::parse_skip_hashes(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default())
+    });
+    !hashes.is_empty()
+        && crate::pipeline::native_stages(pipeline as This)
+            .is_some_and(|(stages, _)| stages.iter().any(|(_, sh)| hashes.contains(&sh.hash)))
+}
+
+/// A dispatch of a pipeline `VICTORY_SKIP_PIPELINES` lists: counted as dropped and noted in the
+/// pass trace. Returns whether it was skipped.
+fn skipped_dispatch(t: &MetalTitle, l: &mut MetalList, how: &str) -> bool {
+    if !skipped_pipeline(l.pipeline) {
+        return false;
+    }
+    dropped("a dispatch skipped by VICTORY_SKIP_PIPELINES");
+    if pass_on() {
+        pass_note(t, l, &format!("dispatch {how}"), "skipped by VICTORY_SKIP_PIPELINES", true, 1);
+    }
+    true
+}
+
 /// `DispatchX` with thread counts (`crate::list::dispatch_x`). Without the translation for
 /// them it is dropped: run as group counts, its lanes past the counts would write over memory
 /// that is not theirs.
 pub(crate) fn dispatch_threads(this: This, threads: [u32; 3]) {
     with_list(this, |t, l| match thread_pipe(t, l.pipeline) {
+        _ if skipped_dispatch(t, l, &format!("threads {threads:?}")) => {}
         Pipe::Compute(pso) => {
             if pass_on() {
                 pass_note(t, l, &format!("dispatch-threads{threads:?}"), "ran", true, 1);
@@ -1956,6 +2012,11 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
 }
 
 fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
+    if skipped_pipeline(l.pipeline) {
+        dropped("a draw skipped by VICTORY_SKIP_PIPELINES");
+        trace_drop(l);
+        return None;
+    }
     if !l.targets_ready {
         dropped("a draw of a pass whose render targets the host cannot make");
         trace_drop(l);
@@ -2173,6 +2234,7 @@ pub(crate) fn execute_indirect(
         Command::Dispatch => {
             let mut start = std::time::Instant::now();
             with_list(this, |t, l| match (start = std::time::Instant::now(), pipe(t, l.pipeline, &TargetFormats::default())).1 {
+                _ if skipped_dispatch(t, l, "indirect") => {}
                 Pipe::Compute(pso) => {
                     let found = std::time::Instant::now();
                     let _timed = Defer(|| note_indirect(max, start, found));

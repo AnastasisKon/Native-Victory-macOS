@@ -2015,6 +2015,14 @@ pub extern "system" fn CloseThreadpoolWait(wait: *mut PoolObject) {
     WaitForThreadpoolWaitCallbacks(wait, 1);
 }
 
+/// `ExitProcess`: the process ends with this code. The images' detach runs
+/// first, through the exit table registered when the first one attached, which
+/// is `ExitProcess`'s order.
+pub extern "system" fn ExitProcess(code: u32) -> ! {
+    tracing::info!("ExitProcess({code})");
+    std::process::exit(code as i32);
+}
+
 pub extern "system" fn CallbackMayRunLong(_instance: *const c_void) -> i32 {
     0
 }
@@ -2971,6 +2979,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             SetThreadpoolTimer,
             WaitForThreadpoolTimerCallbacks,
             CloseThreadpoolTimer,
+            ExitProcess,
             CreateThreadpoolWait,
             SetThreadpoolWait,
             WaitForThreadpoolWaitCallbacks,
@@ -4029,5 +4038,24 @@ mod crypt_string_tests {
     #[test]
     fn the_codec_is_answered_rather_than_stubbed() {
         assert!(lookup("crypt32.dll", "CryptStringToBinaryW").is_some());
+    }
+}
+
+#[cfg(test)]
+mod exit_process_tests {
+    use super::*;
+
+    #[test]
+    fn exit_process_is_answered_rather_than_stubbed() {
+        // Not called: it ends the process, which is its whole purpose.
+        assert!(
+            lookup("kernel32.dll", "ExitProcess").is_some(),
+            "ExitProcess is not answered"
+        );
+        assert!(lookup(
+            "api-ms-win-core-processthreads-l1-1-0.dll",
+            "ExitProcess"
+        )
+        .is_some());
     }
 }

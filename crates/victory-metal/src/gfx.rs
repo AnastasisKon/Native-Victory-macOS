@@ -1894,10 +1894,10 @@ impl Metal {
             // up first, so an attach that races the completion sees it and pays at once.
             owed.completed.store(true, std::sync::atomic::Ordering::Release);
             owed.pay_refund();
-            });
+            })
         };
         // SAFETY: the block is retained by Metal until it has run.
-        unsafe { cb.addCompletedHandler(&failed as *const _ as *mut _) };
+        unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
         crate::metal::residency_timed("cb_commit", None, || cb.commit());
         self.committed.set(self.committed.get() + 1);
         owed

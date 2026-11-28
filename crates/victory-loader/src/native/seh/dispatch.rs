@@ -368,12 +368,69 @@ extern "C" fn raise_exception(
     dispatch_exception(ctx, &mut record, 0)
 }
 
+/// Diagnostics (`--features diagnostics`): the RVAs `VICTORY_SKIP_TITLE_INT3` names in the
+/// title image, a switch with the same meaning and spelling as the Windows path's (#24).
+#[cfg(feature = "diagnostics")]
+static SKIP_TITLE_INT3: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+/// Whether this exception is a title `int3` assert that `VICTORY_SKIP_TITLE_INT3` names, and
+/// `ctx` was moved past it: the one-byte `int3` is stepped over the way a debugger continues
+/// past an assert, so a run reaches the code behind it. Off, and compiled out, without the
+/// `diagnostics` feature. The Windows path reads the same switch in its vectored handler,
+/// which runs before the title's own handlers; this dispatch is that place here.
+fn step_over_assert(ctx: &mut Context, rec: &ExceptionRecord) -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        if rec.code != EXCEPTION_BREAKPOINT {
+            return false;
+        }
+        let list = SKIP_TITLE_INT3.get_or_init(|| {
+            std::env::var("VICTORY_SKIP_TITLE_INT3")
+                .map(|v| {
+                    v.split(',')
+                        .filter_map(|x| {
+                            u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        let rip = ctx.rip as usize;
+        let Some(base) = unwind::image_base_of(rip) else {
+            return false;
+        };
+        let Ok(rva) = u32::try_from(rip - base) else {
+            return false;
+        };
+        if !list.contains(&rva) {
+            return false;
+        }
+        // Logged every time, so a log never hides a patched run.
+        tracing::warn!(
+            rva = format_args!("{rva:#x}"),
+            "stepped over a title int3 (VICTORY_SKIP_TITLE_INT3)"
+        );
+        ctx.rip += 1;
+        true
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = (ctx, rec);
+        false
+    }
+}
+
 /// # Safety
 /// `ctx` and `rec` stay valid until the thread is resumed.
 unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
     // SAFETY: both are ours for this dispatch.
     if unsafe { super::super::dump::write_trap(&*ctx, &*rec) } {
         // SAFETY: forwarded from the caller.
+        unsafe { resume(ctx) };
+    }
+    // SAFETY: both are ours for this dispatch.
+    if unsafe { step_over_assert(&mut *ctx, &*rec) } {
+        // SAFETY: as above; `ctx` names the instruction after the `int3`.
         unsafe { resume(ctx) };
     }
     // First-chance log: the title's own handlers may hide where a fault started.

@@ -46,6 +46,14 @@ pub fn image_path(base: usize) -> Option<PathBuf> {
         .map(|(_, p)| p.clone())
 }
 
+/// Every title image this host has mapped, by base, with the file it came from.
+pub fn images() -> Vec<(usize, PathBuf)> {
+    IMAGE_PATHS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// The title image whose original file is called `file` (any case).
 pub fn image_named(file: &str) -> Option<usize> {
     let paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());

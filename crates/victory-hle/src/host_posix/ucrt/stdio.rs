@@ -266,7 +266,7 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
     let mut files = HashMap::new();
     let mut std_files = [0; 3];
     for (i, s) in std.iter().enumerate() {
-        let block = Box::leak(Box::new([0u64; 2])).as_mut_ptr() as usize;
+        let block = new_block();
         files.insert(block, s.clone());
         std_files[i] = block;
     }
@@ -312,8 +312,41 @@ fn alloc_fd(s: &Shared) -> Option<i32> {
     Some(fd as i32)
 }
 
+/// What a title treats as a `FILE*`: the opaque words it has always been here,
+/// then the CRT's buffer fields, whose *addresses*
+/// `_get_stream_buffer_pointers` hands out.
+///
+/// The C++ runtime keeps those addresses and reads and writes the stream's
+/// buffer through them: `msvcp140`'s `basic_filebuf::_Init` stores them as its
+/// own area pointers, so they must be real and outlive the stream. Nulls are
+/// not the same thing — the filebuf then holds null area pointers, and its
+/// destructor follows one.
+#[repr(C)]
+pub(super) struct FileBlock {
+    /// Never read here: the words a `FILE*` has always been in this host.
+    opaque: [u64; 2],
+    /// `char* _base`: the start of the stream's buffer.
+    base: *mut u8,
+    /// `char* _ptr`: the next byte to write, or to hand out.
+    ptr: *mut u8,
+    /// `int _cnt`: bytes left in the buffer, negative while writing.
+    count: i32,
+}
+
+/// A `FILE*`'s block, which lives as long as the process: the title keeps the
+/// handle, and titles have taken handles and never given them back.
+fn new_block() -> usize {
+    let block = FileBlock {
+        opaque: [0; 2],
+        base: std::ptr::null_mut(),
+        ptr: std::ptr::null_mut(),
+        count: 0,
+    };
+    Box::leak(Box::new(block)) as *mut FileBlock as usize
+}
+
 fn new_file(s: Shared) -> *mut c_void {
-    let block = Box::leak(Box::new([0u64; 2])).as_mut_ptr() as usize;
+    let block = new_block();
     state().files.insert(block, s);
     block as *mut c_void
 }
@@ -887,22 +920,31 @@ pub extern "system" fn _lock_file(_file: *mut c_void) {}
 
 pub extern "system" fn _unlock_file(_file: *mut c_void) {}
 
-/// The CRT's buffer internals, which nothing here has.
+/// The CRT's buffer internals: the addresses of the stream's `_base`, `_ptr`
+/// and `_cnt`, so that a C++ `basic_filebuf` over the stream can keep its own
+/// buffer in step with it (see [`FileBlock`]).
 pub extern "system" fn _get_stream_buffer_pointers(
-    _file: *mut c_void,
-    base: *mut usize,
-    ptr: *mut usize,
-    count: *mut i32,
+    file: *mut c_void,
+    base: *mut *mut *mut u8,
+    ptr: *mut *mut *mut u8,
+    count: *mut *mut i32,
 ) -> i32 {
-    // SAFETY: the title's out pointers, each possibly null.
+    if stream_of(file).is_none() {
+        bad_param(EINVAL);
+        return -1;
+    }
+    let block = file.cast::<FileBlock>();
+    // SAFETY: the title's out pointers, each possibly null, into a block of
+    // ours that lives as long as the handle.
     unsafe {
-        for p in [base, ptr] {
-            if !p.is_null() {
-                p.write(0);
-            }
+        if !base.is_null() {
+            base.write(std::ptr::addr_of_mut!((*block).base));
+        }
+        if !ptr.is_null() {
+            ptr.write(std::ptr::addr_of_mut!((*block).ptr));
         }
         if !count.is_null() {
-            count.write(0);
+            count.write(std::ptr::addr_of_mut!((*block).count));
         }
     }
     0
@@ -1895,6 +1937,62 @@ mod tests {
         assert_eq!(_fileno(o), 1);
         assert_eq!(_fileno(e), 2);
         assert_eq!(fflush(o), 0);
+    }
+
+    #[test]
+    fn stream_buffer_pointers_are_addresses_of_the_streams_own_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slots.bin");
+        std::fs::write(&path, b"hello").unwrap();
+        let f = open(&path, "rb");
+        assert!(!f.is_null());
+
+        let (mut base, mut ptr, mut count): (*mut *mut u8, *mut *mut u8, *mut i32) = (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(_get_stream_buffer_pointers(f, &mut base, &mut ptr, &mut count), 0);
+        // The C++ runtime keeps these as the stream's area pointers and reads
+        // the buffer through them: nulls leave a `basic_filebuf` holding null
+        // pointers, which its destructor then follows.
+        assert!(!base.is_null() && !ptr.is_null() && !count.is_null());
+        assert_ne!(base as usize, ptr as usize);
+
+        // The same stream keeps the same slots, and what is written through
+        // them is what a later ask reads back.
+        // SAFETY: the slots are this stream's own.
+        unsafe { base.write(std::ptr::dangling_mut::<u8>()) };
+        let (mut base2, mut ptr2, mut count2) = (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(
+            _get_stream_buffer_pointers(f, &mut base2, &mut ptr2, &mut count2),
+            0
+        );
+        assert_eq!((base2, ptr2, count2), (base, ptr, count));
+        // SAFETY: read back through the address the stream handed out.
+        assert_eq!(unsafe { *base2 }, std::ptr::dangling_mut::<u8>());
+
+        // Out pointers may be left out.
+        assert_eq!(
+            _get_stream_buffer_pointers(
+                f,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        // A handle that is not a stream is refused.
+        assert_eq!(
+            _get_stream_buffer_pointers(std::ptr::null_mut(), &mut base, &mut ptr, &mut count),
+            -1
+        );
+        assert_eq!(errno(), EINVAL);
+        assert_eq!(fclose(f), 0);
     }
 
     fn sprintf(fmt: &str, args: &[u64]) -> (i32, String) {

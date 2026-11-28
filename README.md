@@ -101,7 +101,7 @@ The setup script checks Rosetta, the Xcode command line tools, rustup and the Me
 tools/macos/run-native.sh /path/to/your/game/folder
 ```
 
-Point it at the folder that holds `game_scarlett_master.exe`. A window opens; after a few seconds of black while it loads, you should see the boot movie and then the menus, and the full log is saved under `runs/`. The script also presses Enter for you every two seconds until 80 s to get past the start screen. Click the window and the keyboard drives the game's gamepad:
+Point it at the folder that holds `game_scarlett_master.exe`. A folder that is still downloading looks complete, because the downloader preallocates every archive to its full length: the sizes, the headers and the tails are right, and the data between them reads as zeros. Run `tools/macos/check-game-data.sh /path/to/your/game/folder` first and it samples each archive and names the ones that are still holes, which is the difference between a run that says something and one the title ends in its boot shader database. A window opens; after a few seconds of black while it loads, you should see the boot movie and then the menus, and the full log is saved under `runs/`. The script also presses Enter for you every two seconds until 80 s to get past the start screen. Click the window and the keyboard drives the game's gamepad:
 
 | Keys | Pad |
 | --- | --- |

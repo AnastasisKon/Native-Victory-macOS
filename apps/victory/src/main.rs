@@ -4,6 +4,10 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+// `VICTORY_CRASH_SAVE` saves title memory from the fatal-signal handler, which only the
+// native host (x86_64 macOS) runs: elsewhere the module would be dead code.
+#[cfg(all(unix, feature = "diagnostics", target_os = "macos", target_arch = "x86_64"))]
+mod crash_save;
 mod inspect;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod native_run;
@@ -229,6 +233,11 @@ fn log_fatal_signals() {
         hex(&mut line, addr_at, addr, 16);
         // SAFETY: a fixed line on the stack; write is async-signal-safe.
         unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+        // The ranges `VICTORY_CRASH_SAVE` names, before the default action kills the
+        // process: async-signal-safe, as the line was.
+        #[cfg(all(feature = "diagnostics", target_os = "macos", target_arch = "x86_64"))]
+        // SAFETY: the ranges are title memory, named at startup.
+        unsafe { crate::crash_save::write_all() };
         // SAFETY: SA_RESETHAND made SIG_DFL the disposition again; raise terminates.
         unsafe { libc::raise(sig) };
     }

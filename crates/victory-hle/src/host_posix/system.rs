@@ -568,6 +568,71 @@ pub extern "system" fn GlobalFree(memory: *mut c_void) -> *mut c_void {
     LocalFree(memory)
 }
 
+/// `QueueUserWorkItem`: the callback runs on a thread of its own, as the legacy
+/// work queue does. The flags choose which pool would run it, and this host has
+/// the one, so they are not consulted.
+pub extern "system" fn QueueUserWorkItem(callback: usize, context: *mut c_void, _flags: u32) -> i32 {
+    if callback == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // A title pointer is not `Send`, and it is the title's own to pass across
+    // threads: it handed this one to the queue for that.
+    let context = context as usize;
+    std::thread::spawn(move || {
+        // SAFETY: the title's `WORKERCALLBACK` (`PVOID`, `BOOL TimerOrWaitFired`),
+        // which this is not a timer for.
+        unsafe { native::call_win64(callback, &[context as u64, 0]) };
+    });
+    1
+}
+
+/// `InitializeProcThreadAttributeList`: the attributes describe a process this
+/// host does not start, so the call says so instead of leaving a list that
+/// `UpdateProcThreadAttribute` would fill with nothing. It still answers the
+/// size a list would take, which is what a caller asks with a null list.
+pub extern "system" fn InitializeProcThreadAttributeList(
+    list: *mut c_void,
+    count: u32,
+    _flags: u32,
+    size: *mut usize,
+) -> i32 {
+    if size.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if list.is_null() {
+        // The size query. An attribute list is a header and one entry per
+        // attribute; the exact layout is not this host's to promise.
+        // SAFETY: the title's size out-pointer.
+        unsafe { size.write(usize::from(size_of::<u64>()) * (1 + count as usize)) };
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    tracing::warn!("InitializeProcThreadAttributeList: a process is not started here");
+    set_error(ERROR_NOT_SUPPORTED);
+    0
+}
+
+/// `UpdateProcThreadAttribute`: nothing to put an attribute in, so it is refused
+/// with the reason rather than accepted and forgotten.
+pub extern "system" fn UpdateProcThreadAttribute(
+    _list: *mut c_void,
+    _flags: u32,
+    attribute: usize,
+    _value: *const c_void,
+    _size: usize,
+    _previous: *mut c_void,
+    _return_size: *mut usize,
+) -> i32 {
+    tracing::warn!("UpdateProcThreadAttribute: attribute {attribute:#x} is not applied here");
+    set_error(ERROR_NOT_SUPPORTED);
+    0
+}
+
+/// `DeleteProcThreadAttributeList`: there is no list, and nothing to free.
+pub extern "system" fn DeleteProcThreadAttributeList(_list: *mut c_void) {}
+
 /// `GetConsoleWindow`: this host writes to the standard streams, so a console
 /// is here and its window is a handle of its own (as `CreateWindowExA` above
 /// answers for a library's message window). Nothing draws on it.
@@ -3096,6 +3161,10 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             GetConsoleWindow,
             GetConsoleScreenBufferInfo,
             WriteConsoleW,
+            QueueUserWorkItem,
+            InitializeProcThreadAttributeList,
+            UpdateProcThreadAttribute,
+            DeleteProcThreadAttributeList,
             FlushProcessWriteBuffers,
             LocalAlloc,
             lstrlenW,
@@ -4425,5 +4494,130 @@ mod console_tests {
         ] {
             assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
         }
+    }
+}
+
+#[cfg(test)]
+mod work_queue_and_attribute_tests {
+    use super::*;
+
+    /// The queued callback runs, on a thread that is not this one, and receives
+    /// its context.
+    #[test]
+    fn a_queued_work_item_runs_with_its_context() {
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        static GOT: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn work(context: usize, _timer: u32) {
+            GOT.store(context as u64, Ordering::SeqCst);
+            RAN.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let callback = native::host_callbacks(&[(work as *const () as usize, false)]).unwrap()[0];
+        assert_eq!(
+            QueueUserWorkItem(callback, 0x4321 as *mut c_void, 0),
+            1
+        );
+        let waiting = Instant::now();
+        while RAN.load(Ordering::SeqCst) == 0 && waiting.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(RAN.load(Ordering::SeqCst), 1);
+        assert_eq!(GOT.load(Ordering::SeqCst), 0x4321);
+
+        assert_eq!(QueueUserWorkItem(0, std::ptr::null_mut(), 0), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    /// The attribute list is for a process this host does not start: it answers
+    /// how big a list would be and refuses the rest with a reason.
+    #[test]
+    fn the_process_attribute_list_is_refused_with_a_reason() {
+        let mut size = 0usize;
+        assert_eq!(
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut size),
+            0
+        );
+        assert!(size > 0, "the size query wrote nothing");
+        assert_eq!(super::super::GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+
+        let mut list = [0u8; 64];
+        assert_eq!(
+            InitializeProcThreadAttributeList(list.as_mut_ptr().cast(), 2, 0, &mut size),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_NOT_SUPPORTED);
+        assert_eq!(
+            UpdateProcThreadAttribute(
+                list.as_mut_ptr().cast(),
+                0,
+                0x20009, // PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
+                std::ptr::null(),
+                8,
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_NOT_SUPPORTED);
+        DeleteProcThreadAttributeList(list.as_mut_ptr().cast());
+    }
+
+    #[test]
+    fn the_five_calls_are_answered_rather_than_stubbed() {
+        for (dll, name) in [
+            (
+                "api-ms-win-core-threadpool-legacy-l1-1-0.dll",
+                "QueueUserWorkItem",
+            ),
+            (
+                "api-ms-win-core-processthreads-l1-1-0.dll",
+                "CreateRemoteThreadEx",
+            ),
+            (
+                "api-ms-win-core-processthreads-l1-1-0.dll",
+                "InitializeProcThreadAttributeList",
+            ),
+            (
+                "api-ms-win-core-processthreads-l1-1-0.dll",
+                "UpdateProcThreadAttribute",
+            ),
+            (
+                "api-ms-win-core-processthreads-l1-1-0.dll",
+                "DeleteProcThreadAttributeList",
+            ),
+        ] {
+            // The table the loader consults, which knows the names this module
+            // does not answer itself (`CreateRemoteThreadEx` is the handle
+            // table's there, next to `DuplicateHandle`).
+            assert!(
+                super::super::lookup(dll, name).is_some(),
+                "{dll}!{name} is not answered"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod create_remote_thread_tests {
+    use super::*;
+
+    /// A thread of another process is not this process's to start.
+    #[test]
+    fn a_thread_in_another_process_is_refused() {
+        let mut id = 0u32;
+        assert!(
+            super::super::CreateRemoteThreadEx(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                &mut id
+            )
+            .is_null()
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
     }
 }

@@ -922,7 +922,7 @@ fn a_lane_mask_join_read_as_data_answers_per_wave_in_the_paired_form() {
     ];
     w.push(S_ENDPGM);
     // The fast path refuses it for the join, which is what #524 is about.
-    let why = refusal_of(&w, 128).expect("the fast path takes it, so this is not the shape");
+    let why = default_refusal(&w).expect("the fast path takes it, so this is not the shape");
     assert!(why.contains("a lane-mask join"), "{why}");
     let got = run_group(&w, 0, 128, 128);
     assert_eq!(got.len(), 128);
@@ -1891,7 +1891,7 @@ fn a_lane_holding_half_a_wave_maximum_is_refused() {
 #[test]
 fn a_wave_maximum_read_at_lane_0_answers_the_wave_in_the_paired_form() {
     let w = max_read_at_lane(0);
-    let why = refusal(&w).expect("the fast path takes it, so this is not the shape");
+    let why = default_refusal(&w).expect("the fast path takes it, so this is not the shape");
     assert!(why.contains("no reduction or prefix"), "{why}");
     let got = run_group(&w, 0, 128, 128);
     assert_eq!(got.len(), 128);
@@ -2223,6 +2223,18 @@ fn a_lane_read_in_a_group_of_four_waves_reads_each_waves_own_lane() {
     }
     assert_eq!(got[192..200], [1227; 8], "wave 3: its lane 35 (thread 227, off)");
     assert_eq!(got[200..], [CANARY; 56]);
+}
+
+/// What the default translation - both switches off, whatever the environment says - refuses `words`
+/// for in a wave64 group of 128 threads. A test that goes on to translate with a switch on names its
+/// precondition this way, so it still holds when the run sets the switch.
+fn default_refusal(words: &[u32]) -> Option<String> {
+    let options = victory_shader::emit::Options {
+        paired_waves: false,
+        strict_vccz_branch: false,
+        ..shaders::options()
+    };
+    try_translate_wave(words, 5, 0, 128, true, options).err().map(|e| e.to_string())
 }
 
 /// What the fast path refuses `words` for in a wave64 group of `threads`.
@@ -2584,7 +2596,7 @@ fn a_vote_used_as_a_branch_follows_each_console_wave_in_the_paired_form() {
     w.extend(GLOBAL_STORE_V2_AT_V1);
     w.push(S_ENDPGM);
     // The fast path refuses it (`DIVERGENT_EXCHANGE`): that is what #527 is about.
-    assert!(refusal(&w).is_some(), "the fast path takes it, so this is not the shape");
+    assert!(default_refusal(&w).is_some(), "the fast path takes it, so this is not the shape");
     let got = run_group(&w, 0, 128, 128);
     assert_eq!(got.len(), 128);
     // `s_bcnt1` leaves SCC set when the count is zero: wave 0's is 64, so SCC is clear, its

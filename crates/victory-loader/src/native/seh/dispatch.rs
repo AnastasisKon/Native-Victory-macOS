@@ -404,15 +404,25 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                 for rva in list.split(',').filter_map(|v| usize::from_str_radix(v.trim(), 16).ok()) {
                     // Beyond the image: an absolute address.
                     let at = if rva > 0x1000_0000 { rva } else { base + rva };
-                    let v = (at as *const u64).read_unaligned();
-                    tracing::warn!("peek {at:#x} = {v:#x}");
+                    // An address written down by hand can name nothing, and a fault taken here
+                    // would be a second one inside this dispatch, not the one being reported.
+                    match super::super::dump::read_checked(at) {
+                        Some(v) => tracing::warn!("peek {at:#x} = {v:#x}"),
+                        None => tracing::warn!("peek {at:#x} = not mapped"),
+                    }
                 }
-                // The qwords rcx points at, when it looks like a pointer.
+                // The qwords rcx points at, when it holds an address something answers: a
+                // register is not a pointer for being large (`0xfffffffd` is not), and reading
+                // through one that names nothing faulted inside the dispatch that reports the
+                // title's faults.
                 if (0x10000..0x7fff_ffff_0000).contains(&c.gpr[1]) {
-                    let words: Vec<u64> = (0..8)
-                        .map(|i| ((c.gpr[1] + 8 * i) as *const u64).read_unaligned())
+                    let words: Vec<String> = (0..8)
+                        .map(|i| {
+                            super::super::dump::read_checked((c.gpr[1] + 8 * i) as usize)
+                                .map_or("-".into(), |x| format!("{x:x}"))
+                        })
                         .collect();
-                    tracing::warn!("[rcx] {words:x?}");
+                    tracing::warn!("[rcx] {}", words.join(" "));
                 }
                 let chain: Vec<usize> = backtrace(*c, stack_bounds())
                     .into_iter()

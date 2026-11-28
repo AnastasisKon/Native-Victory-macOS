@@ -19,6 +19,8 @@ struct Save {
     len: usize,
 }
 
+/// The ranges to save, made at startup. Read without a lock (`OnceLock::get` is an atomic
+/// load), since the handler it serves may not wait for anything.
 static SAVES: std::sync::OnceLock<Vec<Save>> = std::sync::OnceLock::new();
 
 /// Reads `VICTORY_CRASH_SAVE` and keeps what it names, bounded by the title
@@ -36,7 +38,7 @@ pub fn configure(base: usize, size: usize, cache_dir: &Path) {
 
 /// [`configure`]'s work, on a list it is given, so that a test can name memory
 /// of its own instead of the title's.
-fn set(base: usize, size: usize, cache_dir: &Path, value: &str) {
+pub(crate) fn set(base: usize, size: usize, cache_dir: &Path, value: &str) {
     let saves = parse(value, size)
         .into_iter()
         .filter_map(|(rva, len)| {

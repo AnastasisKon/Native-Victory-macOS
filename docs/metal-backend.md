@@ -605,6 +605,16 @@ the tests stay `cfg(windows)`), `descriptor.rs` (`record` and `increment` are `p
   - `host`: queues, fences, pipelines, heaps, textures; `execute(queue, lists, waits, signals)`
     resolves every address, groups commands into compute / blit / render passes and calls
     `submit_passes`. It never waits; completion is a fence value.
+- **Running the tests on a Mac you need**: the GPU tests of this crate make their own devices and command
+  queues, and a test binary runs them on a thread pool. Ten threads reached a high water mark of 80 command
+  queues within half a second on a 16 GB M1 Pro, after which the GPU stopped answering, WindowServer's submit
+  thread blocked behind it and the Mac panicked on the watchdog ([#548](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/548)).
+  The same tests one at a time pass, so use `cargo test -p victory-gpu -- --test-threads=1` on a machine you are
+  working on. A gate in the library does not work: a thread that claims the GPU when it makes its first `Metal`
+  and holds it until the thread ends deadlocks the tests that make one on a thread they then join (tried; the
+  `victory-metal` test binary hung). What would work is a lock taken by each GPU test body -- there are about a
+  hundred of them across `native/*_tests.rs` -- or a permit carried by the `Host`/`Title` a test makes, with room
+  for the tests that make more than one.
 - **Tests** (`cargo test -p victory-gpu`, macOS arm64, skipped without the Metal Shader Converter): a
   list recorded as a title would record it, title memory shown at an alias address of the pool, run
   through `NativeHost`, results read back through the title's alias:

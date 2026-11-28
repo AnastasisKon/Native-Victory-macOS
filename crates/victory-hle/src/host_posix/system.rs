@@ -229,46 +229,93 @@ pub extern "system" fn CompareStringEx(
 
 const CT_CTYPE1: u32 = 1;
 
-pub extern "system" fn GetStringTypeW(kind: u32, src: *const u16, len: i32, out: *mut u16) -> i32 {
+/// The `CT_CTYPE1` categories of one character (`winnls.h`).
+fn ctype1(character: u16) -> u16 {
+    const UPPER: u16 = 0x0001;
+    const LOWER: u16 = 0x0002;
+    const DIGIT: u16 = 0x0004;
+    const SPACE: u16 = 0x0008;
+    const PUNCT: u16 = 0x0010;
+    const CNTRL: u16 = 0x0020;
+    const BLANK: u16 = 0x0040;
+    const XDIGIT: u16 = 0x0080;
+    const ALPHA: u16 = 0x0100;
+    const DEFINED: u16 = 0x0200;
+    let Some(c) = char::from_u32(u32::from(character)) else {
+        // A lone surrogate: not a character, so nothing is true of it.
+        return 0;
+    };
+    // A digit is a digit in any script: `C1_DIGIT` is not ASCII-only here, and a
+    // numeric character is never punctuation.
+    let (alpha, digit) = (c.is_alphabetic(), c.is_numeric());
+    let (space, control) = (c.is_whitespace(), c.is_control());
+    let mut flags = DEFINED;
+    if alpha {
+        flags |= ALPHA;
+    }
+    if c.is_uppercase() {
+        flags |= UPPER;
+    }
+    if c.is_lowercase() {
+        flags |= LOWER;
+    }
+    if digit {
+        flags |= DIGIT;
+    }
+    if space {
+        flags |= SPACE;
+    }
+    if control {
+        flags |= CNTRL;
+    }
+    if c == ' ' || c == '\t' {
+        flags |= BLANK;
+    }
+    if c.is_ascii_hexdigit() {
+        flags |= XDIGIT;
+    }
+
+    // `ispunct` is a graphical character that is neither a letter, a digit nor a
+    // space - which is what makes an apostrophe one and a non-breaking space
+    // none.
+    if !alpha && !digit && !space && !control {
+        flags |= PUNCT;
+    }
+    flags
+}
+
+fn get_string_type(kind: u32, src: *const u16, len: i32, out: *mut u16) -> i32 {
     if kind != CT_CTYPE1 || src.is_null() || out.is_null() {
+        if kind != CT_CTYPE1 {
+            // The bidirectional and width-and-kana tables are not answered here;
+            // saying so beats answering zero for every character.
+            tracing::warn!("GetStringType: CT_CTYPE{kind} is not answered");
+        }
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
     // SAFETY: see above.
     for (i, &unit) in unsafe { units(src, len) }.iter().enumerate() {
-        let c = char::from_u32(u32::from(unit)).unwrap_or('\0');
-        let mut t = 0u16;
-        if c.is_uppercase() {
-            t |= 1;
-        }
-        if c.is_lowercase() {
-            t |= 2;
-        }
-        if c.is_ascii_digit() {
-            t |= 4;
-        }
-        if c.is_whitespace() {
-            t |= 8;
-        }
-        if c.is_ascii_punctuation() {
-            t |= 0x10;
-        }
-        if c.is_control() {
-            t |= 0x20;
-        }
-        if c == ' ' || c == '\t' {
-            t |= 0x40;
-        }
-        if c.is_ascii_hexdigit() {
-            t |= 0x80;
-        }
-        if c.is_alphabetic() {
-            t |= 0x100;
-        }
         // SAFETY: the title's output array has one word per unit.
-        unsafe { out.add(i).write(t) };
+        unsafe { out.add(i).write(ctype1(unit)) }
     }
     1
+}
+
+pub extern "system" fn GetStringTypeW(kind: u32, src: *const u16, len: i32, out: *mut u16) -> i32 {
+    get_string_type(kind, src, len, out)
+}
+
+/// The same question, asked with a locale: this host's is the one its
+/// classification already uses.
+pub extern "system" fn GetStringTypeExW(
+    _locale: u32,
+    kind: u32,
+    src: *const u16,
+    len: i32,
+    out: *mut u16,
+) -> i32 {
+    get_string_type(kind, src, len, out)
 }
 
 pub extern "system" fn GetCPInfo(code_page: u32, info: *mut u8) -> i32 {
@@ -3269,6 +3316,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             lstrcmpW,
             CompareStringEx,
             GetStringTypeW,
+            GetStringTypeExW,
             GetCPInfo,
             LCMapStringEx,
             GetUserDefaultLocaleName,
@@ -4875,5 +4923,101 @@ mod logical_processor_tests {
             )
             .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod string_type_tests {
+    use super::*;
+
+    /// The categories of `winnls.h`, which is what `ispunct`, `isdigit` and
+    /// their neighbours ask about through this call.
+    const UPPER: u16 = 0x0001;
+    const LOWER: u16 = 0x0002;
+    const DIGIT: u16 = 0x0004;
+    const SPACE: u16 = 0x0008;
+    const PUNCT: u16 = 0x0010;
+    const CNTRL: u16 = 0x0020;
+    const BLANK: u16 = 0x0040;
+    const XDIGIT: u16 = 0x0080;
+    const ALPHA: u16 = 0x0100;
+    const DEFINED: u16 = 0x0200;
+
+    fn kinds_of(text: &str) -> Vec<u16> {
+        let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        let mut out = vec![0u16; text.encode_utf16().count()];
+        assert_eq!(
+            GetStringTypeW(1, wide.as_ptr(), -1, out.as_mut_ptr()),
+            1,
+            "{text}"
+        );
+        out
+    }
+
+    /// A letter in each case, a digit, a blank, punctuation, a control and the
+    /// characters that are all of those at once (a hex digit is a digit).
+    #[test]
+    fn the_categories_are_what_the_characters_are() {
+        // `A` is a hex digit as well as a capital letter.
+        assert_eq!(kinds_of("A")[0], UPPER | ALPHA | XDIGIT | DEFINED);
+        // And `a` is a hex digit too, which the lower-case letters `b`..`z` after
+        // `f` are not.
+        assert_eq!(kinds_of("a")[0], LOWER | ALPHA | XDIGIT | DEFINED);
+        assert_eq!(kinds_of("7")[0], DIGIT | XDIGIT | DEFINED);
+        assert_eq!(kinds_of("f")[0], LOWER | ALPHA | XDIGIT | DEFINED);
+        assert_eq!(kinds_of(" ") [0], SPACE | BLANK | DEFINED);
+        assert_eq!(kinds_of("\t")[0], SPACE | BLANK | CNTRL | DEFINED);
+        assert_eq!(kinds_of("\n")[0], SPACE | CNTRL | DEFINED);
+        assert_eq!(kinds_of("'")[0], PUNCT | DEFINED);
+        assert_eq!(kinds_of(".")[0], PUNCT | DEFINED);
+        // A non-ASCII punctuation is still punctuation, which an ASCII-only test
+        // would miss.
+        assert_eq!(kinds_of("\u{ab}")[0], PUNCT | DEFINED);
+        // An accented letter is a letter, and a lower-case one.
+        assert_eq!(kinds_of("\u{e9}")[0], LOWER | ALPHA | DEFINED);
+        assert_eq!(kinds_of("\u{c9}")[0], UPPER | ALPHA | DEFINED);
+        // `g` is a letter and not a hex digit, which is where the hex letters
+        // stop.
+        assert_eq!(kinds_of("g")[0], LOWER | ALPHA | DEFINED);
+        // A digit outside ASCII is a digit, not punctuation.
+        assert_eq!(kinds_of("\u{660}")[0], DIGIT | DEFINED);
+        // A non-breaking space is a space, not a blank.
+        assert_eq!(kinds_of("\u{a0}")[0], SPACE | DEFINED);
+    }
+
+    /// A count is honoured, and a negative one means the string's own end.
+    #[test]
+    fn the_count_decides_how_much_is_classified() {
+        let wide: Vec<u16> = "a1bc".encode_utf16().collect();
+        let mut out = [0u16; 2];
+        assert_eq!(GetStringTypeExW(0x400, 1, wide.as_ptr(), 2, out.as_mut_ptr()), 1);
+        assert_eq!(out, [LOWER | ALPHA | XDIGIT | DEFINED, DIGIT | XDIGIT | DEFINED]);
+
+        // A NUL-terminated call stops at the terminator, and the call takes the
+        // locale as its first word.
+        let mut all = [0u16; 4];
+        assert_eq!(
+            GetStringTypeExW(0x400, 1, wide.as_ptr(), -1, all.as_mut_ptr()),
+            1
+        );
+        assert_eq!(all[2], LOWER | ALPHA | XDIGIT | DEFINED, "`b` is a hex digit");
+
+        // The tables this host does not answer are refused, and a null pointer
+        // with them.
+        for kind in [2, 3, 0] {
+            assert_eq!(GetStringTypeW(kind, wide.as_ptr(), 1, all.as_mut_ptr()), 0);
+            assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        }
+        assert_eq!(
+            GetStringTypeW(1, std::ptr::null(), 1, all.as_mut_ptr()),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn the_two_names_are_answered_rather_than_stubbed() {
+        assert!(lookup("api-ms-win-core-string-l1-1-0.dll", "GetStringTypeExW").is_some());
+        assert!(lookup("api-ms-win-core-string-l1-1-0.dll", "GetStringTypeW").is_some());
     }
 }

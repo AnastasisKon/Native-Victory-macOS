@@ -39,6 +39,19 @@ mod winsock;
 mod wasapi;
 mod xaudio2;
 
+/// The turn of whichever test is driving Winsock.
+///
+/// The startup count is the process's, and so are the ephemeral ports the
+/// tests bind and release: a test elsewhere that reaches these calls by name
+/// (`host!("ws2_32.dll", ...)`, as `modules::net`'s does) takes the same turn,
+/// so no run can start the stack up, or take a port, inside another's
+/// assertions about either.
+#[cfg(test)]
+pub(crate) fn winsock_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 0x102;
 const WAIT_FAILED: u32 = 0xFFFF_FFFF;

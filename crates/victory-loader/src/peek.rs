@@ -26,9 +26,15 @@ fn register_index(name: &str) -> Option<usize> {
 #[cfg_attr(not(all(target_os = "macos", target_arch = "x86_64")), allow(dead_code))]
 pub(crate) fn address(entry: &str, gpr: &[u64; 16], base: Option<usize>) -> Option<usize> {
     let entry = entry.trim();
-    if let Some((reg, offset)) = entry.split_once('+') {
+    if let Some((reg, terms)) = entry.split_once('+') {
         let index = register_index(reg)?;
-        let offset = usize::from_str_radix(offset.trim().trim_start_matches("0x"), 16).ok()?;
+        // Terms are summed, so `rsi+0x10020+0x38` names a field two steps into the object a writer
+        // keeps: an entry the single-term form accepted as nothing and skipped without a word.
+        let mut offset = 0usize;
+        for term in terms.split('+') {
+            let term = usize::from_str_radix(term.trim().trim_start_matches("0x"), 16).ok()?;
+            offset = offset.checked_add(term)?;
+        }
         return (gpr[index] as usize).checked_add(offset);
     }
     let at = usize::from_str_radix(entry.trim_start_matches("0x"), 16).ok()?;
@@ -66,5 +72,22 @@ mod tests {
         gpr[6] = u64::MAX;
         assert_eq!(address("rsi+1", &gpr, None), None);
         assert_eq!(address("nonsense", &gpr, None), None);
+    }
+
+    /// Offsets add up: an entry names a field of the object a register points into, and two terms
+    /// name a field of a field without a second run to read the first address.
+    #[test]
+    fn peek_entries_add_their_offsets() {
+        let mut gpr = [0u64; 16];
+        gpr[6] = 0x7f_0000_0000; // rsi
+        assert_eq!(
+            address("rsi+0x10020+0x38", &gpr, None),
+            Some(0x7f_0001_0058)
+        );
+        assert_eq!(address("rsi+10020+38", &gpr, None), Some(0x7f_0001_0058));
+        // A term that is no hex, and one that carries the sum past the address space, name nothing.
+        assert_eq!(address("rsi+0x10020+nope", &gpr, None), None);
+        gpr[6] = u64::MAX - 1;
+        assert_eq!(address("rsi+1+1", &gpr, None), None);
     }
 }

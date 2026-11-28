@@ -57,6 +57,10 @@ IMPORT u32 FlsAlloc(ptr);
 IMPORT int FlsSetValue(u32, ptr);
 IMPORT ptr FlsGetValue(u32);
 IMPORT int FlsFree(u32);
+IMPORT ptr CreateThreadpoolWork(ptr, ptr, ptr);
+IMPORT void SubmitThreadpoolWork(ptr);
+IMPORT void WaitForThreadpoolWorkCallbacks(ptr, int);
+IMPORT void CloseThreadpoolWork(ptr);
 IMPORT u32 WaitForMultipleObjects(u32, const ptr *, int, u32);
 IMPORT int SwitchToThread(void);
 IMPORT void InitializeCriticalSection(ptr);
@@ -553,6 +557,7 @@ enum {
     T_EXIT_THREAD = 1u << 19,
     T_FLS_DESTRUCTOR = 1u << 20,
     T_FLS_FREE_DESTRUCTOR = 1u << 21,
+    T_THREADPOOL_WORK = 1u << 22,
 };
 
 static volatile u32 ran_flag, spin_stop;
@@ -603,6 +608,20 @@ static u32 fls_worker(ptr param)
 {
     FlsSetValue((u32)(u64)param, (ptr)0x5A5A);
     return 0;
+}
+
+/* Threadpool work: the host's pool runs it, and the stack it runs on is a title thread's
+ * (TEB StackBase at gs:[8], StackLimit at gs:[0x10]). */
+static volatile u32 tp_ran, tp_small_stack;
+
+static void tp_callback(ptr instance, ptr context, ptr work)
+{
+    (void)instance;
+    (void)context;
+    (void)work;
+    tp_ran++;
+    if (read_gs(8) - read_gs(0x10) < (8u << 20))
+        tp_small_stack = 1;
 }
 
 /* A CONTEXT is 0x4D0 bytes, 16-aligned. */
@@ -699,6 +718,18 @@ u32 probe_threads(ptr unused)
         fls_destroyed = 0;
         if (FlsSetValue(fls, (ptr)0x1234) && (FlsFree(fls) == 1) && fls_destroyed == 0x1234)
             ok |= T_FLS_FREE_DESTRUCTOR;
+    }
+
+    /* Submitted work runs on the host's pool, on a stack a title thread would have. */
+    tp_ran = 0;
+    tp_small_stack = 0;
+    ptr work = CreateThreadpoolWork((ptr)tp_callback, 0, 0);
+    if (work) {
+        SubmitThreadpoolWork(work);
+        WaitForThreadpoolWorkCallbacks(work, 0);
+        CloseThreadpoolWork(work);
+        if (tp_ran == 1 && !tp_small_stack)
+            ok |= T_THREADPOOL_WORK;
     }
 
     CloseHandle(done);

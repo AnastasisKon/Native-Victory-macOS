@@ -876,6 +876,257 @@ pub extern "system" fn LoadResource(module: *mut c_void, resource: *mut c_void) 
     }
 }
 
+/// `SizeofResource`: the bytes a resource's data entry gives, which is what a title
+/// allocates before `LoadResource`ing it.
+pub extern "system" fn SizeofResource(module: *mut c_void, resource: *mut c_void) -> u32 {
+    if resource.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if resource_base(module) == 0 {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    // SAFETY: `resource` is a data entry of a mapped image: rva at 0, size at 4.
+    unsafe { resource.cast::<u8>().add(4).cast::<u32>().read_unaligned() }
+}
+
+/// `LockResource`: the bytes, which are already in the mapped image - and
+/// [`LoadResource`] hands out that address too, so the two agree.
+pub extern "system" fn LockResource(resource: *mut c_void) -> *mut c_void {
+    if resource.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    resource
+}
+
+/// `FindResourceW`: the same walk as [`FindResourceExW`] with any language, which is
+/// how a title asks for its own version resource.
+pub extern "system" fn FindResourceW(module: *mut c_void, kind: usize, name: usize) -> *mut c_void {
+    FindResourceExW(module, kind, name, 0)
+}
+
+/// `RT_VERSION` and the one name it has: what `version.dll` reads.
+const RT_VERSION: usize = 16;
+const VS_VERSION_INFO_NAME: usize = 1;
+const VS_FIXEDFILEINFO_BYTES: u32 = 52;
+
+/// The version resource of the image at `base`, and its length.
+fn version_resource(base: usize) -> Option<(usize, u32)> {
+    if base == 0 {
+        return None;
+    }
+    let entry = FindResourceExW(base as *mut c_void, RT_VERSION, VS_VERSION_INFO_NAME, 0);
+    if entry.is_null() {
+        return None;
+    }
+    let size = SizeofResource(base as *mut c_void, entry);
+    let data = LoadResource(base as *mut c_void, entry);
+    (!data.is_null() && size >= 6).then_some((data as usize, size))
+}
+
+/// The base of the image `path` names, which is how `version.dll`'s calls address a
+/// file: only an image this host has mapped is answered, since the resource tree is
+/// read out of the mapped image rather than off disk.
+fn version_base(path: *const u16) -> Option<usize> {
+    let path = files::wide_path(path)?;
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    crate::runtime::image_named(&name)
+}
+
+/// `GetFileVersionInfoSizeW`: the bytes `GetFileVersionInfoW` would fill.
+pub extern "system" fn GetFileVersionInfoSizeW(path: *const u16, handle: *mut u32) -> u32 {
+    let Some((_, size)) = version_base(path).and_then(version_resource) else {
+        set_error(ERROR_FILE_NOT_FOUND);
+        return 0;
+    };
+    if !handle.is_null() {
+        // SAFETY: the title's out word. Windows writes the zero it returns here.
+        unsafe { handle.write(0) };
+    }
+    size
+}
+
+/// `GetFileVersionInfoW`: the version resource's bytes, copied into the title's block,
+/// which is what `VerQueryValueW` then looks inside.
+pub extern "system" fn GetFileVersionInfoW(
+    path: *const u16,
+    _handle: u32,
+    len: u32,
+    data: *mut c_void,
+) -> i32 {
+    if data.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some((source, size)) = version_base(path).and_then(version_resource) else {
+        set_error(ERROR_FILE_NOT_FOUND);
+        return 0;
+    };
+    let len = (len as usize).min(size as usize);
+    // SAFETY: the source is `size` bytes of the mapped image, and the title passes a
+    // block of `len`.
+    unsafe { std::ptr::copy_nonoverlapping(source as *const u8, data.cast::<u8>(), len) };
+    1
+}
+
+/// One block of a `VS_VERSIONINFO`: its own header, key and value.
+struct VersionBlock {
+    /// Its whole length (`wLength`), header included.
+    len: usize,
+    /// Where its value starts.
+    value: usize,
+    /// `wValueLength`: bytes for a binary value, characters for a string.
+    value_len: usize,
+    kind: u16,
+    key: String,
+}
+
+impl VersionBlock {
+    /// How many bytes the value takes.
+    fn value_bytes(&self) -> usize {
+        if self.kind == 1 {
+            self.value_len * 2
+        } else {
+            self.value_len
+        }
+    }
+}
+
+/// Reads the block at `at`: `wLength`, `wValueLength`, `wType`, the key, then the
+/// value on the next four-byte boundary.
+fn read_version_block(bytes: &[u8], at: usize) -> Option<VersionBlock> {
+    if at + 6 > bytes.len() {
+        return None;
+    }
+    let len = usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+    let value_len = usize::from(u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]));
+    let kind = u16::from_le_bytes([bytes[at + 4], bytes[at + 5]]);
+    if len < 6 || at + len > bytes.len() {
+        return None;
+    }
+    let mut key = String::new();
+    let mut p = at + 6;
+    loop {
+        if p + 2 > at + len {
+            return None;
+        }
+        let unit = u16::from_le_bytes([bytes[p], bytes[p + 1]]);
+        p += 2;
+        if unit == 0 {
+            break;
+        }
+        key.push(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}'));
+    }
+    while p % 4 != 0 {
+        p += 1;
+    }
+    Some(VersionBlock {
+        len,
+        value: p,
+        value_len,
+        kind,
+        key,
+    })
+}
+
+/// The blocks inside `parent`, in order.
+fn version_children(bytes: &[u8], parent: &VersionBlock) -> Vec<VersionBlock> {
+    let mut children = Vec::new();
+    let mut at = parent.value + parent.value_bytes();
+    while at % 4 != 0 {
+        at += 1;
+    }
+    while at + 6 <= parent.value + parent.value_bytes().max(parent.len) && at < bytes.len() {
+        let Some(block) = read_version_block(bytes, at) else {
+            break;
+        };
+        if block.len == 0 {
+            break;
+        }
+        at += block.len;
+        children.push(block);
+        while at % 4 != 0 {
+            at += 1;
+        }
+    }
+    children
+}
+
+/// `VerQueryValueW`: a value inside the block `GetFileVersionInfoW` filled - the fixed
+/// file info, the translations, or one string of one string table. A string's length
+/// comes back in characters, a binary value's in bytes, as Windows reports them.
+pub extern "system" fn VerQueryValueW(
+    block: *const c_void,
+    sub: *const u16,
+    out: *mut *mut c_void,
+    len: *mut u32,
+) -> i32 {
+    if block.is_null() || sub.is_null() || out.is_null() || len.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: the block's own `wLength` bounds it, and the title filled it.
+    let total = unsafe {
+        let root = block.cast::<u8>();
+        usize::from(u16::from_le_bytes([root.read(), root.add(1).read()]))
+    };
+    if total < 6 {
+        return 0;
+    }
+    // SAFETY: `total` bytes of the title's block.
+    let bytes = unsafe { std::slice::from_raw_parts(block.cast::<u8>(), total) };
+    let Some(root) = read_version_block(bytes, 0) else {
+        return 0;
+    };
+    let mut want = String::new();
+    // SAFETY: the title's NUL-terminated sub-block path.
+    unsafe {
+        let mut p = sub;
+        while *p != 0 {
+            want.push(char::from_u32(u32::from(*p)).unwrap_or('\u{FFFD}'));
+            p = p.add(1);
+        }
+    }
+    let parts: Vec<&str> = want.split('\\').filter(|p| !p.is_empty()).collect();
+    let found: Option<(usize, u32)> = match parts.as_slice() {
+        [] => Some((root.value, VS_FIXEDFILEINFO_BYTES)),
+        ["VarFileInfo", "Translation"] => version_children(bytes, &root)
+            .iter()
+            .find(|b| b.key.eq_ignore_ascii_case("VarFileInfo"))
+            .and_then(|var| {
+                let children = version_children(bytes, var);
+                let translation = children
+                    .iter()
+                    .find(|b| b.key.eq_ignore_ascii_case("Translation"))?;
+                Some((translation.value, translation.value_len as u32))
+            }),
+        ["StringFileInfo", table, key] => version_children(bytes, &root)
+            .iter()
+            .find(|b| b.key.eq_ignore_ascii_case("StringFileInfo"))
+            .and_then(|info| {
+                let tables = version_children(bytes, info);
+                let table = tables
+                    .iter()
+                    .find(|b| b.key.eq_ignore_ascii_case(table))?;
+                let entries = version_children(bytes, table);
+                let entry = entries.iter().find(|b| b.key.eq_ignore_ascii_case(key))?;
+                Some((entry.value, entry.value_len as u32))
+            }),
+        _ => None,
+    };
+    let Some((offset, length)) = found else {
+        return 0;
+    };
+    // SAFETY: both out-pointers are the title's, and the value is inside the block.
+    unsafe {
+        out.write(block.cast::<u8>().add(offset).cast_mut().cast());
+        len.write(length);
+    }
+    1
+}
+
 /// `GetConsoleWindow`: this host writes to the standard streams, so a console
 /// is here and its window is a handle of its own (as `CreateWindowExA` above
 /// answers for a library's message window). Nothing draws on it.
@@ -1174,6 +1425,224 @@ pub extern "system" fn GetSystemTimeAsFileTime(out: *mut u64) {
 
 pub extern "system" fn GetSystemTimePreciseAsFileTime(out: *mut u64) {
     GetSystemTimeAsFileTime(out);
+}
+
+// What the title thinks it is running on: the OS version, and the machine's facts.
+
+/// The Windows version reported: the console's own build family, which is what a
+/// title gates its features on. shortcut: the console reports its own build; this is
+/// the Windows 10 2004 build the GDK's own headers target, and no title here has
+/// asked for a build number this host could answer more truthfully.
+const WINDOWS_MAJOR: u32 = 10;
+const WINDOWS_MINOR: u32 = 0;
+const WINDOWS_BUILD: u32 = 19041;
+const VER_PLATFORM_WIN32_NT: u32 = 2;
+const VER_NT_WORKSTATION: u8 = 1;
+
+/// `OSVERSIONINFOEXW`'s size, which is what a title passes for it.
+const VERSION_INFO_EX: u32 = 156;
+
+/// Fills an `OSVERSIONINFOEXW` (or the shorter `OSVERSIONINFOW`, by the size the
+/// caller wrote) with the version this host reports.
+fn fill_version_info(info: *mut u8) {
+    if info.is_null() {
+        return;
+    }
+    // SAFETY: the title's structure, whose size is its first word.
+    unsafe {
+        let size = info.cast::<u32>().read();
+        info.add(4).cast::<u32>().write(WINDOWS_MAJOR);
+        info.add(8).cast::<u32>().write(WINDOWS_MINOR);
+        info.add(12).cast::<u32>().write(WINDOWS_BUILD);
+        info.add(16).cast::<u32>().write(VER_PLATFORM_WIN32_NT);
+        // szCSDVersion: no service pack.
+        std::ptr::write_bytes(info.add(20), 0, 128);
+        if size >= VERSION_INFO_EX {
+            info.add(148).cast::<u16>().write(0); // wServicePackMajor
+            info.add(150).cast::<u16>().write(0); // wServicePackMinor
+            info.add(152).cast::<u16>().write(0); // wSuiteMask
+            info.add(154).write(VER_NT_WORKSTATION);
+            info.add(155).write(0);
+        }
+    }
+}
+
+/// `RtlGetVersion`: the version, and `STATUS_SUCCESS` even when the caller's size
+/// would make `GetVersionExW` fail.
+pub extern "system" fn RtlGetVersion(info: *mut u8) -> i32 {
+    fill_version_info(info);
+    0
+}
+
+pub extern "system" fn GetVersionExW(info: *mut u8) -> i32 {
+    if info.is_null() {
+        return 0;
+    }
+    // SAFETY: the title's structure, whose size is its first word.
+    let size = unsafe { info.cast::<u32>().read() };
+    if size != 156 && size != 148 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    fill_version_info(info);
+    1
+}
+
+/// The `VER_*` bits `VerifyVersionInfoW` compares, in the low byte of its type mask.
+const VER_MINORVERSION: u8 = 0x1;
+const VER_MAJORVERSION: u8 = 0x2;
+const VER_BUILDNUMBER: u8 = 0x4;
+const VER_PLATFORMID: u8 = 0x8;
+const VER_SERVICEPACKMINOR: u8 = 0x10;
+const VER_SERVICEPACKMAJOR: u8 = 0x20;
+const VER_SUITENAME: u8 = 0x40;
+const VER_PRODUCT_TYPE: u8 = 0x80;
+
+/// The `VER_*` operator in the high byte of the type mask.
+const VER_EQUAL: u8 = 1;
+const VER_GREATER: u8 = 2;
+const VER_GREATER_EQUAL: u8 = 3;
+const VER_LESS: u8 = 4;
+const VER_LESS_EQUAL: u8 = 5;
+const VER_AND: u8 = 6;
+const VER_OR: u8 = 7;
+
+const ERROR_OLD_WIN_VERSION: u32 = 1150;
+
+/// `VerifyVersionInfoW`: whether this host's version satisfies the condition, which
+/// is how a title decides between its Windows 7 and Windows 10 paths without a
+/// manifest. The operator is the high byte of `type_mask`, the fields the low byte.
+pub extern "system" fn VerifyVersionInfoW(
+    condition: *const u8,
+    type_mask: u32,
+    _lparam: usize,
+) -> i32 {
+    if condition.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: the title's CONDITION_VECTOR, 16 bytes: the words it names are read
+    // below, and it wrote the ones its mask selected.
+    let condition = unsafe { std::slice::from_raw_parts(condition, 16) };
+    let word = |at: usize| u16_from(condition, at);
+    let operator = ((type_mask >> 8) & 0xFF) as u8;
+    let compare = |wanted: u16, actual: u32| -> bool {
+        let wanted = u32::from(wanted);
+        match operator {
+            VER_EQUAL => actual == wanted,
+            VER_GREATER => actual > wanted,
+            VER_GREATER_EQUAL => actual >= wanted,
+            VER_LESS => actual < wanted,
+            VER_LESS_EQUAL => actual <= wanted,
+            VER_AND => actual & wanted == wanted,
+            VER_OR => actual & wanted != 0,
+            _ => false,
+        }
+    };
+    let mask = type_mask as u8;
+    let mut satisfied = true;
+    if mask & VER_MAJORVERSION != 0 {
+        satisfied &= compare(word(0), WINDOWS_MAJOR);
+    }
+    if mask & VER_MINORVERSION != 0 {
+        satisfied &= compare(word(2), WINDOWS_MINOR);
+    }
+    if mask & VER_BUILDNUMBER != 0 {
+        satisfied &= compare(word(4), WINDOWS_BUILD);
+    }
+    if mask & VER_PLATFORMID != 0 {
+        satisfied &= compare(word(6), VER_PLATFORM_WIN32_NT);
+    }
+    if mask & VER_SERVICEPACKMAJOR != 0 {
+        satisfied &= compare(word(10), 0);
+    }
+    if mask & VER_SERVICEPACKMINOR != 0 {
+        satisfied &= compare(word(8), 0);
+    }
+    if mask & VER_SUITENAME != 0 {
+        satisfied &= compare(word(12), 0);
+    }
+    if mask & VER_PRODUCT_TYPE != 0 {
+        satisfied &= compare(word(14), u32::from(VER_NT_WORKSTATION));
+    }
+    if satisfied {
+        return 1;
+    }
+    set_error(ERROR_OLD_WIN_VERSION);
+    0
+}
+
+fn u16_from(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
+/// `QueryUnbiasedInterruptTime`: 100 ns units since boot, which this host's own
+/// counter already is.
+pub extern "system" fn QueryUnbiasedInterruptTime(out: *mut u64) -> i32 {
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: the title's out word.
+    unsafe { out.write(clock::counter() / 100) };
+    1
+}
+
+/// `GetSystemTimes`: the process's own user and kernel time and no idle time, which
+/// is the honest answer here: this host does not account for another process's idling
+/// and a title only subtracts two readings of it.
+pub extern "system" fn GetSystemTimes(idle: *mut u64, kernel: *mut u64, user: *mut u64) -> i32 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: a local `rusage`, filled by the call.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        set_error(ERROR_NOT_SUPPORTED);
+        return 0;
+    }
+    // SAFETY: the call above filled it.
+    let usage = unsafe { usage.assume_init() };
+    let mut ticks = |tv: libc::timeval| -> u64 {
+        (tv.tv_sec as u64) * TICKS_PER_SECOND + (tv.tv_usec as u64) * 10
+    };
+    // SAFETY: the title's out words, each of which it may leave null.
+    unsafe {
+        if !idle.is_null() {
+            idle.write(0);
+        }
+        if !kernel.is_null() {
+            kernel.write(ticks(usage.ru_stime));
+        }
+        if !user.is_null() {
+            user.write(ticks(usage.ru_utime));
+        }
+    }
+    1
+}
+
+/// `GetPhysicallyInstalledSystemMemory`: the machine's RAM in KiB, from the host.
+pub extern "system" fn GetPhysicallyInstalledSystemMemory(out: *mut u64) -> i32 {
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut bytes: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    // SAFETY: a local out value and its size, for the documented sysctl.
+    let ok = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&raw mut bytes).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok != 0 || bytes == 0 {
+        set_error(ERROR_NOT_SUPPORTED);
+        return 0;
+    }
+    // SAFETY: the title's out word.
+    unsafe { out.write(bytes / 1024) };
+    1
 }
 
 pub extern "system" fn GetSystemTime(out: *mut SystemTimeFields) {
@@ -1734,6 +2203,150 @@ pub extern "system" fn SetThreadStackGuarantee(guarantee: *mut u32) -> i32 {
     if guarantee.is_null() {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
+    }
+    1
+}
+
+// shortcut: one error mode for the process. Windows keeps a thread mode beside the
+// process one; a title that sets one and reads the other sees one value here.
+static ERROR_MODE: AtomicU32 = AtomicU32::new(0);
+
+pub extern "system" fn GetErrorMode() -> u32 {
+    ERROR_MODE.load(Ordering::Relaxed)
+}
+
+pub extern "system" fn SetErrorMode(mode: u32) -> u32 {
+    ERROR_MODE.swap(mode, Ordering::Relaxed)
+}
+
+pub extern "system" fn SetThreadErrorMode(mode: u32, old: *mut u32) -> i32 {
+    let previous = ERROR_MODE.swap(mode, Ordering::Relaxed);
+    if !old.is_null() {
+        // SAFETY: the title's out word.
+        unsafe { old.write(previous) };
+    }
+    1
+}
+
+// shortcut: the priority class is remembered, not applied. Raising a process's own
+/// scheduling class on macOS is a privileged operation, and a title only reads back
+/// what it set (some print it in their crash logs).
+static PRIORITY_CLASS: AtomicU32 = AtomicU32::new(NORMAL_PRIORITY_CLASS);
+const IDLE_PRIORITY_CLASS: u32 = 0x40;
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x4000;
+const NORMAL_PRIORITY_CLASS: u32 = 0x20;
+const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x8000;
+const HIGH_PRIORITY_CLASS: u32 = 0x80;
+const REALTIME_PRIORITY_CLASS: u32 = 0x100;
+
+const PRIORITY_CLASSES: [u32; 6] = [
+    IDLE_PRIORITY_CLASS,
+    BELOW_NORMAL_PRIORITY_CLASS,
+    NORMAL_PRIORITY_CLASS,
+    ABOVE_NORMAL_PRIORITY_CLASS,
+    HIGH_PRIORITY_CLASS,
+    REALTIME_PRIORITY_CLASS,
+];
+
+/// `IMAGE_FILE_MACHINE_AMD64`: the machine whose code this host runs.
+const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+
+/// Whether `process` names this process: the pseudo handle is the only one a title
+/// can hold here, since no process handle is ever created.
+fn is_this_process(process: *mut c_void) -> bool {
+    process as isize == GetCurrentProcess()
+}
+
+pub extern "system" fn SetPriorityClass(process: *mut c_void, class: u32) -> i32 {
+    if !is_this_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if !PRIORITY_CLASSES.contains(&class) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    PRIORITY_CLASS.store(class, Ordering::Relaxed);
+    1
+}
+
+pub extern "system" fn GetPriorityClass(process: *mut c_void) -> u32 {
+    if !is_this_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    PRIORITY_CLASS.load(Ordering::Relaxed)
+}
+
+/// `IsWow64Process2`: this process is the machine's own code, so it is not a 32-bit
+/// process under emulation. The native machine is reported as AMD64 because that is
+/// the machine whose code runs here: a title told otherwise takes paths (arm64
+/// binaries, different threading) that this host does not serve.
+pub extern "system" fn IsWow64Process2(
+    process: *mut c_void,
+    process_machine: *mut u16,
+    native_machine: *mut u16,
+) -> i32 {
+    if !is_this_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    // SAFETY: the title's out words, either of which it may leave null.
+    unsafe {
+        if !process_machine.is_null() {
+            process_machine.write(0);
+        }
+        if !native_machine.is_null() {
+            native_machine.write(IMAGE_FILE_MACHINE_AMD64);
+        }
+    }
+    1
+}
+
+/// `QueryFullProcessImageNameW`: the title image's path, in the caller's buffer with
+/// its NUL, and the length without it back in `size`. A buffer that is too small is
+/// `ERROR_INSUFFICIENT_BUFFER`, as Windows reports it, and is not filled.
+pub extern "system" fn QueryFullProcessImageNameW(
+    process: *mut c_void,
+    _flags: u32,
+    out: *mut u16,
+    size: *mut u32,
+) -> i32 {
+    if !is_this_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if out.is_null() || size.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut name = vec![0u16; 4096];
+    let written =
+        crate::modules::kernel::GetModuleFileNameW(std::ptr::null_mut(), name.as_mut_ptr(), 4096)
+            as usize;
+    let path: Vec<u16> = if written > 0 {
+        name.truncate(written);
+        name
+    } else {
+        std::env::current_exe()
+            .map(|p| p.to_string_lossy().encode_utf16().collect())
+            .unwrap_or_default()
+    };
+    // SAFETY: the title's in/out size.
+    let capacity = unsafe { size.read() } as usize;
+    if path.is_empty() {
+        set_error(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
+    if path.len() + 1 > capacity {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    // SAFETY: a buffer of `capacity` units, which holds the path and its NUL.
+    unsafe {
+        std::ptr::copy_nonoverlapping(path.as_ptr(), out, path.len());
+        out.add(path.len()).write(0);
+        size.write(path.len() as u32);
     }
     1
 }
@@ -2656,8 +3269,90 @@ pub extern "system" fn FlsSetValue(index: u32, value: usize) -> i32 {
     1
 }
 
-// One worker per submission or timer arm. Callbacks use the Windows ABI
-// (instance, context, object).
+// Submitted callbacks run on the pool's workers (`MIN_STACK` each: title code runs there, and a
+// guessed draw builds Metal pipelines), and a timer or wait that has to sit and wait keeps a
+// thread of its own. Callbacks use the Windows ABI (instance, context, object).
+
+/// One queued call of a pool worker.
+type PoolJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// The workers submitted callbacks run on. A work item is queued and a worker that is not
+/// already running one takes it, so a title that submits thousands in a frame pays for the
+/// callbacks and not for a thread each time (nor for the TEB that comes with it).
+struct Workers {
+    queue: Mutex<Queue>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct Queue {
+    jobs: std::collections::VecDeque<PoolJob>,
+    /// Workers waiting for a job.
+    idle: usize,
+    /// Workers alive, whether they are running a job or waiting for one.
+    alive: usize,
+}
+
+/// How many workers the pool starts at most: a title that submits from every thread fills them,
+/// and a grain of the pool size keeps a machine of many cores from being all stack.
+const MAX_WORKERS: usize = 12;
+
+static WORKERS: LazyLock<Workers> = LazyLock::new(Workers::new);
+
+impl Workers {
+    fn new() -> Workers {
+        Workers {
+            queue: Mutex::default(),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Queues `job`, starting a worker for it when none is waiting and the pool is under
+    /// [`MAX_WORKERS`]: the job then waits for whichever worker finishes first.
+    fn push(&'static self, job: PoolJob) {
+        let mut queue = lock(&self.queue);
+        queue.jobs.push_back(job);
+        if queue.idle > 0 {
+            self.wake.notify_one();
+            return;
+        }
+        if queue.alive >= MAX_WORKERS {
+            return;
+        }
+        queue.alive += 1;
+        drop(queue);
+        if thread::spawn("threadpool-worker", super::MIN_STACK, move || {
+            self.run();
+            0
+        })
+        .is_err()
+        {
+            // The job stays queued for the next worker that finishes.
+            lock(&self.queue).alive -= 1;
+            self.wake.notify_all();
+        }
+    }
+
+    /// Runs queued jobs until the process ends: a worker keeps its stack and its TEB for the
+    /// next one.
+    fn run(&'static self) {
+        loop {
+            let job = {
+                let mut queue = lock(&self.queue);
+                loop {
+                    if let Some(job) = queue.jobs.pop_front() {
+                        break job;
+                    }
+                    queue.idle += 1;
+                    queue = self.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
+                    queue.idle -= 1;
+                }
+            };
+            job();
+        }
+    }
+}
+
 pub(crate) struct PoolObject {
     callback: usize,
     context: usize,
@@ -2712,7 +3407,9 @@ impl PoolObject {
         let armed = Instant::now();
         // An immediately due callback is queued before the submitting call returns.
         let mut ticket = delay.is_zero().then(|| state.queue_callback());
-        std::thread::spawn(move || {
+        // Work, and a timer that is already due and does not repeat, can go to a pool worker.
+        let immediate = delay.is_zero() && period.is_zero();
+        let mut run = move || {
             let mut state = lock(&self.state);
             let mut delay = delay.saturating_sub(armed.elapsed());
             loop {
@@ -2752,7 +3449,19 @@ impl PoolObject {
                 }
                 delay = period;
             }
-        });
+        };
+        // A timer that has to wait for its deadline keeps a thread of its own, so it cannot hold
+        // a worker the title's work items need.
+        if immediate {
+            WORKERS.push(Box::new(run));
+        } else if thread::spawn("threadpool-callback", super::MIN_STACK, move || {
+            run();
+            0
+        })
+        .is_err()
+        {
+            tracing::warn!("threadpool: no thread to wait on a timer's deadline");
+        }
     }
 
     /// Arms one wait on `object`: the callback runs once when the object is
@@ -2772,7 +3481,7 @@ impl PoolObject {
         let generation = state.timer_generation;
         state.armed += 1;
         let armed_at = Instant::now();
-        std::thread::spawn(move || {
+        let spawned = thread::spawn("threadpool-wait", super::MIN_STACK, move || {
             // In slices, so a disarm need not wait for the object to change.
             const SLICE: Duration = Duration::from_millis(20);
             let deadline = timeout.map(|t| armed_at + t);
@@ -2801,7 +3510,7 @@ impl PoolObject {
                 Some(result) if state.timer_generation == generation => result,
                 _ => {
                     self.changed.notify_all();
-                    return;
+                    return 0;
                 }
             };
             state.running += 1;
@@ -2822,7 +3531,14 @@ impl PoolObject {
             let mut state = lock(&self.state);
             state.running -= 1;
             self.changed.notify_all();
+            0
         });
+        if spawned.is_err() {
+            // Nothing is armed: `WaitForThreadpoolWaitCallbacks` must not wait for a thread that
+            // was never started.
+            state.armed -= 1;
+            self.changed.notify_all();
+        }
     }
 
     fn wait_idle(&self, cancel: bool) {
@@ -3070,6 +3786,11 @@ pub extern "system" fn GetTempPathW(size: u32, out: *mut u16) -> u32 {
     // SAFETY: the title's buffer of `size` units.
     unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), out, text.len()) };
     (text.len() - 1) as u32
+}
+
+/// `MoveFileW`: the same move with no flags.
+pub extern "system" fn MoveFileW(from: *const u16, to: *const u16) -> i32 {
+    MoveFileExW(from, to, 0)
 }
 
 pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, _flags: u32) -> i32 {
@@ -4082,6 +4803,10 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
     }
     let kernel = dll == "kernel32.dll"
         || dll == "kernelbase.dll"
+        // The `Rtl*` names are ntdll's, and a title imports them from there;
+        // `version.dll` reads the version resource this table now serves.
+        || dll == "ntdll.dll"
+        || dll == "version.dll"
         || dll.starts_with("api-ms-win-core-")
         || dll.starts_with("api-ms-win-eventing-");
     if kernel {
@@ -4093,6 +4818,12 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             GetStringTypeW,
             GetStringTypeExW,
             FindResourceExW,
+            FindResourceW,
+            SizeofResource,
+            LockResource,
+            GetFileVersionInfoSizeW,
+            GetFileVersionInfoW,
+            VerQueryValueW,
             LoadResource,
             GetCPInfo,
             LCMapStringEx,
@@ -4127,6 +4858,12 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             DecodePointer,
             GetSystemTimeAsFileTime,
             GetSystemTimePreciseAsFileTime,
+            RtlGetVersion,
+            GetVersionExW,
+            VerifyVersionInfoW,
+            QueryUnbiasedInterruptTime,
+            GetSystemTimes,
+            GetPhysicallyInstalledSystemMemory,
             GetSystemTime,
             GetLocalTime,
             FileTimeToSystemTime,
@@ -4157,6 +4894,13 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             GetActiveProcessorCount,
             GetCurrentProcessorNumber,
             SetProcessPriorityBoost,
+            GetErrorMode,
+            SetErrorMode,
+            SetThreadErrorMode,
+            SetPriorityClass,
+            GetPriorityClass,
+            IsWow64Process2,
+            QueryFullProcessImageNameW,
             SetThreadIdealProcessorEx,
             GetThreadGroupAffinity,
             SetThreadGroupAffinity,
@@ -4218,6 +4962,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             SetFileAttributesW,
             GetDiskFreeSpaceExW,
             GetTempPathW,
+            MoveFileW,
             MoveFileExW,
             CreateFile2,
             CopyFile2,
@@ -4659,6 +5404,109 @@ mod tests {
         assert_eq!(FlsGetValue(slot), 9);
         assert_eq!(FlsFree(slot), 1);
         assert_eq!(CALLS.load(Ordering::Relaxed), 5, "freeing runs it once more");
+    }
+
+    /// A worker keeps its stack and its TEB for the next job: with one job in flight at a time
+    /// the second runs on the thread that ran the first, and that thread's stack is a title
+    /// thread's (`MIN_STACK`), not the 2 MiB a bare `std::thread::spawn` gives.
+    #[test]
+    fn pool_workers_are_reused_and_get_a_title_stack() {
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        static REUSED: AtomicU32 = AtomicU32::new(0);
+        static SMALL_STACK: AtomicU32 = AtomicU32::new(0);
+        std::thread_local! {
+            static JOBS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+
+        // A pool of this test's own: the shared one is busy with other tests.
+        let pool: &'static Workers = Box::leak(Box::new(Workers::new()));
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let mut submit = |done: std::sync::mpsc::Sender<()>| {
+            pool.push(Box::new(move || {
+                JOBS.with(|jobs| {
+                    if jobs.get() > 0 {
+                        REUSED.store(1, Ordering::Relaxed);
+                    }
+                    jobs.set(jobs.get() + 1);
+                });
+                RAN.fetch_add(1, Ordering::Relaxed);
+                let teb = teb::current();
+                // SAFETY: inside this thread's own TEB block, at the offsets the loader keeps.
+                let (base, limit) = unsafe {
+                    (
+                        teb.add(teb::OFF_STACK_BASE).cast::<usize>().read(),
+                        teb.add(teb::OFF_STACK_LIMIT).cast::<usize>().read(),
+                    )
+                };
+                if base - limit < super::super::MIN_STACK {
+                    SMALL_STACK.fetch_add(1, Ordering::Relaxed);
+                }
+                let _ = done.send(());
+            }));
+            finished
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a worker ran the job");
+        };
+        submit(done.clone());
+        // The worker is idle only once the job's closure has returned: wait for that, so the
+        // second job is queued for it rather than for a worker started to take it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock(&pool.queue).idle == 0 {
+            assert!(Instant::now() < deadline, "the worker never went idle");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        submit(done);
+        assert_eq!(RAN.load(Ordering::Relaxed), 2);
+        assert_eq!(REUSED.load(Ordering::Relaxed), 1, "the worker runs the next job");
+        assert_eq!(SMALL_STACK.load(Ordering::Relaxed), 0, "a worker has MIN_STACK");
+        assert_eq!(lock(&pool.queue).alive, 1, "one worker took both jobs");
+    }
+
+    /// Submitted work runs on the pool's workers, and each of them has a title thread's stack.
+    #[test]
+    fn submitted_work_runs_on_workers_with_a_title_stack() {
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        static SMALL_STACK: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn work(_instance: usize, _context: usize, _work: usize) {
+            RAN.fetch_add(1, Ordering::Relaxed);
+            let teb = teb::current();
+            // SAFETY: inside this thread's own TEB block, at the offsets the loader keeps.
+            let (base, limit) = unsafe {
+                (
+                    teb.add(teb::OFF_STACK_BASE).cast::<usize>().read(),
+                    teb.add(teb::OFF_STACK_LIMIT).cast::<usize>().read(),
+                )
+            };
+            if base - limit < super::super::MIN_STACK {
+                SMALL_STACK.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let callback = native::host_callbacks(&[(work as *const () as usize, false)]).unwrap()[0];
+        let item = CreateThreadpoolWork(callback, 0, std::ptr::null());
+        SubmitThreadpoolWork(item);
+        WaitForThreadpoolWorkCallbacks(item, 0);
+        CloseThreadpoolWork(item);
+        assert_eq!(RAN.load(Ordering::Relaxed), 1);
+        assert_eq!(SMALL_STACK.load(Ordering::Relaxed), 0, "a worker has MIN_STACK");
+    }
+
+    /// A burst of submitted items all run, on the workers the pool starts for them.
+    #[test]
+    fn a_burst_of_submitted_items_all_run() {
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn work(_instance: usize, _context: usize, _work: usize) {
+            RAN.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let callback = native::host_callbacks(&[(work as *const () as usize, false)]).unwrap()[0];
+        let item = CreateThreadpoolWork(callback, 0, std::ptr::null());
+        for _ in 0..64 {
+            SubmitThreadpoolWork(item);
+        }
+        WaitForThreadpoolWorkCallbacks(item, 0);
+        CloseThreadpoolWork(item);
+        assert_eq!(RAN.load(Ordering::Relaxed), 64);
     }
 
     const ONE_HOUR_DUE: i64 = -3600 * TICKS_PER_SECOND as i64;
@@ -6255,6 +7103,376 @@ mod apartment_and_winrt_tests {
             ("api-ms-win-core-winrt-error-l1-1-0.dll", "SetRestrictedErrorInfo"),
         ] {
             assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
+        }
+    }
+}
+
+#[cfg(test)]
+mod version_resource_tests {
+    use super::*;
+
+    /// One block of a `VS_VERSIONINFO`: header, key, padding, value, padded to four
+    /// bytes so the next block starts aligned.
+    fn block(key: &str, value_len: u16, kind: u16, value: &[u8]) -> Vec<u8> {
+        let mut out = vec![0, 0];
+        out.extend_from_slice(&value_len.to_le_bytes());
+        out.extend_from_slice(&kind.to_le_bytes());
+        for unit in key.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out.extend_from_slice(&[0, 0]);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(value);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        let len = out.len() as u16;
+        out[0..2].copy_from_slice(&len.to_le_bytes());
+        out
+    }
+
+    fn container(key: &str, children: &[Vec<u8>]) -> Vec<u8> {
+        let mut value = Vec::new();
+        for child in children {
+            while value.len() % 4 != 0 {
+                value.push(0);
+            }
+            value.extend_from_slice(child);
+        }
+        block(key, 0, 1, &value)
+    }
+
+    /// A version resource as a linker writes it: the fixed info, one string table with
+    /// one string, and one translation.
+    fn resource() -> Vec<u8> {
+        let mut fixed = Vec::new();
+        fixed.extend_from_slice(&0xFEEF_04BDu32.to_le_bytes()); // dwSignature
+        fixed.extend_from_slice(&0x0001_0000u32.to_le_bytes()); // dwStrucVersion
+        for _ in 0..11 {
+            fixed.extend_from_slice(&0u32.to_le_bytes());
+        }
+        assert_eq!(fixed.len(), 52, "VS_FIXEDFILEINFO is 13 words");
+        let file_version: Vec<u16> = "1.2.3.4\0".encode_utf16().collect();
+        let mut version_bytes = Vec::new();
+        for unit in &file_version {
+            version_bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let table = container(
+            "040904b0",
+            &[block("FileVersion", file_version.len() as u16, 1, &version_bytes)],
+        );
+        let strings = container("StringFileInfo", &[table]);
+        let mut translation = Vec::new();
+        translation.extend_from_slice(&0x0409u16.to_le_bytes());
+        translation.extend_from_slice(&0x04b0u16.to_le_bytes());
+        let vars = container(
+            "VarFileInfo",
+            &[block("Translation", translation.len() as u16, 0, &translation)],
+        );
+        let mut root = block("VS_VERSION_INFO", 52, 0, &fixed);
+        root.extend_from_slice(&strings);
+        root.extend_from_slice(&vars);
+        let len = root.len() as u16;
+        root[0..2].copy_from_slice(&len.to_le_bytes());
+        root
+    }
+
+    fn query(block: &mut [u8], sub: &str) -> Option<(*const u8, u32)> {
+        let sub: Vec<u16> = sub.encode_utf16().chain([0]).collect();
+        let (mut out, mut len) = (std::ptr::null_mut(), 0u32);
+        let ok = VerQueryValueW(
+            block.as_mut_ptr().cast(),
+            sub.as_ptr(),
+            &mut out,
+            &mut len,
+        );
+        (ok != 0).then_some((out.cast::<u8>() as *const u8, len))
+    }
+
+    /// The fixed file info, a string of a string table, and the translations come out of
+    /// the block a title got from `GetFileVersionInfoW`, and a key that is not there is
+    /// not found.
+    #[test]
+    fn the_values_inside_a_version_resource_are_found() {
+        let mut block = resource();
+
+        let (fixed, len) = query(&mut block, r"\").expect("the fixed file info");
+        assert_eq!(len, 52);
+        // SAFETY: 52 bytes of the block, as the query just reported.
+        let signature = unsafe { fixed.cast::<u32>().read_unaligned() };
+        assert_eq!(signature, 0xFEEF_04BD);
+
+        let (value, len) = query(&mut block, r"\StringFileInfo\040904b0\FileVersion")
+            .expect("the file version string");
+        assert_eq!(len, 8, "characters, with the NUL");
+        // SAFETY: `len` UTF-16 units of the block.
+        let units = unsafe { std::slice::from_raw_parts(value.cast::<u16>(), len as usize) };
+        assert_eq!(String::from_utf16_lossy(units), "1.2.3.4\0");
+
+        let (translation, len) = query(&mut block, r"\VarFileInfo\Translation")
+            .expect("the translations");
+        assert_eq!(len, 4);
+        // SAFETY: 4 bytes of the block.
+        let pair = unsafe { std::slice::from_raw_parts(translation.cast::<u16>(), 2) };
+        assert_eq!((pair[0], pair[1]), (0x0409, 0x04b0));
+
+        assert!(query(&mut block, r"\StringFileInfo\040904b0\NoSuchKey").is_none());
+        assert!(query(&mut block, r"\StringFileInfo\040704b0\FileVersion").is_none());
+        assert!(query(&mut block, r"\Nonsense").is_none());
+    }
+
+    /// A resource the image does not have, and a caller that passes nothing, are both
+    /// answered with a failure rather than a guess.
+    #[test]
+    fn a_resource_call_that_cannot_be_answered_fails() {
+        set_error(0);
+        assert_eq!(SizeofResource(std::ptr::null_mut(), std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert!(LockResource(std::ptr::null_mut()).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        // No image is mapped in this test, so there is no version resource to find.
+        let mut out = 0u32;
+        let mut path: Vec<u16> = "game.exe".encode_utf16().chain([0]).collect();
+        assert_eq!(GetFileVersionInfoSizeW(path.as_mut_ptr(), &mut out), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_FILE_NOT_FOUND);
+
+        let mut block = [0u8; 156];
+        assert_eq!(VerQueryValueW(
+            block.as_mut_ptr().cast(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut()
+        ), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        for dll in ["kernel32.dll", "version.dll"] {
+            for name in [
+                "FindResourceW",
+                "SizeofResource",
+                "LockResource",
+                "GetFileVersionInfoSizeW",
+                "GetFileVersionInfoW",
+                "VerQueryValueW",
+            ] {
+                assert!(
+                    super::super::lookup(dll, name).is_some(),
+                    "{dll}!{name} is not answered"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    fn condition(words: &[(usize, u16)]) -> [u8; 16] {
+        let mut condition = [0u8; 16];
+        for &(at, value) in words {
+            condition[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        condition
+    }
+
+    /// The version a title asks for is filled in, both the short and the extended
+    /// form, and a size that is neither is refused the way `GetVersionExW` refuses it.
+    #[test]
+    fn the_version_is_filled_in_both_forms() {
+        let mut extended = [0u8; 156];
+        extended[0..4].copy_from_slice(&156u32.to_le_bytes());
+        assert_eq!(GetVersionExW(extended.as_mut_ptr()), 1);
+        let word = |at: usize| u32::from_le_bytes(extended[at..at + 4].try_into().unwrap());
+        assert_eq!(
+            (word(4), word(8), word(12), word(16)),
+            (WINDOWS_MAJOR, WINDOWS_MINOR, WINDOWS_BUILD, VER_PLATFORM_WIN32_NT)
+        );
+        assert_eq!(extended[20], 0, "no service pack string");
+        assert_eq!(extended[154], VER_NT_WORKSTATION);
+        assert_eq!(extended[148..154], [0u8; 6], "no service pack, no suite");
+
+        // The shorter form is filled as far as it goes, and the extended tail is left.
+        let mut short = [0xFFu8; 148];
+        short[0..4].copy_from_slice(&148u32.to_le_bytes());
+        assert_eq!(GetVersionExW(short.as_mut_ptr()), 1);
+        assert_eq!(u32::from_le_bytes(short[12..16].try_into().unwrap()), WINDOWS_BUILD);
+
+        let mut wrong = [0u8; 156];
+        wrong[0..4].copy_from_slice(&100u32.to_le_bytes());
+        set_error(0);
+        assert_eq!(GetVersionExW(wrong.as_mut_ptr()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        // RtlGetVersion reports the same version and always succeeds.
+        let mut rtl = [0u8; 156];
+        rtl[0..4].copy_from_slice(&156u32.to_le_bytes());
+        assert_eq!(RtlGetVersion(rtl.as_mut_ptr()), 0);
+        assert_eq!(
+            u32::from_le_bytes(rtl[12..16].try_into().unwrap()),
+            WINDOWS_BUILD
+        );
+    }
+
+    /// The version comparison answers with the operator it was given, which is how a
+    /// title picks between its Windows 7 and Windows 10 paths.
+    #[test]
+    fn the_version_comparison_answers_with_its_operator() {
+        let build = |operator: u8, wanted: u16| {
+            let mask = u32::from(VER_BUILDNUMBER) | (u32::from(operator) << 8);
+            VerifyVersionInfoW(condition(&[(4, wanted)]).as_ptr(), mask, 0)
+        };
+        assert_eq!(build(VER_GREATER_EQUAL, 7601), 1, "Windows 7 or later");
+        assert_eq!(build(VER_GREATER_EQUAL, WINDOWS_BUILD as u16), 1);
+        assert_eq!(build(VER_EQUAL, WINDOWS_BUILD as u16), 1);
+        assert_eq!(build(VER_LESS, WINDOWS_BUILD as u16), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_OLD_WIN_VERSION);
+        assert_eq!(build(VER_GREATER, WINDOWS_BUILD as u16), 0);
+        assert_eq!(build(VER_GREATER, WINDOWS_BUILD as u16 - 1), 1);
+
+        // Two fields at once both have to hold.
+        let both = condition(&[(0, 10), (4, 19041)]);
+        let mask = u32::from(VER_MAJORVERSION | VER_BUILDNUMBER) | (u32::from(VER_GREATER_EQUAL) << 8);
+        assert_eq!(VerifyVersionInfoW(both.as_ptr(), mask, 0), 1);
+        let older = condition(&[(0, 11)]);
+        assert_eq!(
+            VerifyVersionInfoW(
+                older.as_ptr(),
+                u32::from(VER_MAJORVERSION) | (u32::from(VER_GREATER_EQUAL) << 8),
+                0
+            ),
+            0
+        );
+    }
+
+    /// The machine's facts: an interrupt time that moves, the process's own CPU time,
+    /// and the RAM the host reports.
+    #[test]
+    fn the_interrupt_time_and_the_machines_time_and_memory_are_answered() {
+        let (mut first, mut second) = (0u64, 0u64);
+        assert_eq!(QueryUnbiasedInterruptTime(&mut first), 1);
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(QueryUnbiasedInterruptTime(&mut second), 1);
+        assert!(second > first, "the interrupt time stood still");
+        assert_eq!(QueryUnbiasedInterruptTime(std::ptr::null_mut()), 0);
+
+        let (mut idle, mut kernel, mut user) = (1u64, 0u64, 0u64);
+        assert_eq!(GetSystemTimes(&mut idle, &mut kernel, &mut user), 1);
+        assert_eq!(idle, 0, "idle is not accounted for here");
+        assert!(kernel + user > 0, "the process has used no CPU time");
+
+        let mut memory = 0u64;
+        assert_eq!(GetPhysicallyInstalledSystemMemory(&mut memory), 1);
+        assert!(memory > 1024, "{memory} KiB of RAM is not a Mac");
+        assert_eq!(GetPhysicallyInstalledSystemMemory(std::ptr::null_mut()), 0);
+
+        for dll in ["kernel32.dll", "ntdll.dll"] {
+            for name in [
+                "RtlGetVersion",
+                "GetVersionExW",
+                "VerifyVersionInfoW",
+                "QueryUnbiasedInterruptTime",
+                "GetSystemTimes",
+                "GetPhysicallyInstalledSystemMemory",
+            ] {
+                assert!(super::super::lookup(dll, name).is_some(), "{dll}!{name}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    /// The error mode a title sets at startup is the one it and everything else in
+    /// the process reads back.
+    #[test]
+    fn the_error_mode_round_trips_and_reports_what_it_replaced() {
+        let original = GetErrorMode();
+        assert_eq!(SetErrorMode(0x1 | 0x2), original);
+        assert_eq!(GetErrorMode(), 0x1 | 0x2);
+        let mut replaced = 0u32;
+        assert_eq!(SetThreadErrorMode(0x8000, &mut replaced), 1);
+        assert_eq!(replaced, 0x1 | 0x2);
+        assert_eq!(GetErrorMode(), 0x8000);
+        // A caller that wants no old value passes no pointer.
+        assert_eq!(SetThreadErrorMode(original, std::ptr::null_mut()), 1);
+        assert_eq!(GetErrorMode(), original);
+    }
+
+    /// The priority class is the one the title set, an unknown class is refused, and
+    /// a handle that is not this process is not answered.
+    #[test]
+    fn the_priority_class_is_remembered_and_validated() {
+        let process = GetCurrentProcess() as usize as *mut c_void;
+        let original = GetPriorityClass(process);
+        assert!(PRIORITY_CLASSES.contains(&original));
+        assert_eq!(SetPriorityClass(process, ABOVE_NORMAL_PRIORITY_CLASS), 1);
+        assert_eq!(GetPriorityClass(process), ABOVE_NORMAL_PRIORITY_CLASS);
+        set_error(0);
+        assert_eq!(SetPriorityClass(process, 0x1234), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(GetPriorityClass(process), ABOVE_NORMAL_PRIORITY_CLASS);
+        assert_eq!(SetPriorityClass(process, original), 1);
+        assert_eq!(GetPriorityClass(0xdead as *mut c_void), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
+    }
+
+    /// The title is the machine's own code, not a 32-bit process under emulation,
+    /// and its image path comes back with its length in the caller's buffer.
+    #[test]
+    fn the_process_is_amd64_and_knows_where_its_image_is() {
+        let process = GetCurrentProcess() as usize as *mut c_void;
+        let (mut machine, mut native) = (0xFFFFu16, 0u16);
+        assert_eq!(IsWow64Process2(process, &mut machine, &mut native), 1);
+        assert_eq!((machine, native), (0, 0x8664));
+        assert_eq!(
+            IsWow64Process2(process, std::ptr::null_mut(), std::ptr::null_mut()),
+            1,
+            "both outputs are optional"
+        );
+        assert_eq!(
+            IsWow64Process2(0xdead as *mut c_void, &mut machine, &mut native),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
+
+        let mut buffer = [0u16; 4096];
+        let mut size = buffer.len() as u32;
+        assert_eq!(
+            QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size),
+            1
+        );
+        assert!(size > 0 && (size as usize) < buffer.len());
+        let text = String::from_utf16_lossy(&buffer[..size as usize]);
+        assert!(!text.is_empty(), "no image path");
+        assert_eq!(buffer[size as usize], 0, "the path is NUL-terminated");
+        assert_eq!(text.len(), size as usize, "the length excludes the NUL");
+
+        let mut small = [0u16; 2];
+        let mut too_small = 2u32;
+        set_error(0);
+        assert_eq!(
+            QueryFullProcessImageNameW(process, 0, small.as_mut_ptr(), &mut too_small),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+
+        for dll in ["kernel32.dll", "api-ms-win-core-processthreads-l1-1-0.dll"] {
+            for name in [
+                "GetErrorMode",
+                "SetErrorMode",
+                "SetThreadErrorMode",
+                "SetPriorityClass",
+                "GetPriorityClass",
+                "IsWow64Process2",
+                "QueryFullProcessImageNameW",
+            ] {
+                assert!(super::super::lookup(dll, name).is_some(), "{dll}!{name}");
+            }
         }
     }
 }

@@ -787,14 +787,29 @@ mod tests {
 
         // SAFETY: `a_addr` points to the first byte of `buf`.
         unsafe { (&*(a_addr as *const AtomicU8)).store(1, Ordering::SeqCst) };
+        // A single wake reaches one of the three `a` waiters, and which one is
+        // not ours to say: it is whichever reached `WaitOnAddress` first, and
+        // the order three spawned threads register in is the scheduler's.
         WakeByAddressSingle(a_addr as *mut c_void);
-        assert_eq!(rx_a1.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
-        assert!(rx_a2.recv_timeout(Duration::from_millis(30)).is_err());
+        let mut woken = Vec::new();
+        let mut waiting = Vec::new();
+        for (name, rx) in [("a1", rx_a1), ("a2", rx_a2), ("a3", rx_a3)] {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(value) => {
+                    assert_eq!(value, 1, "{name}");
+                    woken.push(name);
+                }
+                Err(_) => waiting.push((name, rx)),
+            }
+        }
+        assert_eq!(woken.len(), 1, "a single wake reached {woken:?}");
         assert!(rx_b.recv_timeout(Duration::from_millis(10)).is_err());
 
+        // The broadcast reaches the rest, and still not `b`.
         WakeByAddressAll(a_addr as *mut c_void);
-        assert_eq!(rx_a2.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
-        assert_eq!(rx_a3.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        for (name, rx) in waiting {
+            assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1, "{name}");
+        }
         assert!(rx_b.recv_timeout(Duration::from_millis(30)).is_err());
 
         // SAFETY: `b_addr` is 8-byte aligned within `buf`.

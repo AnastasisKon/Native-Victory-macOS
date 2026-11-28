@@ -180,6 +180,11 @@ has 'refusals by cause'
 printf '# commit dddd444\n# exit code 139\nvictory: fatal signal 11 (code 1) at address 0x7ff8deadbeef\n' > "$dir/fatal.log"
 /bin/bash "$script" --compare "$dir/after.log" "$dir/fatal.log" > "$dir/out"
 row '^ended +time limit +fatal signal 11 \(code 1\) at 0x7ff8deadbeef +changed$'
+# A GPU that ran out of memory lost the run before the timer did: the ended row says so even when
+# the title kept presenting after it (the black screen with sound, #569, #521).
+printf '# commit eeee555\n# stopped by --seconds\n# exit code 0\nmetal: command buffer failed: NSError { code: 8, localizedDescription: "Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)" }\n' > "$dir/oom.log"
+/bin/bash "$script" --compare "$dir/after.log" "$dir/oom.log" > "$dir/out"
+row '^ended +time limit +GPU out of memory +changed$'
 /bin/bash "$script" --compare "$dir/before.log" > "$dir/out" 2>&1 && fail "one log accepted"
 has 'usage:'
 

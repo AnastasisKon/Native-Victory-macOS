@@ -101,6 +101,9 @@ function field(line, key,   re, s) { # value of `key=...` (optionally quoted) in
     else if (line ~ /ErrorTimeout/) kind = "Timeout"
     else if (line ~ /ErrorOutOfMemory|[Oo]ut of memory|OutOfMemory/) kind = "OutOfMemory"
     gk[kind]++
+    # The last out-of-memory, for how the run ended: a GPU that failed its work is not a clean exit
+    # even when the title keeps running and presenting (the black screen with sound, #569, #521).
+    if (kind == "OutOfMemory") { gpu_lost = 1; glosst = lastt - t0; glosf = curframe }
     if (++ngpu <= 12) gl[ngpu] = sprintf("%-14s t=+%.1fs frame~%d", kind, lastt - t0, curframe)
   }
   if (ts != "") lastt = t
@@ -219,6 +222,8 @@ function metrics(   i, k, w, nw, v, r, u, kd, d, end) { # the --compare rows, on
   if (exc != "") { end = exc; sub(/.* at /, "", end); sub(/ .*/, "", end); end = "fault at " end }
   else if (fatal != "") { end = fatal; sub(/^victory: /, "", end); sub(/ at address /, " at ", end) }
   else if (exitcode == 139) end = "SIGSEGV"
+  # Ahead of the time limit: a run that lost its GPU before the timer ended it lost it first.
+  else if (gpu_lost) end = "GPU out of memory"
   else if (timedout) end = "time limit"
   else if (nend) end = "watchdog/kill line"
   else if (exitcode != "") end = "exit code " exitcode
@@ -329,7 +334,12 @@ END {
   if (exc != "") printf "  %s\n  (at +%.1fs, frame~%d)\n", substr(exc, 1, 120), exct, excf
   if (fatal != "") printf "  %s\n  (at +%.1fs, frame~%d)\n", substr(fatal, 1, 120), fatalt, fatalf
   for (i = 1; i <= nend && i <= 3; i++) print "  " endl[i]
-  if (exc == "" && fatal == "" && !nend) print "  no unhandled exception, fatal-signal or watchdog line (killed by --seconds or clean exit)"
+  if (gpu_lost) {
+    printf "  the GPU failed %d command buffer%s (OutOfMemory=%d), last at +%.1fs frame~%d\n", ngpu, (ngpu == 1 ? "" : "s"), gk["OutOfMemory"], glosst, glosf
+    if (curframe > glosf + 8) printf "  the title kept running after it (to frame %d): sound without pictures\n", curframe
+    else print "  nothing ran after it: the run ended at the GPU failure"
+  }
+  if (exc == "" && fatal == "" && !nend && !gpu_lost) print "  no unhandled exception, fatal-signal or watchdog line (killed by --seconds or clean exit)"
   printf "  last frame reached: %d\n\n", curframe
 
   if (prof != "") {
@@ -416,6 +426,7 @@ self_test() {
 @ESC@[2m2026-01-01T00:00:03.200000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_gpu::list: indirect execution dropped (first time) stride=12 address=Some("0xdead")
 @ESC@[2m2026-01-01T00:00:03.300000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_gpu::list: indirect execution dropped (first time) stride=16 address=Some("0xbeef")
 metal: command buffer failed: NSError { code: 2, "Caused GPU Hang Error (00000003:kIOGPUCommandBufferCallbackErrorHang)" }
+metal: command buffer failed: NSError { code: 8, localizedDescription: "Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)" }
 @ESC@[2m2026-01-01T00:00:03.500000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_hle::host_posix::coreaudio: no audio device: sound is mixed and dropped error=AudioQueueStart failed with OSStatus 2003329396
 @ESC@[2m2026-01-01T00:00:04.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_hle::host_posix::wasapi::spatial: WASAPI: spatial audio stream activated static_mask=6
 @ESC@[2m2026-01-01T00:00:04.500000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_hle::host_posix::wasapi: WASAPI: render client released frames in the last second frames=48000
@@ -447,6 +458,8 @@ LOG
   chk '1 named (the first 64 of the run; each line once)'
   chk 'vs H.*ps H.*into DrawTargets'
   chk 'victory: fatal signal 11 (code 1) at address 0x7ff8deadbeef'
+  chk 'the GPU failed 2 command buffers (OutOfMemory=1), last at +3.3s frame~128'
+  chk 'nothing ran after it: the run ended at the GPU failure'
   chk 'frames timed: 1, passes timed: 2, GPU pass time 51.8 ms total, 51.8 ms mean/frame, max frame 51.8 ms'
   chk '42.50 ms  frame=64 rank=1 kind=render pipe=6adfc332b21374b3 work=12'
   chk '9.25 ms  frame=64 rank=2 kind=compute pipe=abc123def456 work=64'

@@ -483,15 +483,13 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
             // VICTORY_DUMP_THREADS=0: at a breakpoint (the title's asserts). An access violation
             // waits for `unhandled`: the title's handlers take some and go on.
             super::super::dump::report_at_fault(r.code, false);
-            // Debugging aid: VICTORY_PEEK=rva,rva,... prints those qwords of
-            // the faulting image.
-            if let (Ok(list), Some(base)) = (
-                std::env::var("VICTORY_PEEK"),
-                unwind::image_base_of(c.rip as usize),
-            ) {
-                for rva in list.split(',').filter_map(|v| usize::from_str_radix(v.trim(), 16).ok()) {
-                    // Beyond the image: an absolute address.
-                    let at = if rva > 0x1000_0000 { rva } else { base + rva };
+            // Debugging aid: VICTORY_PEEK=<entry>,... prints a qword for each: an RVA of the
+            // faulting image, an absolute address, or `reg+offset` in the faulting frame, which
+            // reads a field of the object a fault is about without knowing where the heap put it.
+            let base = unwind::image_base_of(c.rip as usize);
+            if let Ok(list) = std::env::var("VICTORY_PEEK") {
+                for entry in list.split(',') {
+                    let Some(at) = crate::peek::address(entry, &c.gpr, base) else { continue };
                     // An address written down by hand can name nothing, and a fault taken here
                     // would be a second one inside this dispatch, not the one being reported.
                     match super::super::dump::read_checked(at) {
@@ -499,6 +497,9 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                         None => tracing::warn!("peek {at:#x} = not mapped"),
                     }
                 }
+            }
+            // The rest of the aid needs the faulting image: what rcx points at, and the callers.
+            if let Some(base) = base.filter(|_| std::env::var("VICTORY_PEEK").is_ok()) {
                 // The qwords rcx points at, when it holds an address something answers: a
                 // register is not a pointer for being large (`0xfffffffd` is not), and reading
                 // through one that names nothing faulted inside the dispatch that reports the

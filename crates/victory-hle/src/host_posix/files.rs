@@ -186,6 +186,56 @@ fn invalid_handle() -> *mut c_void {
     INVALID_HANDLE_VALUE as *mut c_void
 }
 
+/// A standard descriptor as a file object, so `GetStdHandle` can hand the title
+/// a handle that `ReadFile` and `WriteFile` take.
+pub(crate) fn standard(fd: i32) -> Option<Arc<FileObject>> {
+    // SAFETY: a plain copy of a standard descriptor; the copy is ours to close.
+    let copy = unsafe { libc::dup(fd) };
+    if copy < 0 {
+        return None;
+    }
+    // SAFETY: `copy` is a descriptor no other owner holds.
+    let file = unsafe { <File as std::os::unix::io::FromRawFd>::from_raw_fd(copy) };
+    Some(Arc::new(FileObject {
+        file,
+        position: Mutex::new(0),
+        // Reading from the console is what fd 0 is for.
+        writable: fd != 0,
+        append: false,
+    }))
+}
+
+const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
+const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
+
+/// The handles handed out, kept so each call returns the same one, as Windows
+/// does: a title may close one and expect the next call to fail.
+static STD: Mutex<[usize; 3]> = Mutex::new([0; 3]);
+
+pub extern "system" fn GetStdHandle(which: u32) -> *mut c_void {
+    let fd = match which {
+        STD_INPUT_HANDLE => 0,
+        STD_OUTPUT_HANDLE => 1,
+        STD_ERROR_HANDLE => 2,
+        _ => {
+            set_error(ERROR_INVALID_PARAMETER);
+            return std::ptr::null_mut();
+        }
+    };
+    let mut std = lock(&STD);
+    if std[fd] == 0 {
+        match standard(fd as i32) {
+            Some(object) => std[fd] = new_handle(Object::File(object)) as usize,
+            None => {
+                set_error(ERROR_INVALID_HANDLE);
+                return invalid_handle();
+            }
+        }
+    }
+    std[fd] as *mut c_void
+}
+
 fn create(path: Option<PathBuf>, access: u32, disposition: u32, flags: u32) -> *mut c_void {
     let Some(path) = path else {
         set_error(ERROR_PATH_NOT_FOUND);
@@ -945,6 +995,7 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
     table!(
         CreateFileW,
         CreateFileA,
+        GetStdHandle,
         ReadFile,
         WriteFile,
         GetOverlappedResult,
@@ -1412,5 +1463,42 @@ fn trace_read(file: &File, len: u32) {
     e.1 += u64::from(len);
     if e.0.is_power_of_two() {
         tracing::info!(path, reads = e.0, bytes = e.1, "ReadFile of a file so far");
+    }
+}
+
+#[cfg(test)]
+mod std_handle_tests {
+    use super::*;
+
+    /// The three streams are handles a write can take, and asking twice gives
+    /// the same one back, as on Windows.
+    #[test]
+    fn the_standard_streams_are_file_handles() {
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        assert!(!out.is_null());
+        assert_ne!(out as usize, INVALID_HANDLE_VALUE);
+        assert_eq!(GetStdHandle(STD_OUTPUT_HANDLE), out);
+        assert!(file_of(out).is_some());
+
+        let err = GetStdHandle(STD_ERROR_HANDLE);
+        let inp = GetStdHandle(STD_INPUT_HANDLE);
+        assert!(!err.is_null() && !inp.is_null());
+        assert_ne!(err, out);
+        assert_ne!(inp, out);
+
+        // A write of nothing succeeds and reports nothing written: the handle
+        // is a stream, and the call reaches it rather than failing.
+        let mut written = u32::MAX;
+        assert_eq!(
+            WriteFile(out, std::ptr::null(), 0, &mut written, std::ptr::null_mut()),
+            1
+        );
+        assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn a_stream_that_is_not_one_is_refused() {
+        assert!(GetStdHandle(0).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
     }
 }

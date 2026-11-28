@@ -1722,6 +1722,7 @@ pub(crate) fn install_test_render_pipeline(
 
 pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
     with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
+        _ if skipped_dispatch(t, l, &format!("groups [{x}, {y}, {z}]")) => {}
         Pipe::Compute(pso) => {
             trace_record_dispatch(t, l, "ran");
             if pass_on() {
@@ -1767,11 +1768,38 @@ fn stage_hashes(pipeline: usize) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `VICTORY_SKIP_PIPELINES=<hash>[,<hash>...]` (debugging): whether title pipeline `pipeline`
+/// has a shader of one of the listed 16-digit hashes, so that its draws and dispatches are
+/// dropped (to see which work makes a fault in the picture). Read once; off when unset.
+fn skipped_pipeline(pipeline: usize) -> bool {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        crate::pipeline::parse_skip_hashes(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default())
+    });
+    !hashes.is_empty()
+        && crate::pipeline::native_stages(pipeline as This)
+            .is_some_and(|(stages, _)| stages.iter().any(|(_, sh)| hashes.contains(&sh.hash)))
+}
+
+/// A dispatch of a pipeline `VICTORY_SKIP_PIPELINES` lists: counted as dropped and noted in the
+/// pass trace. Returns whether it was skipped.
+fn skipped_dispatch(t: &MetalTitle, l: &mut MetalList, how: &str) -> bool {
+    if !skipped_pipeline(l.pipeline) {
+        return false;
+    }
+    dropped("a dispatch skipped by VICTORY_SKIP_PIPELINES");
+    if pass_on() {
+        pass_note(t, l, &format!("dispatch {how}"), "skipped by VICTORY_SKIP_PIPELINES", true, 1);
+    }
+    true
+}
+
 /// `DispatchX` with thread counts (`crate::list::dispatch_x`). Without the translation for
 /// them it is dropped: run as group counts, its lanes past the counts would write over memory
 /// that is not theirs.
 pub(crate) fn dispatch_threads(this: This, threads: [u32; 3]) {
     with_list(this, |t, l| match thread_pipe(t, l.pipeline) {
+        _ if skipped_dispatch(t, l, &format!("threads {threads:?}")) => {}
         Pipe::Compute(pso) => {
             if pass_on() {
                 pass_note(t, l, &format!("dispatch-threads{threads:?}"), "ran", true, 1);
@@ -1954,6 +1982,11 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
 }
 
 fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
+    if skipped_pipeline(l.pipeline) {
+        dropped("a draw skipped by VICTORY_SKIP_PIPELINES");
+        trace_drop(l);
+        return None;
+    }
     if !l.targets_ready {
         dropped("a draw of a pass whose render targets the host cannot make");
         trace_drop(l);
@@ -2171,6 +2204,7 @@ pub(crate) fn execute_indirect(
         Command::Dispatch => {
             let mut start = std::time::Instant::now();
             with_list(this, |t, l| match (start = std::time::Instant::now(), pipe(t, l.pipeline, &TargetFormats::default())).1 {
+                _ if skipped_dispatch(t, l, "indirect") => {}
                 Pipe::Compute(pso) => {
                     let found = std::time::Instant::now();
                     let _timed = Defer(|| note_indirect(max, start, found));

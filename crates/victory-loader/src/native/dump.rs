@@ -429,24 +429,24 @@ fn read_all_bases(chain: &[usize]) -> bool {
     !chain.iter().any(|&pc| pc.wrapping_sub(base) == 0x1d83996)
 }
 
-/// `VICTORY_TRAP_WRITES=<hex page address>,<hex watched address>,...`: the page is kept read-only
-/// and each title write to it faults here; a write to a watched address is logged with the
-/// writer's title call chain. The page is opened for the faulting write and closed again a moment
-/// later by a thread, so most writes are not seen (statistics only: look for rare writers).
+/// `VICTORY_TRAP_WRITES=<hex page>,<hex watched address>,...`: the page is kept read-only and each
+/// title write to it faults here; a write to a watched address is logged with the writer's title
+/// call chain. The page is opened for the faulting write and closed again a moment later by a
+/// thread, so most writes are not seen (statistics only: look for rare writers).
+///
+/// A page and its addresses are one group, and `;` separates groups, so a hunt that needs two
+/// pages (an object and the table it looks in, say) is one run rather than one run per page. A
+/// group may separate the page from its addresses with `:` or `,`, as `,` is what the switch took
+/// before groups existed: `<page>:<addr>,<addr>;<page>[,<addr>...]`.
 pub fn write_trap(c: &Context, r: &super::seh::context::ExceptionRecord) -> bool {
-    use std::sync::OnceLock;
-    static SPEC: OnceLock<Option<(usize, Vec<usize>)>> = OnceLock::new();
-    let spec = SPEC.get_or_init(|| {
-        let v = std::env::var("VICTORY_TRAP_WRITES").ok()?;
-        let mut it = v.split(',').filter_map(|x| usize::from_str_radix(x.trim_start_matches("0x"), 16).ok());
-        let page = it.next()?;
-        Some((page & !0xfff, it.collect()))
-    });
-    let Some((page, watched)) = spec else { return false };
-    if r.code != 0xc000_0005 || r.information[0] != 1 || (r.information[1] as usize) & !0xfff != *page {
+    let Some(groups) = trap_spec() else { return false };
+    if r.code != 0xc000_0005 || r.information[0] != 1 {
         return false;
     }
     let at = r.information[1] as usize;
+    let Some((page, watched)) = groups.iter().find(|(page, _)| *page == at & !0xfff) else {
+        return false;
+    };
     if watched.contains(&(at & !7)) {
         let base = unwind::image_base_of(c.rip as usize).unwrap_or(0);
         let chain = super::seh::backtrace(*c, None);
@@ -461,21 +461,47 @@ pub fn write_trap(c: &Context, r: &super::seh::context::ExceptionRecord) -> bool
     true
 }
 
+/// The trapped pages and the addresses whose writes are logged, from `VICTORY_TRAP_WRITES`.
+fn trap_spec() -> Option<&'static Vec<(usize, Vec<usize>)>> {
+    use std::sync::OnceLock;
+    static SPEC: OnceLock<Option<Vec<(usize, Vec<usize>)>>> = OnceLock::new();
+    SPEC.get_or_init(|| std::env::var("VICTORY_TRAP_WRITES").ok().map(|v| parse_trap_spec(&v)))
+        .as_ref()
+}
+
+/// `[<page>[:,]<addr>,...][;<page>...]`, each page rounded down to its page boundary. An entry that
+/// does not parse is left out, and a group with no page is dropped: this is a debugging aid.
+fn parse_trap_spec(value: &str) -> Vec<(usize, Vec<usize>)> {
+    fn hex(text: &str) -> Option<usize> {
+        usize::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+    }
+    let mut groups = Vec::new();
+    for group in value.split(';') {
+        let mut parts = group.split([',', ':']);
+        let Some(page) = parts.next().and_then(hex) else {
+            continue;
+        };
+        groups.push((page & !0xfff, parts.filter_map(hex).collect()));
+    }
+    groups
+}
+
 /// Starts the thread that closes the trapped page again.
 pub fn start_write_trap() {
-    let Some(page) = std::env::var("VICTORY_TRAP_WRITES")
-        .ok()
-        .and_then(|v| usize::from_str_radix(v.split(',').next()?.trim_start_matches("0x"), 16).ok())
-    else {
+    let Some(groups) = trap_spec() else { return };
+    let pages: Vec<usize> = groups.iter().map(|(page, _)| *page).collect();
+    if pages.is_empty() {
         return;
-    };
+    }
     unsafe extern "C" {
         fn mprotect(addr: *mut std::ffi::c_void, len: usize, prot: i32) -> i32;
     }
     std::thread::spawn(move || {
         loop {
-            // SAFETY: the image's own data page.
-            unsafe { mprotect((page & !0xfff) as *mut _, 0x1000, 1) };
+            for page in &pages {
+                // SAFETY: the image's own data page.
+                unsafe { mprotect(*page as *mut _, 0x1000, 1) };
+            }
             std::thread::sleep(Duration::from_micros(300));
         }
     });
@@ -487,6 +513,32 @@ mod tests {
     use std::sync::mpsc::channel;
 
     use super::*;
+
+    /// The write trap takes one group of a page and its addresses, or several separated by `;`,
+    /// and keeps the form it had before groups existed (`<page>,<addr>,...`).
+    #[test]
+    fn a_write_trap_spec_takes_several_pages() {
+        assert_eq!(
+            parse_trap_spec("181796000,181796a28,181796a30"),
+            vec![(0x1_8179_6000, vec![0x1_8179_6a28, 0x1_8179_6a30])]
+        );
+        // ':' separates a page from its addresses, so the old form is not ambiguous either way.
+        assert_eq!(
+            parse_trap_spec("0x181796000:0x181796a28;0x1817c2000:0x1817c2a50"),
+            vec![
+                (0x1_8179_6000, vec![0x1_8179_6a28]),
+                (0x1_817c_2000, vec![0x1_817c_2a50]),
+            ]
+        );
+        // A page is rounded down, an entry that does not parse costs only itself, and a group with
+        // no page is dropped.
+        assert_eq!(parse_trap_spec("181796a28"), vec![(0x1_8179_6000, vec![])]);
+        assert_eq!(
+            parse_trap_spec("181796000,zz,181796a28"),
+            vec![(0x1_8179_6000, vec![0x1_8179_6a28])]
+        );
+        assert!(parse_trap_spec(";zz").is_empty());
+    }
 
     #[test]
     fn a_handled_access_violation_leaves_the_dump_for_the_fatal_one() {

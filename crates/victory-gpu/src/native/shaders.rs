@@ -365,7 +365,7 @@ impl<B: PresentBackend> Title<B> {
         let vs_layout = vs_binding.layout();
         let ps_layout = ps_full.as_ref().and_then(Binding::layout);
         let ps_binding = ps_full
-            .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
+            .filter(|b| b.memory || b.view_addresses || b.dwords > 0 || !b.views.is_empty());
         let desc = RenderPipelineDesc {
             vs: &vs.dxil,
             ps: ps.map(|p| &p.dxil[..]),

@@ -1612,6 +1612,132 @@ pub extern "system" fn GetQueuedCompletionStatusEx(
     i32::from(!failed)
 }
 
+// The file calls a title makes when it manages its own files: moving, copying and
+// replacing them, and asking what a handle is.
+
+const ERROR_FILE_EXISTS: u32 = 80;
+const FILE_TYPE_DISK: u32 = 0x1;
+const FILE_TYPE_CHAR: u32 = 0x2;
+const FILE_TYPE_PIPE: u32 = 0x3;
+const FILE_TYPE_UNKNOWN: u32 = 0;
+
+/// Copies the file's attributes as well as its bytes, which `std::fs::copy` does
+/// not; Windows keeps the source's attributes on the copy.
+fn copy_file(from: &Path, to: &Path, fail_if_exists: bool) -> i32 {
+    match (std::fs::metadata(from), to.exists()) {
+        (Err(e), _) => {
+            set_error(win32_error(&e, from));
+            0
+        }
+        (_, true) if fail_if_exists => {
+            set_error(ERROR_FILE_EXISTS);
+            0
+        }
+        _ => match std::fs::copy(from, to) {
+            Ok(_) => 1,
+            Err(e) => {
+                set_error(win32_error(&e, from));
+                0
+            }
+        },
+    }
+}
+
+/// `CopyFileW`: `FAIL_IF_EXISTS` is `ERROR_FILE_EXISTS`, otherwise the copy replaces
+/// what was there.
+pub extern "system" fn CopyFileW(from: *const u16, to: *const u16, fail_if_exists: i32) -> i32 {
+    match (wide_path(from), wide_path(to)) {
+        (Some(from), Some(to)) => copy_file(&from, &to, fail_if_exists != 0),
+        _ => {
+            set_error(ERROR_FILE_NOT_FOUND);
+            0
+        }
+    }
+}
+
+/// `ReplaceFileW`: the backup gets the file being replaced, and the replacement takes
+/// its name, which is how a title writes a save file without a half-written one.
+pub extern "system" fn ReplaceFileW(
+    replaced: *const u16,
+    replacement: *const u16,
+    backup: *const u16,
+    _flags: u32,
+    _exclude: *const c_void,
+    _reserved: *const c_void,
+) -> i32 {
+    let (Some(replaced), Some(replacement)) = (wide_path(replaced), wide_path(replacement)) else {
+        set_error(ERROR_FILE_NOT_FOUND);
+        return 0;
+    };
+    if !backup.is_null() {
+        let Some(backup) = wide_path(backup) else {
+            set_error(ERROR_FILE_NOT_FOUND);
+            return 0;
+        };
+        if copy_file(&replaced, &backup, false) == 0 {
+            return 0;
+        }
+    }
+    match std::fs::rename(&replacement, &replaced) {
+        Ok(()) => 1,
+        Err(e) => {
+            set_error(win32_error(&e, &replacement));
+            0
+        }
+    }
+}
+
+/// `GetFileType`: what a handle is, which a title asks before reading or seeking it.
+pub extern "system" fn GetFileType(handle: *mut c_void) -> u32 {
+    use std::os::unix::fs::FileTypeExt;
+    let Some(f) = file_of(handle) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return FILE_TYPE_UNKNOWN;
+    };
+    let Ok(metadata) = f.file.metadata() else {
+        // A handle with no metadata behind it: a pipe or a console.
+        return FILE_TYPE_PIPE;
+    };
+    let kind = metadata.file_type();
+    if kind.is_fifo() || kind.is_socket() {
+        FILE_TYPE_PIPE
+    } else if kind.is_char_device() {
+        FILE_TYPE_CHAR
+    } else {
+        FILE_TYPE_DISK
+    }
+}
+
+/// `CreateFileMappingA`: the ANSI form of [`CreateFileMappingW`]. A section name is
+/// not a path, so it is widened byte by byte rather than through the drive table.
+pub extern "system" fn CreateFileMappingA(
+    file: *mut c_void,
+    security: *const c_void,
+    protect: u32,
+    high: u32,
+    low: u32,
+    name: *const c_char,
+) -> *mut c_void {
+    if name.is_null() {
+        return CreateFileMappingW(
+            file,
+            security,
+            protect,
+            high,
+            low,
+            std::ptr::null(),
+        );
+    }
+    // SAFETY: the title's NUL-terminated name.
+    let wide: Vec<u16> = unsafe { CStr::from_ptr(name) }
+        .to_bytes()
+        .iter()
+        .map(|&b| u16::from(b))
+        .chain([0])
+        .collect();
+    CreateFileMappingW(file, security, protect, high, low, wide.as_ptr())
+}
+
 /// Names this module answers for.
 pub(super) fn lookup(name: &str) -> Option<usize> {
     macro_rules! table {
@@ -1651,6 +1777,10 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
         MapViewOfFileEx,
         UnmapViewOfFile,
         FlushViewOfFile,
+        CopyFileW,
+        ReplaceFileW,
+        GetFileType,
+        CreateFileMappingA,
         CreateIoCompletionPort,
         PostQueuedCompletionStatus,
         GetQueuedCompletionStatus,
@@ -2092,6 +2222,133 @@ mod tests {
         assert_eq!((first, second), (1, 2), "the key field of each entry");
         assert_eq!(super::super::CloseHandle(port), 1);
         assert_eq!(super::super::CloseHandle(file), 1);
+    }
+
+    /// A file is copied, moved and replaced through the calls a title uses to write
+    /// a save file without half-written ones, and each refusal has its reason.
+    #[test]
+    fn a_file_is_copied_moved_and_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let letter = mount(dir.path()).unwrap();
+        let wide = |s: &str| {
+            format!("{letter}:\\{s}")
+                .encode_utf16()
+                .chain([0])
+                .collect::<Vec<u16>>()
+        };
+        std::fs::write(dir.path().join("save.dat"), b"first").unwrap();
+
+        assert_eq!(
+            CopyFileW(wide("save.dat").as_ptr(), wide("copy.dat").as_ptr(), 0),
+            1
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("copy.dat")).unwrap(),
+            b"first"
+        );
+        // FAIL_IF_EXISTS keeps what is there and says why.
+        set_error(0);
+        assert_eq!(
+            CopyFileW(wide("save.dat").as_ptr(), wide("copy.dat").as_ptr(), 1),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_FILE_EXISTS);
+        // Overwriting is allowed when the caller does not ask to fail.
+        std::fs::write(dir.path().join("save.dat"), b"second").unwrap();
+        assert_eq!(
+            CopyFileW(wide("save.dat").as_ptr(), wide("copy.dat").as_ptr(), 0),
+            1
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("copy.dat")).unwrap(),
+            b"second"
+        );
+
+        // Replace: the backup holds the old file, and the new one takes its name.
+        std::fs::write(dir.path().join("new.dat"), b"third").unwrap();
+        assert_eq!(
+            ReplaceFileW(
+                wide("save.dat").as_ptr(),
+                wide("new.dat").as_ptr(),
+                wide("backup.dat").as_ptr(),
+                0,
+                std::ptr::null(),
+                std::ptr::null()
+            ),
+            1
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("save.dat")).unwrap(),
+            b"third"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("backup.dat")).unwrap(),
+            b"second"
+        );
+        assert!(!dir.path().join("new.dat").exists(), "the new file moved");
+
+        // Move, the plain form and the flag form.
+        assert_eq!(
+            super::super::system::MoveFileW(wide("save.dat").as_ptr(), wide("moved.dat").as_ptr()),
+            1
+        );
+        assert!(dir.path().join("moved.dat").exists());
+        set_error(0);
+        assert_eq!(
+            CopyFileW(wide("nothing.dat").as_ptr(), wide("x.dat").as_ptr(), 0),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_FILE_NOT_FOUND);
+    }
+
+    /// A file handle is a disk, a console is a character device, and a handle that is
+    /// no handle is unknown.
+    #[test]
+    fn a_handle_says_what_it_is() {
+        let (_dir, _path, file) = mapped_file(&[1u8; 64]);
+        assert_eq!(GetFileType(file), FILE_TYPE_DISK);
+        assert_eq!(super::super::CloseHandle(file), 1);
+        // A device node is a character device, whatever the host's console is, and
+        // the standard handles are not asserted on: this suite's stdout is a pipe in
+        // one run and a file in the next, and either answer is right for a handle.
+        let dev: Vec<u16> = "/dev/null".encode_utf16().chain([0]).collect();
+        let null = CreateFileW(
+            dev.as_ptr(),
+            GENERIC_READ,
+            0,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        assert_ne!(null, invalid_handle());
+        assert_eq!(GetFileType(null), FILE_TYPE_CHAR);
+        assert_eq!(super::super::CloseHandle(null), 1);
+        set_error(0);
+        assert_eq!(GetFileType(0xdead as *mut c_void), FILE_TYPE_UNKNOWN);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
+    }
+
+    /// The ANSI form of `CreateFileMapping` makes the same section, so a name given in
+    /// either encoding is found by the other.
+    #[test]
+    fn the_ansi_mapping_form_names_the_same_section() {
+        let name = b"Local\\victory-ansi-section";
+        let section = CreateFileMappingA(
+            invalid_handle(),
+            std::ptr::null(),
+            PAGE_READWRITE,
+            0,
+            4096,
+            name.as_ptr().cast(),
+        );
+        assert!(!section.is_null());
+        let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0);
+        // SAFETY: the view of the whole 4096-byte section.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(view.cast::<u8>(), 4096) };
+        bytes[0] = 5;
+        assert_eq!(UnmapViewOfFile(view), 1);
+        assert_eq!(super::super::CloseHandle(section), 1);
     }
 
     #[test]

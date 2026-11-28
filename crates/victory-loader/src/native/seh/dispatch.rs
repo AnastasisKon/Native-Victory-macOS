@@ -519,6 +519,20 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
             let base = unwind::image_base_of(c.rip as usize);
             if let Ok(list) = std::env::var("VICTORY_PEEK") {
                 for entry in list.split(',') {
+                    // `[rsi+0x10020]+0x38`: the entry reads a pointer and then a field of what it
+                    // names, the object the frame only points at. Two reads, each as careful as
+                    // the single one below.
+                    if let Some((inner, offset)) = crate::peek::deref_entry(entry) {
+                        let followed = crate::peek::address(inner, &c.gpr, base)
+                            .and_then(super::super::dump::read_checked)
+                            .and_then(|at| usize::try_from(at).ok())
+                            .and_then(|at| at.checked_add(offset));
+                        match followed.and_then(super::super::dump::read_checked) {
+                            Some(v) => tracing::warn!("peek through {entry} = {v:#x}"),
+                            None => tracing::warn!("peek through {entry} = not mapped"),
+                        }
+                        continue;
+                    }
                     let Some(at) = crate::peek::address(entry, &c.gpr, base) else { continue };
                     // An address written down by hand can name nothing, and a fault taken here
                     // would be a second one inside this dispatch, not the one being reported.

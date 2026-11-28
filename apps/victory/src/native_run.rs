@@ -251,6 +251,12 @@ pub fn run(
                 image.base(),
                 image.info().size_of_image as usize,
             );
+            // `VICTORY_BREAK_AT`: the places a reader picked out of the image, as `int3`, so the
+            // first-chance log names the registers and `VICTORY_PEEK` the state there.
+            victory_loader::resolution::apply_break_at(
+                image.base(),
+                image.info().size_of_image as usize,
+            );
         }
     }
     if let Some(tls) = image.tls() {

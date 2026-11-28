@@ -30,12 +30,7 @@ pub(crate) fn address(entry: &str, gpr: &[u64; 16], base: Option<usize>) -> Opti
         let index = register_index(reg)?;
         // Terms are summed, so `rsi+0x10020+0x38` names a field two steps into the object a writer
         // keeps: an entry the single-term form accepted as nothing and skipped without a word.
-        let mut offset = 0usize;
-        for term in terms.split('+') {
-            let term = usize::from_str_radix(term.trim().trim_start_matches("0x"), 16).ok()?;
-            offset = offset.checked_add(term)?;
-        }
-        return (gpr[index] as usize).checked_add(offset);
+        return (gpr[index] as usize).checked_add(sum_offsets(terms)?);
     }
     let at = usize::from_str_radix(entry.trim_start_matches("0x"), 16).ok()?;
     if at > 0x1000_0000 {
@@ -43,6 +38,37 @@ pub(crate) fn address(entry: &str, gpr: &[u64; 16], base: Option<usize>) -> Opti
     } else {
         base?.checked_add(at)
     }
+}
+
+/// The sum of a `+`-separated hex offset list (`0x` optional; empty is 0), as the entries after a
+/// register write it. A term that is no hex, or a sum past the address space, names nothing.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "x86_64")), allow(dead_code))]
+pub(crate) fn sum_offsets(spec: &str) -> Option<usize> {
+    let mut sum = 0usize;
+    for term in spec.split('+') {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        sum = sum.checked_add(usize::from_str_radix(term.trim_start_matches("0x"), 16).ok()?)?;
+    }
+    Some(sum)
+}
+
+/// An entry that follows a pointer before reading: `[rsi+0x10020]+0x38` reads the qword the writer
+/// pointer `[rsi+0x10020]` names, at `+0x38` — a field of an object the frame only points at. Split
+/// into the entry read first and the offset added to the value read there.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "x86_64")), allow(dead_code))]
+pub(crate) fn deref_entry(entry: &str) -> Option<(&str, usize)> {
+    let rest = entry.trim().strip_prefix('[')?;
+    let (inner, after) = rest.split_once(']')?;
+    let after = after.trim();
+    let offset = match after.strip_prefix('+') {
+        Some(terms) => sum_offsets(terms)?,
+        None if after.is_empty() => 0,
+        None => return None,
+    };
+    Some((inner.trim(), offset))
 }
 
 #[cfg(test)]
@@ -72,6 +98,22 @@ mod tests {
         gpr[6] = u64::MAX;
         assert_eq!(address("rsi+1", &gpr, None), None);
         assert_eq!(address("nonsense", &gpr, None), None);
+    }
+
+    /// An entry may follow a pointer first: `[entry]+offset` reads the qword the inner entry
+    /// names, then the qword at that value plus the offset. A bracketed entry with no closing
+    /// bracket, and one with something that is no offset after it, name nothing.
+    #[test]
+    fn peek_entries_follow_a_pointer_before_reading() {
+        assert_eq!(
+            deref_entry("[rsi+0x10020]+0x38"),
+            Some(("rsi+0x10020", 0x38))
+        );
+        assert_eq!(deref_entry("[ 0x181796a00 ]"), Some(("0x181796a00", 0)));
+        assert_eq!(deref_entry("[rsi]+8+8"), Some(("rsi", 0x10)));
+        assert_eq!(deref_entry("[rsi"), None);
+        assert_eq!(deref_entry("[rsi]x"), None);
+        assert_eq!(deref_entry("rsi+0x50"), None);
     }
 
     /// Offsets add up: an entry names a field of the object a register points into, and two terms

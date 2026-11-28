@@ -102,6 +102,9 @@ function tomsec(v,   n) {
     x = norm(x); drop[x]++
   }
   if (line ~ /unhandled exception/) { exc = line; excf = curframe; exct = lastt - t0 }
+  # The host fatal-signal line (app::log_fatal_signals, #392): written straight to stderr with no
+  # timestamp, before the process dies by the fault. It names what the exit status alone cannot.
+  if (line ~ /victory: fatal signal / && fatal == "") { fatal = line; fatalf = curframe; fatalt = lastt - t0 }
   if (line ~ /no audio device: sound is mixed and dropped/) {
     naud++
     aerr = line; sub(/.*error=/, "", aerr)
@@ -168,6 +171,7 @@ function metrics(   i, k, w, nw, v, r, u, kd, d, end) { # the --compare rows, on
   for (kd in gk) if (kd != "Timeout" && kd != "OutOfMemory") emit("gpu", kd, gk[kd])
   for (d in drop) emit("drop", d, drop[d])
   if (exc != "") { end = exc; sub(/.* at /, "", end); sub(/ .*/, "", end); end = "fault at " end }
+  else if (fatal != "") { end = fatal; sub(/^victory: /, "", end); sub(/ at address /, " at ", end) }
   else if (exitcode == 139) end = "SIGSEGV"
   else if (timedout) end = "time limit"
   else if (nend) end = "watchdog/kill line"
@@ -247,8 +251,9 @@ END {
 
   print "-- how it ended"
   if (exc != "") printf "  %s\n  (at +%.1fs, frame~%d)\n", substr(exc, 1, 120), exct, excf
+  if (fatal != "") printf "  %s\n  (at +%.1fs, frame~%d)\n", substr(fatal, 1, 120), fatalt, fatalf
   for (i = 1; i <= nend && i <= 3; i++) print "  " endl[i]
-  if (exc == "" && !nend) print "  no unhandled exception or watchdog line (killed by --seconds or clean exit)"
+  if (exc == "" && fatal == "" && !nend) print "  no unhandled exception, fatal-signal or watchdog line (killed by --seconds or clean exit)"
   printf "  last frame reached: %d\n\n", curframe
 
   if (prof != "") {
@@ -343,6 +348,7 @@ metal: command buffer failed: NSError { code: 2, "Caused GPU Hang Error (0000000
 @ESC@[2m2026-01-01T00:00:05.100000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::host: submit timing: lists=1 cmds=9 prep=2.5ms encode_commit=0.5ms total=3.0ms
 @ESC@[2m2026-01-01T00:00:05.200000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::textures: unmapped levels: 12.0MB in 3 levels of 2 textures (f28=10.0MB f45=2.0MB)
 VIctory: unhandled exception 0xc0000005 at image+0x1234 [0]
+victory: fatal signal 11 (code 1) at address 0x7ff8deadbeef
 LOG
   out=$(summarise "$f")
   rm -f "$f"
@@ -356,6 +362,7 @@ LOG
   chk 'mixer seconds: 1, spatial stream activations: 1, DSP connects: 0, DSP streams: 0'
   chk 'submit timing (VICTORY_SUBMIT_TIMING): 2 submissions, total 4.8 ms (prep 4.0 ms, encode+commit 0.8 ms), slowest 3.0 ms'
   chk 'unmapped mip levels (VICTORY_TRACE_UNMAPPED_LEVELS): 1 lines, last: victory_gpu::native::textures: unmapped levels: 12.0MB in 3 levels of 2 textures'
+  chk 'victory: fatal signal 11 (code 1) at address 0x7ff8deadbeef'
   [ "$ok" = 1 ] && echo "self-test ok" || { printf '%s\n' "$out"; exit 1; }
 }
 

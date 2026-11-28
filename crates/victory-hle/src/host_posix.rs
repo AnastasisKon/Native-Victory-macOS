@@ -39,6 +39,19 @@ mod winsock;
 mod wasapi;
 mod xaudio2;
 
+/// The turn of whichever test is driving Winsock.
+///
+/// The startup count is the process's, and so are the ephemeral ports the
+/// tests bind and release: a test elsewhere that reaches these calls by name
+/// (`host!("ws2_32.dll", ...)`, as `modules::net`'s does) takes the same turn,
+/// so no run can start the stack up, or take a port, inside another's
+/// assertions about either.
+#[cfg(test)]
+pub(crate) fn winsock_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 0x102;
 const WAIT_FAILED: u32 = 0xFFFF_FFFF;
@@ -443,6 +456,9 @@ pub extern "system" fn TlsSetValue(index: u32, value: *mut c_void) -> i32 {
 
 // Kernel objects: a handle table over `victory-platform`.
 
+/// Every kind is shared with the handle, so a copy of the object is a second
+/// handle to the same thing, which is what `DuplicateHandle` makes.
+#[derive(Clone)]
 pub(crate) enum Object {
     Event(Arc<Event>),
     Semaphore(Arc<Semaphore>),
@@ -760,6 +776,42 @@ pub extern "system" fn CloseHandle(handle: *mut c_void) -> i32 {
     1
 }
 
+/// `DuplicateHandle` within this process: a second handle to the same object,
+/// which shares its state as it does on Windows (a file's position, a thread's
+/// end, an event's signal). A handle of another process is not in this table and
+/// is refused.
+pub extern "system" fn DuplicateHandle(
+    source_process: *mut c_void,
+    source: *mut c_void,
+    target_process: *mut c_void,
+    target: *mut *mut c_void,
+    _access: u32,
+    _inherit: i32,
+    options: u32,
+) -> i32 {
+    const DUPLICATE_CLOSE_SOURCE: u32 = 0x1;
+    if target.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let current = system::GetCurrentProcess() as usize as *mut c_void;
+    if source_process != current || target_process != current {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    let Some(object) = lock(&HANDLES).get(&(source as usize)).cloned() else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    let handle = new_handle(object);
+    if options & DUPLICATE_CLOSE_SOURCE != 0 {
+        lock(&HANDLES).remove(&(source as usize));
+    }
+    // SAFETY: the title's out handle.
+    unsafe { target.write(handle) };
+    1
+}
+
 /// `CreateThread`: the start routine runs in title code, on a thread with
 /// its own TEB and static TLS, after the images' thread-attach notices.
 /// `CREATE_SUSPENDED` keeps it from running until `ResumeThread`.
@@ -989,6 +1041,7 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     table!(
         GetLastError,
         SetLastError,
+        DuplicateHandle,
         GetCurrentThreadId,
         GetCurrentProcessId,
         QueryPerformanceFrequency,
@@ -1525,5 +1578,81 @@ mod memory_tests {
         assert_eq!(CloseHandle(auto_ev), 1);
         assert_eq!(CloseHandle(other_ev), 1);
         assert_eq!(CloseHandle(never_ev), 1);
+    }
+}
+
+#[cfg(test)]
+mod duplicate_handle_tests {
+    use super::*;
+
+    fn event(manual: bool, initial: bool) -> *mut c_void {
+        CreateEventW(std::ptr::null(), i32::from(manual), i32::from(initial), std::ptr::null())
+    }
+
+    /// A duplicate is a second handle to the same object: the signal seen
+    /// through one is seen through the other, and closing one leaves the other.
+    #[test]
+    fn a_duplicate_is_the_same_object() {
+        let source = event(false, false);
+        assert!(!source.is_null());
+        let mut copy: *mut c_void = std::ptr::null_mut();
+        let process = system::GetCurrentProcess() as usize as *mut c_void;
+        assert_eq!(
+            DuplicateHandle(
+                process,
+                source,
+                process,
+                &mut copy,
+                0,
+                0,
+                0x2 // DUPLICATE_SAME_ACCESS
+            ),
+            1
+        );
+        assert!(!copy.is_null());
+        assert_ne!(copy, source);
+
+        assert_eq!(SetEvent(source), 1);
+        assert_eq!(WaitForSingleObject(copy, 0), WAIT_OBJECT_0);
+
+        assert_eq!(CloseHandle(source), 1);
+        assert_eq!(SetEvent(copy), 1);
+        assert_eq!(WaitForSingleObject(copy, 0), WAIT_OBJECT_0);
+        assert_eq!(CloseHandle(copy), 1);
+    }
+
+    /// Closing the source as part of the duplication leaves only the copy, and a
+    /// handle that is not in this process's table is refused.
+    #[test]
+    fn the_source_can_be_closed_with_the_copy_and_what_is_not_a_handle_is_refused() {
+        let source = event(true, true);
+        let mut copy: *mut c_void = std::ptr::null_mut();
+        let process = system::GetCurrentProcess() as usize as *mut c_void;
+        assert_eq!(
+            DuplicateHandle(process, source, process, &mut copy, 0, 0, 0x1),
+            1
+        );
+        assert_eq!(WaitForSingleObject(source, 0), WAIT_FAILED);
+        assert_eq!(WaitForSingleObject(copy, 0), WAIT_OBJECT_0);
+        assert_eq!(CloseHandle(copy), 1);
+
+        let mut out: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DuplicateHandle(process, 0x1234 as *mut c_void, process, &mut out, 0, 0, 0),
+            0
+        );
+        assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+        // Another process's handle is not in this table.
+        assert_eq!(
+            DuplicateHandle(process, source, process, std::ptr::null_mut(), 0, 0, 0),
+            0
+        );
+        assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn duplicate_handle_is_answered_rather_than_stubbed() {
+        assert!(lookup("api-ms-win-core-handle-l1-1-0.dll", "DuplicateHandle").is_some());
+        assert!(lookup("kernel32.dll", "DuplicateHandle").is_some());
     }
 }

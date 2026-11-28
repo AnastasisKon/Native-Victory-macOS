@@ -22,7 +22,7 @@ use victory_platform::mem::{self, Protect};
 use victory_platform::sync::{Event, Semaphore};
 use victory_platform::thread;
 
-use super::{Object, files, lock, new_handle, set_error};
+use super::{Object, WAIT_OBJECT_0, WAIT_TIMEOUT, Waitable, files, lock, new_handle, set_error};
 
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_ACCESS_DENIED: u32 = 5;
@@ -32,6 +32,7 @@ const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_NOT_OWNER: u32 = 288;
 const ERROR_INVALID_FLAGS: u32 = 1004;
+const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
 
@@ -565,6 +566,198 @@ pub extern "system" fn LocalFree(memory: *mut c_void) -> *mut c_void {
 
 pub extern "system" fn GlobalFree(memory: *mut c_void) -> *mut c_void {
     LocalFree(memory)
+}
+
+/// `GetConsoleWindow`: this host writes to the standard streams, so a console
+/// is here and its window is a handle of its own (as `CreateWindowExA` above
+/// answers for a library's message window). Nothing draws on it.
+static CONSOLE_WINDOW: AtomicU64 = AtomicU64::new(0x10);
+
+pub extern "system" fn GetConsoleWindow() -> *mut c_void {
+    CONSOLE_WINDOW.load(Ordering::Relaxed) as *mut c_void
+}
+
+/// `GetConsoleScreenBufferInfo`: the shape a title sizes its output to. The
+/// numbers are the ones a Windows console starts with.
+pub extern "system" fn GetConsoleScreenBufferInfo(
+    handle: *mut c_void,
+    info: *mut u8,
+) -> i32 {
+    if handle.is_null() || info.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: the title's CONSOLE_SCREEN_BUFFER_INFO, 22 bytes.
+    unsafe {
+        let put16 = |at: usize, v: i16| info.add(at).cast::<i16>().write_unaligned(v);
+        put16(0, 80); // dwSize.X
+        put16(2, 25); // dwSize.Y
+        put16(4, 0); // dwCursorPosition.X
+        put16(6, 0); // dwCursorPosition.Y
+        put16(8, 7); // wAttributes: grey on black
+        put16(10, 0); // srWindow.Left
+        put16(12, 0); // srWindow.Top
+        put16(14, 79); // srWindow.Right
+        put16(16, 24); // srWindow.Bottom
+        put16(18, 80); // dwMaximumWindowSize.X
+        put16(20, 25); // dwMaximumWindowSize.Y
+    }
+    1
+}
+
+/// `WriteConsoleW`: the text goes to the stream it was written to, as UTF-8,
+/// rather than nowhere. What a console would draw with attributes is not drawn.
+pub extern "system" fn WriteConsoleW(
+    handle: *mut c_void,
+    buffer: *const u16,
+    len: u32,
+    written: *mut u32,
+    _reserved: *const c_void,
+) -> i32 {
+    const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
+    if !written.is_null() {
+        // SAFETY: the title's count out-pointer.
+        unsafe { written.write(0) };
+    }
+    if handle.is_null() || (len > 0 && buffer.is_null()) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let text = if len == 0 {
+        std::borrow::Cow::Borrowed("")
+    } else {
+        // SAFETY: the title's buffer of `len` characters.
+        let units = unsafe { std::slice::from_raw_parts(buffer, len as usize) };
+        String::from_utf16_lossy(units).into()
+    };
+    let fd = if handle == files::GetStdHandle(STD_ERROR_HANDLE) {
+        2
+    } else {
+        1
+    };
+    let bytes = text.as_bytes();
+    // SAFETY: a plain write of the title's text to the host's stream.
+    let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+    if n < 0 {
+        return 0;
+    }
+    if !written.is_null() {
+        // SAFETY: the title's count out-pointer.
+        unsafe { written.write(len) };
+    }
+    1
+}
+
+/// `LocalAlloc`: the process heap's block, as `HeapAlloc` gives one. A movable
+/// block is refused rather than answered with a pointer, since a pointer is not
+/// a movable handle.
+///
+/// Note that `LocalFree` keeps nothing to free (see its note), so what this
+/// allocates is never returned: a title that allocates in a loop would grow.
+pub extern "system" fn LocalAlloc(flags: u32, bytes: usize) -> *mut c_void {
+    const LMEM_ZEROINIT: u32 = 0x0040;
+    const LMEM_MOVEABLE: u32 = 0x0002;
+    if flags & LMEM_MOVEABLE != 0 {
+        tracing::warn!("LocalAlloc: a movable block is not answered");
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    if bytes == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a non-zero size; the block is the title's.
+    let block = unsafe { libc::malloc(bytes) };
+    if block.is_null() {
+        set_error(ERROR_NOT_ENOUGH_MEMORY);
+        return std::ptr::null_mut();
+    }
+    if flags & LMEM_ZEROINIT != 0 {
+        // SAFETY: `bytes` of the block this call just allocated.
+        unsafe { std::ptr::write_bytes(block.cast::<u8>(), 0, bytes) };
+    }
+    block
+}
+
+/// `lstrlenW`: the length in characters, not counting the terminator.
+pub extern "system" fn lstrlenW(text: *const u16) -> i32 {
+    if text.is_null() {
+        return 0;
+    }
+    let mut n = 0usize;
+    // SAFETY: the title's NUL-terminated string.
+    unsafe {
+        while *text.add(n) != 0 {
+            n += 1;
+        }
+    }
+    n as i32
+}
+
+/// `lstrcmpiW`: case-insensitive comparison, as Windows makes it, by folding
+/// case rather than by the host's locale.
+pub extern "system" fn lstrcmpiW(left: *const u16, right: *const u16) -> i32 {
+    if left.is_null() || right.is_null() {
+        // Windows compares a null string as empty.
+        return i32::from(left.is_null() as i32 as u8) - i32::from(right.is_null() as i32 as u8);
+    }
+    let mut at = 0usize;
+    loop {
+        // SAFETY: the title's NUL-terminated strings, read to their end.
+        let (a, b) = unsafe { (*left.add(at), *right.add(at)) };
+        if a == 0 || b == 0 {
+            return i32::from(a != 0) - i32::from(b != 0);
+        }
+        let fold = |c: u16| -> u32 {
+            char::from_u32(u32::from(c))
+                .map(|ch| {
+                    ch.to_lowercase()
+                        .next()
+                        .map_or(u32::from(c), |lower| lower as u32)
+                })
+                .unwrap_or(u32::from(c))
+        };
+        let (fa, fb) = (fold(a), fold(b));
+        if fa != fb {
+            return if fa < fb { -1 } else { 1 };
+        }
+        at += 1;
+    }
+}
+
+/// `GetUserDefaultUILanguage`: the language of the interface, which for this
+/// host is the one its locale answers with.
+pub extern "system" fn GetUserDefaultUILanguage() -> u16 {
+    0x0409
+}
+
+/// `GetSystemTimeAdjustment`: the clock is not adjusted here, and the increment
+/// is the timer's period on Windows (15.625 ms in 100 ns units).
+pub extern "system" fn GetSystemTimeAdjustment(
+    adjustment: *mut u32,
+    increment: *mut u32,
+    disabled: *mut i32,
+) -> i32 {
+    // SAFETY: the title's out parameters, each optional.
+    unsafe {
+        if !adjustment.is_null() {
+            adjustment.write(0);
+        }
+        if !increment.is_null() {
+            increment.write(156_250);
+        }
+        if !disabled.is_null() {
+            disabled.write(1);
+        }
+    }
+    1
+}
+
+/// `FlushProcessWriteBuffers`: on Windows this makes every thread's earlier
+/// writes visible to every other. The fence is what that means here; the host's
+/// memory is already coherent.
+pub extern "system" fn FlushProcessWriteBuffers() {
+    std::sync::atomic::fence(Ordering::SeqCst);
 }
 
 pub extern "system" fn EncodePointer(pointer: *mut c_void) -> *mut c_void {
@@ -1731,6 +1924,10 @@ struct PoolState {
     cancel_generation: u64,
     queued: u32,
     running: u32,
+    /// Workers still blocked on a wait object, waiting for it or for the arming
+    /// to be retired. Counted so `WaitForThreadpoolWaitCallbacks` can answer
+    /// "nothing of mine is still armed".
+    armed: u32,
 }
 
 impl PoolState {
@@ -1809,6 +2006,76 @@ impl PoolObject {
         });
     }
 
+    /// Arms one wait on `object`: the callback runs once when the object is
+    /// signalled, or when `timeout` passes, whichever comes first.
+    ///
+    /// A worker of its own performs the wait, because the title arms a wait and
+    /// goes on: the object it waits on may be signalled long after the call
+    /// returns. One callback per arming, as Windows does it - a wait on an
+    /// object that stays signalled would otherwise call back in a loop nobody
+    /// asked for. Arming again, cancelling, or closing retires the wait.
+    fn wait_once(
+        &'static self,
+        state: &mut PoolState,
+        object: Waitable,
+        timeout: Option<Duration>,
+    ) {
+        let generation = state.timer_generation;
+        state.armed += 1;
+        let armed_at = Instant::now();
+        std::thread::spawn(move || {
+            // In slices, so a disarm need not wait for the object to change.
+            const SLICE: Duration = Duration::from_millis(20);
+            let deadline = timeout.map(|t| armed_at + t);
+            let result = loop {
+                if lock(&self.state).timer_generation != generation {
+                    break None;
+                }
+                let slice = match deadline {
+                    None => SLICE,
+                    Some(deadline) => {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            // The title asked for the callback on the timeout too.
+                            break Some(WAIT_TIMEOUT);
+                        }
+                        left.min(SLICE)
+                    }
+                };
+                if object.wait(Some(slice)) {
+                    break Some(WAIT_OBJECT_0);
+                }
+            };
+            let mut state = lock(&self.state);
+            state.armed -= 1;
+            let result = match result {
+                Some(result) if state.timer_generation == generation => result,
+                _ => {
+                    self.changed.notify_all();
+                    return;
+                }
+            };
+            state.running += 1;
+            self.changed.notify_all();
+            drop(state);
+            // SAFETY: the title's TP_WAIT_CALLBACK, called as Windows calls it.
+            unsafe {
+                native::call_win64(
+                    self.callback,
+                    &[
+                        &raw const INSTANCE as u64,
+                        self.context as u64,
+                        self as *const Self as u64,
+                        result as u64,
+                    ],
+                )
+            };
+            let mut state = lock(&self.state);
+            state.running -= 1;
+            self.changed.notify_all();
+        });
+    }
+
     fn wait_idle(&self, cancel: bool) {
         let mut state = lock(&self.state);
         if cancel && state.queued != 0 {
@@ -1818,7 +2085,7 @@ impl PoolObject {
         }
         drop(
             self.changed
-                .wait_while(state, |s| s.queued != 0 || s.running != 0)
+                .wait_while(state, |s| s.queued != 0 || s.running != 0 || s.armed != 0)
                 .unwrap_or_else(|e| e.into_inner()),
         );
     }
@@ -1886,6 +2153,67 @@ pub extern "system" fn WaitForThreadpoolTimerCallbacks(timer: *mut PoolObject, c
 pub extern "system" fn CloseThreadpoolTimer(timer: *mut PoolObject) {
     SetThreadpoolTimer(timer, std::ptr::null(), 0, 0);
     WaitForThreadpoolTimerCallbacks(timer, 1);
+}
+
+pub extern "system" fn CreateThreadpoolWait(
+    callback: usize,
+    context: usize,
+    _environment: *const c_void,
+) -> *mut PoolObject {
+    new_pool_object(callback, context)
+}
+
+pub extern "system" fn SetThreadpoolWait(
+    wait: *mut PoolObject,
+    handle: *mut c_void,
+    timeout: *const i64,
+) {
+    // SAFETY: pool objects live for the life of the process.
+    let o: &'static PoolObject = unsafe { &*wait };
+    let mut state = lock(&o.state);
+    // Arming again retires the wait it replaces, as Windows does.
+    state.timer_generation = state.timer_generation.wrapping_add(1);
+    o.changed.notify_all();
+    if handle.is_null() {
+        // A null handle disarms the wait and is not an error.
+        return;
+    }
+    let Some(object) = Waitable::of(handle) else {
+        // Nothing is armed for a handle that cannot be waited on, and the
+        // callback would describe a wait that never happened.
+        tracing::warn!("SetThreadpoolWait: {handle:p} is not a waitable object");
+        return;
+    };
+    // SAFETY: the title's optional due time, a relative FILETIME.
+    let timeout = (!timeout.is_null()).then(|| until(unsafe { timeout.read_unaligned() }));
+    o.wait_once(&mut state, object, timeout);
+}
+
+pub extern "system" fn WaitForThreadpoolWaitCallbacks(wait: *mut PoolObject, cancel: i32) {
+    // SAFETY: as above.
+    let o = unsafe { &*wait };
+    if cancel != 0 {
+        // Cancelling a wait means the callback will not run: retiring the
+        // arming is how the worker blocked on the object hears it.
+        let mut state = lock(&o.state);
+        state.timer_generation = state.timer_generation.wrapping_add(1);
+        o.changed.notify_all();
+        drop(state);
+    }
+    o.wait_idle(false);
+}
+
+pub extern "system" fn CloseThreadpoolWait(wait: *mut PoolObject) {
+    SetThreadpoolWait(wait, std::ptr::null_mut(), std::ptr::null());
+    WaitForThreadpoolWaitCallbacks(wait, 1);
+}
+
+/// `ExitProcess`: the process ends with this code. The images' detach runs
+/// first, through the exit table registered when the first one attached, which
+/// is `ExitProcess`'s order.
+pub extern "system" fn ExitProcess(code: u32) -> ! {
+    tracing::info!("ExitProcess({code})");
+    std::process::exit(code as i32);
 }
 
 pub extern "system" fn CallbackMayRunLong(_instance: *const c_void) -> i32 {
@@ -2425,6 +2753,241 @@ pub extern "system" fn CertFindChainInStore(
 
 pub extern "system" fn CertFreeCertificateChain(_chain: *const c_void) {}
 
+// The same answer for the store a library opens by provider rather than by
+// name, and for what it looks up in it: this host has no certificate store, so
+// there is nothing to open and nothing to find. Saying so is what a machine
+// without the store does; a handle nobody can read would have the caller
+// believe it has certificates.
+
+pub extern "system" fn CertOpenStore(
+    _provider: *const u8,
+    _encoding: u32,
+    _crypt: usize,
+    _flags: u32,
+    _para: *const c_void,
+) -> *mut c_void {
+    set_error(ERROR_FILE_NOT_FOUND);
+    std::ptr::null_mut()
+}
+
+pub extern "system" fn CertFindCertificateInStore(
+    _store: *mut c_void,
+    _encoding: u32,
+    _flags: u32,
+    _kind: u32,
+    _to_find: *const c_void,
+    _previous: *const c_void,
+) -> *const c_void {
+    set_error(ERROR_FILE_NOT_FOUND);
+    std::ptr::null()
+}
+
+pub extern "system" fn CertFreeCertificateContext(_context: *const c_void) -> i32 {
+    1
+}
+
+// The crypt32 string codecs. `XCurl` decodes the user and password out of the
+// proxy URL before it builds the auth header, so this one has to be right
+// rather than plausible: a wrong decode corrupts the header silently.
+
+const CRYPT_STRING_BASE64: u32 = 0x1;
+const CRYPT_STRING_BINARY: u32 = 0x2;
+const CRYPT_STRING_BASE64HEADER: u32 = 0x4;
+const CRYPT_STRING_BASE64REQUEST: u32 = 0x8;
+const CRYPT_STRING_BASE64_ANY: u32 = 0x6;
+const ERROR_INVALID_DATA: u32 = 13;
+const ERROR_MORE_DATA: u32 = 234;
+
+/// What the text encodes: the bytes, which encoding it turned out to be, and how
+/// many characters of preamble were skipped to reach it.
+type Decoded = (Vec<u8>, u32, u32);
+
+fn decode_crypt_string(text: &[u8], flags: u32) -> Result<Decoded, u32> {
+    // The format is a value, not a bit: `CRYPT_STRING_BASE64_ANY` is six, so a
+    // bit test would read it as binary.
+    match flags & 0xF {
+        CRYPT_STRING_BINARY => return Ok((text.to_vec(), CRYPT_STRING_BINARY, 0)),
+        CRYPT_STRING_BASE64
+        | CRYPT_STRING_BASE64HEADER
+        | CRYPT_STRING_BASE64REQUEST
+        | CRYPT_STRING_BASE64_ANY => {}
+        // Hex and the other encodings are not what this title asks for, and a
+        // decoder guessed at is worse than a refusal that shows up in a log.
+        other => {
+            tracing::warn!("CryptStringToBinary: flags {other:#x} are not answered");
+            return Err(ERROR_INVALID_PARAMETER);
+        }
+    }
+    let armored = flags & (CRYPT_STRING_BASE64HEADER | CRYPT_STRING_BASE64REQUEST | CRYPT_STRING_BASE64_ANY) != 0;
+    let body_of = |text: &[u8]| -> (Vec<u8>, u32) {
+        if !armored {
+            return (text.to_vec(), 0);
+        }
+        // Line by line: the dashes of the armor and the header lines before the
+        // body are not part of the encoded data, and a body line holds nothing
+        // but the alphabet.
+        let (mut body, mut skipped, mut at) = (Vec::new(), 0u32, 0u32);
+        for line in text.split(|&b| b == b'\n') {
+            let holds_body = line.iter().all(|&b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(b, b'+' | b'/' | b'=' | b'\r' | b'\t' | b' ')
+            }) && line.iter().any(|&b| !matches!(b, b'\r' | b'\t' | b' '));
+            if holds_body {
+                if body.is_empty() {
+                    let lead = line
+                        .iter()
+                        .position(|&b| !matches!(b, b'\r' | b'\t' | b' '))
+                        .unwrap_or(0);
+                    skipped = at + lead as u32;
+                }
+                body.extend_from_slice(line);
+            }
+            at += line.len() as u32 + 1;
+        }
+        (body, skipped)
+    };
+    let (body, skipped) = body_of(text);
+    let bytes = base64_body(&body)?;
+    // Which flavour the text turned out to be: the armor is what the dashes say.
+    let opened_with_dashes = text
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'-');
+    let used = if opened_with_dashes {
+        CRYPT_STRING_BASE64HEADER
+    } else {
+        CRYPT_STRING_BASE64
+    };
+    Ok((bytes, used, skipped))
+}
+
+/// RFC 4648 base64: four characters to three bytes, `=` once at the end, and
+/// whitespace anywhere as the encoder writes it at line ends.
+fn base64_body(body: &[u8]) -> Result<Vec<u8>, u32> {
+    let mut out = Vec::with_capacity(body.len() / 4 * 3 + 3);
+    let (mut bits, mut held) = (0u32, 0u32);
+    let mut padded = false;
+    for &b in body {
+        let value = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                padded = true;
+                continue;
+            }
+            b' ' | b'\t' | b'\r' | b'\n' => continue,
+            // Not an alphabet character and not padding: this is not base64.
+            _ => return Err(ERROR_INVALID_DATA),
+        };
+        if padded {
+            // Data after the padding is not a base64 string.
+            return Err(ERROR_INVALID_DATA);
+        }
+        bits = (bits << 6) | u32::from(value);
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            out.push((bits >> held) as u8);
+        }
+    }
+    // Six bits left over is one character of a group of four, not a byte.
+    if held >= 6 {
+        return Err(ERROR_INVALID_DATA);
+    }
+    Ok(out)
+}
+
+pub extern "system" fn CryptStringToBinaryW(
+    string: *const u16,
+    length: u32,
+    flags: u32,
+    binary: *mut u8,
+    size: *mut u32,
+    skip: *mut u32,
+    used: *mut u32,
+) -> i32 {
+    if string.is_null() || size.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: the title's string, `length` characters or NUL-terminated.
+    let wide = unsafe {
+        let mut n = 0usize;
+        if length == u32::MAX {
+            while *string.add(n) != 0 {
+                n += 1;
+            }
+        } else {
+            n = length as usize;
+        }
+        std::slice::from_raw_parts(string, n)
+    };
+    // Every encoding answered here is ASCII, so a character above that is not
+    // one of them whatever the flags say.
+    let mut text = Vec::with_capacity(wide.len());
+    for &c in wide {
+        match u8::try_from(c) {
+            Ok(b) => text.push(b),
+            Err(_) => {
+                set_error(ERROR_INVALID_DATA);
+                return 0;
+            }
+        }
+    }
+    let (bytes, reported, skipped) = match decode_crypt_string(&text, flags) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            set_error(error);
+            return 0;
+        }
+    };
+    let needed = bytes.len() as u32;
+    // SAFETY: the title's out parameters, each optional.
+    unsafe {
+        if !skip.is_null() {
+            skip.write(skipped);
+        }
+        if !used.is_null() {
+            used.write(reported);
+        }
+        let room = *size;
+        size.write(needed);
+        if binary.is_null() {
+            // The size query: how much a buffer would need.
+            return 1;
+        }
+        if room < needed {
+            set_error(ERROR_MORE_DATA);
+            return 0;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), binary, bytes.len());
+    }
+    1
+}
+
+/// `RaiseFailFastException`: the process ends here, which is what fail-fast
+/// means — the record's code becomes the exit status, and nothing after the
+/// call runs (no unwinding, no exit handlers, as on Windows).
+pub extern "system" fn RaiseFailFastException(
+    record: *const c_void,
+    _context: *const c_void,
+    _flags: u32,
+) {
+    /// `STATUS_FAIL_FAST_EXCEPTION`, when the caller hands no record.
+    const STATUS_FAIL_FAST_EXCEPTION: u32 = 0xC000_0409;
+    let code = if record.is_null() {
+        STATUS_FAIL_FAST_EXCEPTION
+    } else {
+        // SAFETY: the title's `EXCEPTION_RECORD`, whose first field is its code.
+        unsafe { record.cast::<u32>().read() }
+    };
+    tracing::error!("the title raised a fail-fast exception, code {code:#010x}");
+    std::process::exit(code as i32);
+}
+
 // user32: the console has one window of the title's own; these are for
 // libraries that make a message window and pump it.
 
@@ -2528,6 +3091,15 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             LCMapStringEx,
             GetUserDefaultLocaleName,
             GetUserDefaultGeoName,
+            GetUserDefaultUILanguage,
+            GetSystemTimeAdjustment,
+            GetConsoleWindow,
+            GetConsoleScreenBufferInfo,
+            WriteConsoleW,
+            FlushProcessWriteBuffers,
+            LocalAlloc,
+            lstrlenW,
+            lstrcmpiW,
             LocaleNameToLCID,
             GetLocaleInfoEx,
             FormatMessageA,
@@ -2553,6 +3125,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             IsProcessorFeaturePresent,
             IsDebuggerPresent,
             UnhandledExceptionFilter,
+            RaiseFailFastException,
             RtlCaptureStackBackTrace,
             RtlUnwind,
             WerRegisterFile,
@@ -2608,6 +3181,11 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             SetThreadpoolTimer,
             WaitForThreadpoolTimerCallbacks,
             CloseThreadpoolTimer,
+            ExitProcess,
+            CreateThreadpoolWait,
+            SetThreadpoolWait,
+            WaitForThreadpoolWaitCallbacks,
+            CloseThreadpoolWait,
             CallbackMayRunLong,
             DisassociateCurrentThreadFromCallback,
             FreeLibraryWhenCallbackReturns,
@@ -2669,8 +3247,12 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
     if dll == "crypt32.dll" {
         return table!(
             CertOpenSystemStoreW,
+            CertOpenStore,
             CertCloseStore,
+            CryptStringToBinaryW,
             CertFindChainInStore,
+            CertFindCertificateInStore,
+            CertFreeCertificateContext,
             CertFreeCertificateChain
         );
     }
@@ -3365,5 +3947,483 @@ mod trace_tests {
             ),
             ERROR_INVALID_PARAMETER
         );
+    }
+}
+
+#[cfg(test)]
+mod cert_and_fail_fast_tests {
+    use super::*;
+
+    #[test]
+    fn a_store_that_does_not_exist_is_reported_as_missing() {
+        // `XCurl` opens the store by provider rather than by name, and looks a
+        // certificate up in it. This host has no store: saying so is what a
+        // machine without one does, and a handle nobody can read would have the
+        // caller believe it has certificates.
+        for name in [
+            "CertOpenStore",
+            "CertFindCertificateInStore",
+            "CertFreeCertificateContext",
+        ] {
+            assert!(
+                lookup("crypt32.dll", name).is_some(),
+                "{name} is not answered"
+            );
+        }
+        assert!(CertOpenStore(std::ptr::null(), 0, 0, 0, std::ptr::null()).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_FILE_NOT_FOUND);
+        assert!(
+            CertFindCertificateInStore(
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                std::ptr::null(),
+                std::ptr::null()
+            )
+            .is_null()
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_FILE_NOT_FOUND);
+        // Freeing a certificate nobody has is not an error.
+        assert_eq!(CertFreeCertificateContext(std::ptr::null()), 1);
+    }
+
+    #[test]
+    fn the_fail_fast_call_is_answered_rather_than_stubbed() {
+        // Not called: it ends the process, which is the point of it.
+        assert!(
+            lookup(
+                "api-ms-win-core-errorhandling-l1-1-2.dll",
+                "RaiseFailFastException"
+            )
+            .is_some()
+        );
+    }
+}
+
+#[cfg(test)]
+mod threadpool_wait_tests {
+    use super::*;
+
+    /// 100 ms and an hour in the unit a due time is given in: 100 ns per tick.
+    const HUNDRED_MS: i64 = -1_000_000;
+    const ONE_HOUR: i64 = -3600 * TICKS_PER_SECOND as i64;
+
+    /// A wait the title armed on an auto-reset event runs its callback once the
+    /// event is signalled, and reports what it saw.
+    #[test]
+    fn a_signalled_object_runs_the_callback_once() {
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static SEEN: AtomicU32 = AtomicU32::new(u32::MAX);
+        extern "C" fn note(_instance: usize, _context: usize, _wait: usize, result: u32) {
+            SEEN.store(result, Ordering::Relaxed);
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let callback = native::host_callbacks(&[(note as *const () as usize, false)]).unwrap()[0];
+        let event = super::super::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        assert!(!event.is_null());
+        let wait = CreateThreadpoolWait(callback, 0, std::ptr::null());
+        SetThreadpoolWait(wait, event, std::ptr::null());
+        assert_eq!(super::super::SetEvent(event), 1);
+        WaitForThreadpoolWaitCallbacks(wait, 0);
+        assert_eq!(
+            (CALLS.load(Ordering::Relaxed), SEEN.load(Ordering::Relaxed)),
+            (1, WAIT_OBJECT_0)
+        );
+
+        // One callback per arming: a signal with nothing armed is not a callback.
+        assert_eq!(super::super::SetEvent(event), 1);
+        WaitForThreadpoolWaitCallbacks(wait, 0);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+
+        CloseThreadpoolWait(wait);
+        super::super::CloseHandle(event);
+    }
+
+    /// An object that is never signalled still calls back when the due time
+    /// passes, and says the wait timed out.
+    #[test]
+    fn a_wait_that_is_never_signalled_runs_the_callback_on_its_due_time() {
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static SEEN: AtomicU32 = AtomicU32::new(u32::MAX);
+        extern "C" fn note(_instance: usize, _context: usize, _wait: usize, result: u32) {
+            SEEN.store(result, Ordering::Relaxed);
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let callback = native::host_callbacks(&[(note as *const () as usize, false)]).unwrap()[0];
+        let event = super::super::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        let wait = CreateThreadpoolWait(callback, 0, std::ptr::null());
+        SetThreadpoolWait(wait, event, &HUNDRED_MS);
+        WaitForThreadpoolWaitCallbacks(wait, 0);
+        assert_eq!(
+            (CALLS.load(Ordering::Relaxed), SEEN.load(Ordering::Relaxed)),
+            (1, WAIT_TIMEOUT)
+        );
+        CloseThreadpoolWait(wait);
+        super::super::CloseHandle(event);
+    }
+
+    /// Cancelling and disarming both return without waiting for the object to
+    /// change, and neither leaves the callback to run later.
+    #[test]
+    fn canceling_or_disarming_a_wait_keeps_its_callback_from_running() {
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn count(_instance: usize, _context: usize, _wait: usize, _result: u32) {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let callback =
+                native::host_callbacks(&[(count as *const () as usize, false)]).unwrap()[0];
+            let event = super::super::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            let wait = CreateThreadpoolWait(callback, 0, std::ptr::null());
+            SetThreadpoolWait(wait, event, &ONE_HOUR);
+            WaitForThreadpoolWaitCallbacks(wait, 1);
+
+            // Disarming is the same call with a null handle.
+            SetThreadpoolWait(wait, event, &ONE_HOUR);
+            SetThreadpoolWait(wait, std::ptr::null_mut(), std::ptr::null());
+            WaitForThreadpoolWaitCallbacks(wait, 0);
+
+            CloseThreadpoolWait(wait);
+            super::super::CloseHandle(event);
+            let _ = done.send(());
+        });
+        result.recv_timeout(Duration::from_millis(750)).unwrap();
+        assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_wait_calls_are_answered_rather_than_stubbed() {
+        for name in [
+            "CreateThreadpoolWait",
+            "SetThreadpoolWait",
+            "WaitForThreadpoolWaitCallbacks",
+            "CloseThreadpoolWait",
+        ] {
+            assert!(
+                lookup("api-ms-win-core-threadpool-l1-2-0.dll", name).is_some(),
+                "{name} is not answered"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod crypt_string_tests {
+    use super::*;
+
+    /// Calls the way a title calls it: a NUL-terminated UTF-16 string, and a
+    /// buffer the caller believes is big enough.
+    fn decode(text: &str, flags: u32) -> (i32, Vec<u8>, u32, u32) {
+        let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        let mut buffer = [0u8; 128];
+        let mut size = buffer.len() as u32;
+        let mut skip = u32::MAX;
+        let mut used = u32::MAX;
+        let ok = CryptStringToBinaryW(
+            wide.as_ptr(),
+            u32::MAX,
+            flags,
+            buffer.as_mut_ptr(),
+            &mut size,
+            &mut skip,
+            &mut used,
+        );
+        (ok, buffer[..size as usize].to_vec(), skip, used)
+    }
+
+    /// The vectors from RFC 4648 section 10, which is what "base64" means.
+    #[test]
+    fn the_rfc_vectors_decode_to_their_bytes() {
+        for (text, bytes) in [
+            ("", &b""[..]),
+            ("Zg==", b"f"),
+            ("Zm8=", b"fo"),
+            ("Zm9v", b"foo"),
+            ("Zm9vYg==", b"foob"),
+            ("Zm9vYmE=", b"fooba"),
+            ("Zm9vYmFy", b"foobar"),
+        ] {
+            let (ok, decoded, _, used) = decode(text, CRYPT_STRING_BASE64);
+            assert_eq!((ok, decoded.as_slice()), (1, bytes), "{text}");
+            assert_eq!(used, CRYPT_STRING_BASE64);
+        }
+    }
+
+    /// The encoder writes the body across lines, and a proxy URL is not line
+    /// wrapped at all: both are the same bytes.
+    #[test]
+    fn line_ends_and_spaces_are_not_part_of_the_data() {
+        let (ok, decoded, _, _) = decode("Zm9v\r\nYmFy\n", CRYPT_STRING_BASE64);
+        assert_eq!((ok, decoded.as_slice()), (1, &b"foobar"[..]));
+        let (ok, decoded, _, _) = decode(" Zm9v YmFy ", CRYPT_STRING_BASE64);
+        assert_eq!((ok, decoded.as_slice()), (1, &b"foobar"[..]));
+    }
+
+    /// Armored text carries the header lines and the dashes, and says how far in
+    /// the body began.
+    #[test]
+    fn armored_text_is_read_past_its_header() {
+        let armored = "-----BEGIN CERTIFICATE-----\r\nProc-Type: 4,ENCRYPTED\r\n\r\nZm9vYmFy\r\n-----END CERTIFICATE-----\r\n";
+        let (ok, decoded, skip, used) = decode(armored, CRYPT_STRING_BASE64_ANY);
+        assert_eq!((ok, decoded.as_slice()), (1, &b"foobar"[..]));
+        assert_eq!(used, CRYPT_STRING_BASE64HEADER);
+        // The body starts after the second header line's CRLF.
+        let expected = armored.find("Zm9v").unwrap() as u32;
+        assert_eq!(skip, expected);
+    }
+
+    /// A buffer too small is told how much it needs, and a null buffer is the
+    /// size query rather than a failure.
+    #[test]
+    fn a_short_buffer_is_told_the_size_it_needs() {
+        let wide: Vec<u16> = "Zm9vYmFy".encode_utf16().chain([0]).collect();
+        let mut size = 2u32;
+        let mut small = [0u8; 2];
+        assert_eq!(
+            CryptStringToBinaryW(
+                wide.as_ptr(),
+                u32::MAX,
+                CRYPT_STRING_BASE64,
+                small.as_mut_ptr(),
+                &mut size,
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!((size, super::super::GetLastError()), (6, ERROR_MORE_DATA));
+
+        let mut size = 0u32;
+        assert_eq!(
+            CryptStringToBinaryW(
+                wide.as_ptr(),
+                u32::MAX,
+                CRYPT_STRING_BASE64,
+                std::ptr::null_mut(),
+                &mut size,
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            1
+        );
+        assert_eq!(size, 6);
+    }
+
+    /// What is not base64 is refused as invalid data, not decoded into
+    /// something that looks like bytes.
+    #[test]
+    fn what_is_not_base64_is_refused() {
+        for text in ["Zm9v!", "Z", "Zm9vY", "Zg==Zm9v"] {
+            let (ok, _, _, _) = decode(text, CRYPT_STRING_BASE64);
+            assert_eq!(ok, 0, "{text} was accepted");
+            assert_eq!(super::super::GetLastError(), ERROR_INVALID_DATA, "{text}");
+        }
+        // An encoding this host does not decode says so instead of guessing.
+        let (ok, _, _, _) = decode("6d396f", 0x10);
+        assert_eq!(ok, 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    /// `CRYPT_STRING_BINARY` is the copy: the bytes are already bytes.
+    #[test]
+    fn binary_is_a_copy() {
+        let (ok, decoded, _, used) = decode("Zm9v", CRYPT_STRING_BINARY);
+        assert_eq!((ok, decoded.as_slice()), (1, &b"Zm9v"[..]));
+        assert_eq!(used, CRYPT_STRING_BINARY);
+    }
+
+    #[test]
+    fn the_codec_is_answered_rather_than_stubbed() {
+        assert!(lookup("crypt32.dll", "CryptStringToBinaryW").is_some());
+    }
+}
+
+#[cfg(test)]
+mod exit_process_tests {
+    use super::*;
+
+    #[test]
+    fn exit_process_is_answered_rather_than_stubbed() {
+        // Not called: it ends the process, which is its whole purpose.
+        assert!(
+            lookup("kernel32.dll", "ExitProcess").is_some(),
+            "ExitProcess is not answered"
+        );
+        assert!(lookup(
+            "api-ms-win-core-processthreads-l1-1-0.dll",
+            "ExitProcess"
+        )
+        .is_some());
+    }
+}
+
+#[cfg(test)]
+mod obsolete_and_system_info_tests {
+    use super::*;
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain([0]).collect()
+    }
+
+    /// `LocalAlloc` is the process heap's block, zeroed when asked, and a
+    /// movable block is refused rather than answered with a pointer.
+    #[test]
+    fn local_alloc_gives_a_block_or_says_why_not() {
+        let block = LocalAlloc(0x0040, 16).cast::<u8>();
+        assert!(!block.is_null());
+        // SAFETY: the 16 bytes this call allocated.
+        unsafe {
+            for i in 0..16 {
+                assert_eq!(*block.add(i), 0, "byte {i} was not zeroed");
+            }
+            *block = 7;
+        }
+        assert_eq!(LocalFree(block.cast()), std::ptr::null_mut());
+
+        assert!(LocalAlloc(0, 0).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert!(LocalAlloc(0x0002, 16).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn the_obsolete_strings_measure_and_compare() {
+        let a = wide("h\u{e9}llo");
+        assert_eq!(lstrlenW(a.as_ptr()), 5);
+        assert_eq!(lstrlenW(std::ptr::null()), 0);
+        let empty = wide("");
+        assert_eq!(lstrlenW(empty.as_ptr()), 0);
+
+        let mixed = wide("AbC");
+        let folded = wide("aBc");
+        assert_eq!(lstrcmpiW(mixed.as_ptr(), folded.as_ptr()), 0);
+        let earlier = wide("abc");
+        let later = wide("abd");
+        assert_eq!(lstrcmpiW(earlier.as_ptr(), later.as_ptr()), -1);
+        assert_eq!(lstrcmpiW(later.as_ptr(), earlier.as_ptr()), 1);
+        // A shorter string that is a prefix comes first.
+        let short = wide("ab");
+        assert_eq!(lstrcmpiW(short.as_ptr(), earlier.as_ptr()), -1);
+        // The accents fold too, since case folding is by character and not by
+        // the host's locale.
+        let accented = wide("\u{c9}cole");
+        let accented_lower = wide("\u{e9}COLE");
+        assert_eq!(lstrcmpiW(accented.as_ptr(), accented_lower.as_ptr()), 0);
+    }
+
+    /// The clock is not adjusted, and the language is the one the locale answers
+    /// with.
+    #[test]
+    fn the_system_answers_what_this_host_is() {
+        let (mut adjustment, mut increment, mut disabled) = (u32::MAX, u32::MAX, -1);
+        assert_eq!(
+            GetSystemTimeAdjustment(&mut adjustment, &mut increment, &mut disabled),
+            1
+        );
+        assert_eq!((adjustment, increment, disabled), (0, 156_250, 1));
+        assert_eq!(GetUserDefaultUILanguage(), 0x0409);
+        // A fence with nothing to order is the call's whole effect.
+        FlushProcessWriteBuffers();
+    }
+
+    #[test]
+    fn the_six_calls_are_answered_rather_than_stubbed() {
+        for (dll, name) in [
+            ("api-ms-win-core-heap-l2-1-0.dll", "LocalAlloc"),
+            ("api-ms-win-core-string-obsolete-l1-1-0.dll", "lstrlenW"),
+            ("api-ms-win-core-string-obsolete-l1-1-0.dll", "lstrcmpiW"),
+            (
+                "api-ms-win-core-localization-obsolete-l1-2-0.dll",
+                "GetUserDefaultUILanguage",
+            ),
+            (
+                "api-ms-win-core-sysinfo-l1-1-0.dll",
+                "GetSystemTimeAdjustment",
+            ),
+            (
+                "api-ms-win-core-processthreads-l1-1-0.dll",
+                "FlushProcessWriteBuffers",
+            ),
+        ] {
+            assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
+        }
+    }
+}
+
+#[cfg(test)]
+mod console_tests {
+    use super::*;
+
+    /// The console is here: a window handle, and the shape a title sizes its
+    /// output to.
+    #[test]
+    fn the_console_answers_its_shape() {
+        assert!(!GetConsoleWindow().is_null());
+        // The same window on every call, as on Windows.
+        assert_eq!(GetConsoleWindow(), GetConsoleWindow());
+
+        let mut info = [0u8; 22];
+        let handle = files::GetStdHandle(0xFFFF_FFF5);
+        assert_eq!(GetConsoleScreenBufferInfo(handle, info.as_mut_ptr()), 1);
+        let field = |at: usize| i16::from_le_bytes([info[at], info[at + 1]]);
+        assert_eq!((field(0), field(2)), (80, 25));
+        assert_eq!((field(4), field(6)), (0, 0));
+        assert_eq!(field(8), 7);
+        assert_eq!((field(10), field(12), field(14), field(16)), (0, 0, 79, 24));
+        assert_eq!((field(18), field(20)), (80, 25));
+
+        assert_eq!(
+            GetConsoleScreenBufferInfo(std::ptr::null_mut(), info.as_mut_ptr()),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    /// A console write reaches a stream instead of going nowhere, and the count
+    /// it reports is characters, not bytes.
+    #[test]
+    fn text_written_to_the_console_reaches_a_stream() {
+        let out = files::GetStdHandle(0xFFFF_FFF5);
+        // One space: the write is real, and this does not fill the log the test
+        // runs in (the call writes to the descriptor, past the harness's capture).
+        let text: Vec<u16> = " ".encode_utf16().collect();
+        let mut written = u32::MAX;
+        assert_eq!(
+            WriteConsoleW(out, text.as_ptr(), text.len() as u32, &mut written, std::ptr::null()),
+            1
+        );
+        assert_eq!(written, 1, "the count is characters, not the bytes written");
+
+        let mut written = u32::MAX;
+        assert_eq!(
+            WriteConsoleW(out, std::ptr::null(), 0, &mut written, std::ptr::null()),
+            1
+        );
+        assert_eq!(written, 0);
+
+        assert_eq!(
+            WriteConsoleW(std::ptr::null_mut(), text.as_ptr(), 1, &mut written, std::ptr::null()),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn the_console_calls_are_answered_rather_than_stubbed() {
+        for (dll, name) in [
+            ("api-ms-win-core-console-l3-2-0.dll", "GetConsoleWindow"),
+            (
+                "api-ms-win-core-console-l2-1-0.dll",
+                "GetConsoleScreenBufferInfo",
+            ),
+            ("api-ms-win-core-console-l1-1-0.dll", "WriteConsoleW"),
+        ] {
+            assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
+        }
     }
 }

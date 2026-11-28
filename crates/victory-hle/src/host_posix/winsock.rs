@@ -1560,10 +1560,10 @@ mod tests {
     use super::*;
 
     /// The startup count is the process's: the tests that start and stop
-    /// Winsock take turns.
+    /// Winsock take turns, and so does any other test that drives these calls
+    /// (see [`super::super::winsock_turn`]).
     fn serial() -> std::sync::MutexGuard<'static, ()> {
-        static TURN: Mutex<()> = Mutex::new(());
-        TURN.lock().unwrap_or_else(|e| e.into_inner())
+        super::super::winsock_turn()
     }
 
     fn loopback_addr(port: u16) -> [u8; 16] {

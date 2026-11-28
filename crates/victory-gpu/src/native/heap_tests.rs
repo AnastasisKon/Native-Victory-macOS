@@ -805,8 +805,8 @@ fn a_size_query_of_a_writable_image_reads_its_size() {
 
 /// `buffer_store_format_xyzw` and `buffer_load_format_xyzw` with `idxen` through a 16-byte
 /// structured writable buffer view, an `R32G32B32A32_UINT` typed writable buffer view, an
-/// `R32G32B32A32_FLOAT` view, and an `R8G8B8A8_UNORM` view write and read back through the same
-/// heap entry that `buffer_store_dwordx4` writes (`#255`).
+/// `R32G32B32A32_FLOAT` view, an `R32_UINT` view, and an `R8G8B8A8_UNORM` view write and read back
+/// through the same heap entry that `buffer_store_dwordx4` writes (`#255`).
 #[test]
 fn formatted_buffer_stores_and_loads_through_structured_and_typed_uavs() {
     // Table at s4: entry 0 (dwords 0..4) is the tested UAV, entry 1 (dwords 4..8) is a raw output UAV.
@@ -973,6 +973,31 @@ fn formatted_buffer_stores_and_loads_through_structured_and_typed_uavs() {
         );
     }
 
+    // A placed buffer with an R32_UINT UAV was bound to a formatted xyzw store in a world trace
+    // (#255). Only the first component fits the format. A dword store still writes all four.
+    f.put(0x2_0000, &[0u32; 24]);
+    f.put(0x2_1000, &[0u32; 8]);
+    let uint_in = [bits[1], bits[0], bits[2], bits[3]];
+    f.put(0x2_1800, &uint_in);
+    let mut view_uint = [0u32; 16];
+    (view_uint[0], view_uint[1], view_uint[2], view_uint[4]) = (42, 1, 4, 16);
+    [view_uint[10], view_uint[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view_uint, start);
+    assert!(t.host.mirror(start).unwrap());
+
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso_fmt);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    l.set_compute_pipeline(&pso_raw);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(f.get(0x2_0010, 4), [0, uint_in[0], 0, 0], "R32_UINT formatted store");
+    assert_eq!(f.get(0x2_0030, 4), uint_in, "R32_UINT dword store");
+    let uint_out = f.get(0x2_1000, 5);
+    assert_eq!((uint_out[0], uint_out[4]), (uint_in[0], 16), "R32_UINT readback and dimensions");
+
     // Format-converting typed UAVs: `R8G8B8A8_UNORM` (28) and `R16G16B16A16_FLOAT` (10).
     f.put(0x2_0000, &[0u32; 16]);
     f.put(0x2_1000, &[0u32; 8]);
@@ -1089,7 +1114,7 @@ fn formatted_buffer_stores_and_loads_through_structured_and_typed_uavs() {
         ((-1.0f32).to_bits(), 1.0f32.to_bits(), 8),
         "R16G16_SNORM readback + getDimensions"
     );
-    assert_eq!(t.host.typed_views(), 8, "8 promotions across the 8 mirrored descriptors");
+    assert_eq!(t.host.typed_views(), 9, "one promotion per tested typed descriptor");
     assert_eq!(t.host.live_typed_views(), 1, "only 1 entry holds a typed view at the end");
 
     // A typed view over a committed buffer (host memory no pool holds) is made over the host's
@@ -1104,6 +1129,7 @@ fn formatted_buffer_stores_and_loads_through_structured_and_typed_uavs() {
     let mut view_own = [0u32; 16];
     (view_own[0], view_own[1], view_own[4]) = (3, 1, 8);
     [view_own[10], view_own[11]] = super::addr_tests::halves(at);
+    let views_before_committed = t.host.typed_views();
     crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view_own, start);
     assert!(t.host.mirror(start).unwrap());
     let mut l = NativeList::default();
@@ -1112,7 +1138,7 @@ fn formatted_buffer_stores_and_loads_through_structured_and_typed_uavs() {
     l.set_compute_root_table(0, &heap, 0);
     l.dispatch(1, 1, 1).unwrap();
     super::run(&t.host, &[&l]);
-    assert_eq!(t.host.typed_views(), 9, "promoted over the committed buffer");
+    assert_eq!(t.host.typed_views(), views_before_committed + 1, "promoted over the committed buffer");
     assert_eq!(t.host.unmapped(), 0);
     // SAFETY: inside the allocation; read after the run waited for the GPU.
     let own = unsafe { std::slice::from_raw_parts(at as *const u32, 8) };

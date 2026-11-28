@@ -445,8 +445,11 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                 image = format_args!("{:#x?}", unwind::image_base_of(c.rip as usize).map(|b| c.rip as usize - b)),
                 info = format_args!("{:x?}", &r.information[..2]),
                 rax = format_args!("{:#x}", g[0]), rcx = format_args!("{:#x}", g[1]),
-                rdx = format_args!("{:#x}", g[2]), rsp = format_args!("{:#x}", g[4]),
-                r8 = format_args!("{:#x}", g[8]), r10 = format_args!("{:#x}", g[10]),
+                rdx = format_args!("{:#x}", g[2]), rbx = format_args!("{:#x}", g[3]),
+                rsp = format_args!("{:#x}", g[4]), rbp = format_args!("{:#x}", g[5]),
+                rsi = format_args!("{:#x}", g[6]), rdi = format_args!("{:#x}", g[7]),
+                r8 = format_args!("{:#x}", g[8]), r9 = format_args!("{:#x}", g[9]),
+                r10 = format_args!("{:#x}", g[10]), r11 = format_args!("{:#x}", g[11]),
                 "first-chance exception"
             );
             // VICTORY_DUMP_THREADS=0: at a breakpoint (the title's asserts). An access violation

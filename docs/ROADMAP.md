@@ -42,7 +42,7 @@ Two problems stop it, in this order:
 
 Refused shaders drop their draws and dispatches. Unique refused shaders in the story load fell from 526 to about 150 on 27 November, and more fixes have landed since. Refusals now name their exact cause. The largest groups left:
 - a descriptor loaded from title memory at an address in a root constant (bindless; needs the host to map the address to a heap index);
-- a lane-mask join of an untracked mask;
+- a lane-mask join of an untracked mask (answered per wave by lockstep's paired form, `VICTORY_PAIRED_WAVES=1`: `split_wave_tests::a_lane_mask_join_read_as_data_answers_per_wave_in_the_paired_form`);
 - cross-lane operations and LDS shared between the two host waves of a console wave, inside real per-lane branches (needs if-conversion so both host waves always arrive);
 - a whole-wave section step the simulation does not follow.
 

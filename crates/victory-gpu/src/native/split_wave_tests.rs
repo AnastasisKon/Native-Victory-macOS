@@ -881,6 +881,58 @@ fn a_mask_join_read_by_an_or_with_exec_is_not_taken_as_anded_off() {
     assert!(why.contains("a lane-mask join"), "{why}");
 }
 
+/// The program above - a lane-mask join the fast path refuses - in lockstep's paired form, which
+/// the roadmap lists as one of the largest refusal groups left ("a lane-mask join of an untracked
+/// mask"). One group of two console waves, four host waves: wave 0's lanes are 0..63 and wave 1's
+/// 64..127, and every compare here is `n > v0` for n at most 50, so wave 0's are the only lanes
+/// that pass any of them. Wave 0: `s[8:9] | exec` is lanes 0..19 and `s[8:9] & exec` lanes 0..2, so
+/// `v_cndmask` or'd gives 3 in lanes 0..2 and 1 in 3..19, 0 above. Wave 1: every compare is empty,
+/// both joins stay empty through the branches it takes, so it stores 0 in all 64 of its lanes -
+/// still a store each, since the last EXEC is the whole wave.
+#[test]
+fn a_lane_mask_join_read_as_data_answers_per_wave_in_the_paired_form() {
+    let mut w = vec![
+        0xD4C4_0008, 0x0002_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        0xBF88_0003, // s_cbranch_execz j1
+        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], null
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        // j1:
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+        0xBF88_0002, // s_cbranch_execz j2
+        0xD4C4_0008, 0x0002_0085, // v_cmp_gt_u32 s[8:9], 5, v0
+        // j2:
+        0x888A_7E08, // s_or_b64 s[10:11], s[8:9], exec
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0x7D88_009E, // v_cmp_gt_u32 vcc, 30, v0
+        0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+        0xBF88_0002, // s_cbranch_execz j3
+        0xD4C4_0008, 0x0002_0083, // v_cmp_gt_u32 s[8:9], 3, v0
+        // j3:
+        0x8788_7E08, // s_and_b64 s[8:9], s[8:9], exec
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0xD501_0002, 0x0029_0280, // v_cndmask_b32 v2, 0, 1, s[10:11]
+        0xD501_0003, 0x0021_0480, // v_cndmask_b32 v3, 0, 2, s[8:9]
+        0x3804_0702, // v_or_b32 v2, v2, v3
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+    ];
+    w.push(S_ENDPGM);
+    // The fast path refuses it for the join, which is what #524 is about.
+    let why = refusal_of(&w, 128).expect("the fast path takes it, so this is not the shape");
+    assert!(why.contains("a lane-mask join"), "{why}");
+    let got = run_group(&w, 0, 128, 128);
+    assert_eq!(got.len(), 128);
+    let mut wave0 = vec![3u32; 3];
+    wave0.extend([1u32; 17]);
+    wave0.extend([0u32; 44]);
+    assert_eq!(got[..64], wave0[..], "wave 0: 3, then 1, then 0");
+    assert_eq!(got[64..], [0u32; 64], "wave 1: every compare empty, so all zeros");
+}
+
 #[test]
 fn a_mask_join_read_by_an_xor_with_exec_is_not_taken_as_anded_off() {
     // As the NAND case, but an `s_xor` with EXEC: lanes outside EXEC keep the address's bits,

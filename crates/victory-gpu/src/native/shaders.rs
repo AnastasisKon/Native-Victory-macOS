@@ -204,9 +204,42 @@ impl ShaderStats {
 }
 
 /// The pipelines made, by the content of their DXIL (and, for graphics, their state).
+///
+/// shortcut: a title that makes thousands of pipeline variants a minute (a state value that
+/// changes per draw) would keep every one for the run, so each map drops its least recently used
+/// entries past [`PIPELINE_CACHE`] (`VICTORY_PIPELINE_CACHE` overrides it). A dropped pipeline is
+/// made again at its next use, which is a hit in the disk cache (`victory_metal::disk`) rather
+/// than a conversion, and the log says how many went.
 pub struct Libraries<B: GraphicsBackend> {
-    compute: HashMap<[u8; 32], Pipe<B>>,
-    render: HashMap<[u8; 32], Pipe<B>>,
+    /// Pipeline and the tick it was last used at.
+    compute: HashMap<[u8; 32], (Pipe<B>, u64)>,
+    render: HashMap<[u8; 32], (Pipe<B>, u64)>,
+    /// Bumped per lookup, so an entry's number says how recently it was used.
+    tick: u64,
+    /// Entries kept per map before the least recently used go.
+    limit: usize,
+}
+
+/// Pipelines kept per map (compute, and render) unless `VICTORY_PIPELINE_CACHE` says otherwise.
+/// A world draws through a few hundred; the rest is the title's variant churn.
+pub(super) const PIPELINE_CACHE: usize = 8192;
+
+/// Pipelines to keep per map: `var` is `VICTORY_PIPELINE_CACHE`, a count, `0` to keep none.
+pub fn pipeline_cache(var: Option<&str>) -> usize {
+    var.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(PIPELINE_CACHE)
+}
+
+/// Drops the least recently used half of `map` once it holds more than `limit` entries, so a map at
+/// its cap does not evict on every insert: what is kept is used again, what is dropped is made
+/// again from the disk cache.
+pub(super) fn trim<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, (V, u64)>, limit: usize) {
+    if map.len() <= limit {
+        return;
+    }
+    let mut ticks: Vec<u64> = map.values().map(|(_, t)| *t).collect();
+    ticks.sort_unstable();
+    let cutoff = ticks[ticks.len() / 2];
+    map.retain(|_, (_, t)| *t >= cutoff);
 }
 
 impl<B: GraphicsBackend> Default for Libraries<B> {
@@ -214,7 +247,34 @@ impl<B: GraphicsBackend> Default for Libraries<B> {
         Libraries {
             compute: HashMap::new(),
             render: HashMap::new(),
+            tick: 0,
+            limit: pipeline_cache(std::env::var("VICTORY_PIPELINE_CACHE").ok().as_deref()),
         }
+    }
+}
+
+impl<B: GraphicsBackend> Libraries<B> {
+    /// The pipeline cached for `key`, its use recorded, or `None` where there is none.
+    fn used(&mut self, render: bool, key: &[u8; 32]) -> Option<Pipe<B>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let map = if render { &mut self.render } else { &mut self.compute };
+        let entry = map.get_mut(key)?;
+        entry.1 = tick;
+        Some(entry.0.clone())
+    }
+
+    /// `key`'s pipeline is made: kept, and the oldest dropped when the map is over its cap.
+    fn keep(&mut self, render: bool, key: [u8; 32], pipe: Pipe<B>) {
+        self.tick += 1;
+        let tick = self.tick;
+        let limit = self.limit;
+        let map = if render { &mut self.render } else { &mut self.compute };
+        if limit == 0 {
+            return;
+        }
+        map.insert(key, (pipe, tick));
+        trim(map, limit);
     }
 }
 
@@ -229,14 +289,14 @@ impl<B: PresentBackend> Title<B> {
             return Pipe::Refused;
         }
         let key = *blake3::hash(&shader.dxil).as_bytes();
-        if let Some(p) = self.libraries.compute.get(&key) {
+        if let Some(p) = self.libraries.used(false, &key) {
             self.shaders.cached += 1;
-            return p.clone();
+            return p;
         }
         let put_off = self.shaders.put_off;
         let made = self.make_compute(shader, name);
         if self.shaders.put_off == put_off {
-            self.libraries.compute.insert(key, made.clone());
+            self.libraries.keep(false, key, made.clone());
         }
         made
     }
@@ -289,14 +349,14 @@ impl<B: PresentBackend> Title<B> {
         // The arguments are part of the pipeline's binding.
         h.update(format!("{:?}{:?}", vs.user_data, ps.map(|p| &p.user_data)).as_bytes());
         let key = *h.finalize().as_bytes();
-        if let Some(p) = self.libraries.render.get(&key) {
+        if let Some(p) = self.libraries.used(true, &key) {
             self.shaders.cached += 1;
-            return p.clone();
+            return p;
         }
         let put_off = self.shaders.put_off;
         let made = self.make_render(vs, ps, graphics, name);
         if self.shaders.put_off == put_off {
-            self.libraries.render.insert(key, made.clone());
+            self.libraries.keep(true, key, made.clone());
         }
         made
     }

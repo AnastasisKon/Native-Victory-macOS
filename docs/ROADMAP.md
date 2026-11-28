@@ -28,6 +28,14 @@ Two problems stop it, in this order:
 - In the world, fps falls from about 15 to about 7 over 4 minutes. Something grows every frame; host texture copies are the main suspect (one tester counted 26,000 by frame 4096). Being investigated on `fix/fps-decay`.
 - Series X can run out of GPU memory at the world load, even on 24 GB ([#8](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/8), [#79](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/79), [#110](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/110)). A byte budget on host texture copies ([#294](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/294); `VICTORY_METAL_TEXTURE_BUDGET_MB`, off unless set) gives up copies nothing uses past a byte limit; whether that frees enough on 16 GB is not measured yet. On a 24 GB M4 Pro the world load stopped with the budget off because copies overlap: 8.5 GB of copies over 1.7 GB of distinct title memory (#301). Series S is the default on Macs with 24 GB or less. The native host now logs Metal's own recommended working set size alongside the title's declared budget at startup, so a tester's log carries the numbers needed to set a real threshold.
 - The game rewrites about 40,000 descriptor records a frame with plain stores. Patching its store sites instead of remirroring is being measured ([#43](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/43); `VICTORY_TRACE_DESCRIPTORS=sites`).
+- The scanner thread re-hashes the memory of every watched texture in rounds (`native/textures.rs`), which is what
+  a round costs: on an M3 Pro, blake3 over 640 KiB copies through the scanner's 1 MiB buffer runs at 1.76 GB/s, so
+  a round over the ~7.8 GB of copies one world run made (13,000 of 600 KB, the figures in "A byte budget on host
+  texture copies") is about 4.4 s of one core, back to back, and it grows with every copy the title streams. That
+  matches "something grows every frame" better than the copy count does, and no cheaper hash fixes it: crc32 runs at
+  25 GB/s here, which would turn the same work into ~26 GB/s of memory traffic shared with the GPU. What bounds it is
+  a smaller watched set (only textures a submission will sample) or a page-level write test, which macOS does not
+  expose for anonymous memory; both need a run to judge. Not measured on a world run yet.
 - Textures the GPU writes and the CPU reads back (the water simulation) are copied back behind `VICTORY_TEXTURE_BACK=1`, off by default ([#46](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/46)). A world run on an M5 Pro names 22 textures at no measurable cost, then crashes before boats can be seen. Needed: a run past that crash.
 
 ## 3. Shader translation gaps ([#4](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/4))
@@ -59,6 +67,14 @@ The whole game executable (about 440,000 functions) lifts to C in seconds and co
 
 ## Solved recently
 
+- **28 November:**
+  - The host's pipeline tables never dropped an entry, so a title that makes thousands of state variants a minute
+    kept every pipeline for the run (memory, and the tables' scans grew with it): they now keep the most recently
+    used 8192 per table (`VICTORY_PIPELINE_CACHE`), which is many times a world's working set, and a dropped
+    pipeline is made again from the disk cache.
+  - MetalFX's temporal scaler and frame interpolator are wrapped and run on the GPU (a test encodes one of each and
+    waits for it), and a single-plane frame is scaled straight into the drawable under `VICTORY_METALFX=spatial`, so
+    the full-screen triangle's extra read and write at output size go.
 - **26–27 November:**
   - The Metal GPU timeout at about 53 s ([#2](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/2)): waits stay on the CPU until the GPU work is observed done.
   - Failed command buffers now still signal their fences ([#80](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/80)).

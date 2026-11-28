@@ -294,6 +294,19 @@ pub fn read_memory(at: *const u8, len: usize) -> Vec<u8> {
 /// Fills `out` from title memory at `at`, with zeros where it cannot be read; whether some of it
 /// could not be read at once (`VICTORY_TRACE_TEXTURE_SYNC=1` counts those textures).
 fn read_into(memory: Option<&PoolTable>, at: usize, out: &mut [u8], known_partial: bool) -> bool {
+    // A big buffer is read chunk by chunk on the rayon pool: the chunks are independent, and one
+    // thread copying a 4K texture's 32 MiB is the sync's other serialized cost. `PoolTable`'s
+    // lock only walks the maps; the copies themselves run outside it.
+    const CHUNK: usize = 1 << 20;
+    if out.len() > CHUNK {
+        let unreadable = std::sync::atomic::AtomicBool::new(false);
+        out.par_chunks_mut(CHUNK).enumerate().for_each(|(i, chunk)| {
+            if !read_bytes(memory, at + i * CHUNK, chunk, known_partial) {
+                unreadable.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        return unreadable.load(std::sync::atomic::Ordering::Relaxed);
+    }
     !read_bytes(memory, at, out, known_partial)
 }
 
@@ -696,29 +709,32 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
         }) else {
             continue;
         };
-        let mut h = blake3::Hasher::new();
-        // Big textures are hashed whole on the rayon pool instead of chunk by chunk here.
-        let big = size >= (1 << 20);
-        let mut unreadable = false;
+        // A big texture is read whole in one call (`read_into` is chunk-parallel inside) and
+        // hashed whole on the rayon pool; a small one streams through `buf`, chunk by chunk.
+        let big = size >= buf.len() && size > (1 << 20);
         // Keep the bytes when the texture is small enough to hand to the submission, so it
         // detiles them without reading the memory again (the whole read is the sync's main cost).
         let keep = size > 0 && size <= stash_max_texture();
-        // One buffer holds the bytes either because they are big (hashed whole on the rayon
-        // pool) or because the submission will take them (`keep`).
         let mut whole: Vec<u8> = Vec::new();
         if big || keep {
             whole.reserve(size);
         }
-        for off in (0..size).step_by(buf.len()) {
-            let n = buf.len().min(size - off);
-            unreadable |= !read_bytes(pool.as_deref(), at + off, &mut buf[..n], was_partial);
-            if big || keep {
-                whole.extend_from_slice(&buf[..n]);
-            }
-            if !big {
+        let mut h = blake3::Hasher::new();
+        let unreadable = if big {
+            whole.resize(size, 0);
+            read_into(pool.as_deref(), at, &mut whole, was_partial)
+        } else {
+            let mut unreadable = false;
+            for off in (0..size).step_by(buf.len()) {
+                let n = buf.len().min(size - off);
+                unreadable |= !read_bytes(pool.as_deref(), at + off, &mut buf[..n], was_partial);
                 h.update(&buf[..n]);
+                if keep {
+                    whole.extend_from_slice(&buf[..n]);
+                }
             }
-        }
+            unreadable
+        };
         let h = if big { hash_of(&whole) } else { h.finalize() };
         watch_in(watched, |w| {
             // Released, or begun/applied by a submission while it was hashed here: this reading is
@@ -2599,6 +2615,19 @@ mod tests {
         for size in sizes {
             let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
             assert_eq!(hash_of(&bytes), blake3::hash(&bytes), "size {size}");
+        }
+    }
+
+    #[test]
+    fn read_into_parallel_chunks_match_the_source_byte_for_byte() {
+        // Above the 1 MiB chunk cutoff (parallel path), at the cutoff boundary, and below it.
+        for len in [(1 << 20) + 1, 1 << 20, (1 << 20) - 1, 3 * (1 << 20) + 123] {
+            let src: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+            let mut out = vec![0xa5u8; len];
+            let unreadable = read_into(None, src.as_ptr() as usize, &mut out, false);
+            assert!(!unreadable, "len {len}");
+            assert_eq!(out, src, "len {len}");
+
         }
     }
 

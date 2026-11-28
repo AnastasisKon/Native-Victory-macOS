@@ -151,6 +151,33 @@ fn a_texture_made_without_its_top_level_gets_the_lower_levels() {
     .unwrap();
 }
 
+/// `VICTORY_TEXTURE_DROP_TOP_MIP=2`: a host texture made without two levels receives the title's
+/// level 2 as its level 0.
+#[test]
+fn a_texture_made_without_two_levels_gets_the_levels_below() {
+    let Some(pool) = pool(9302, 8) else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (64, 32), 4, 28, Swizzle::SW_64KB_D.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    tile(&pool, 0, &info.layout);
+    let tiled = super::super::textures::read_memory(info.memory, info.size);
+    let mut desc = info.desc().unwrap();
+    (desc.width, desc.height, desc.mips) = (16, 8, 2);
+    with_title(|t| {
+        let tex = t.host.backend.create_texture(&desc).unwrap();
+        super::super::textures::upload_from(&t.host.backend, &tex, &info, &tiled, 2).unwrap();
+        for host_mip in 0..2usize {
+            let (w, h) = (16 >> host_mip, 8 >> host_mip);
+            let mut out = vec![0u8; w * h * 4];
+            t.host.backend.read_texture(&tex, host_mip, 0, &mut out, w * 4, 0);
+            for (x, y) in [(0, 0), (w - 1, h - 1), (w / 2, h / 2)] {
+                let at = (y * w + x) * 4;
+                assert_eq!(out[at..at + 4], texel(host_mip as u32 + 2, x as u32, y as u32), "host mip {host_mip} at {x},{y}");
+            }
+        }
+    })
+    .unwrap();
+}
+
 /// Held by the tests that count on a texture staying hot: the many submissions of
 /// `a_texture_blank_for_thousands_of_submissions_is_still_probed` and
 /// `hot_textures_cool_by_submissions_even_when_probe_round_is_capped` cool every other test's

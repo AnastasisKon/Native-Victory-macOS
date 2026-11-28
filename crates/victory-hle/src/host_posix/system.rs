@@ -3216,6 +3216,11 @@ pub extern "system" fn GetTempPathW(size: u32, out: *mut u16) -> u32 {
     (text.len() - 1) as u32
 }
 
+/// `MoveFileW`: the same move with no flags.
+pub extern "system" fn MoveFileW(from: *const u16, to: *const u16) -> i32 {
+    MoveFileExW(from, to, 0)
+}
+
 pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, _flags: u32) -> i32 {
     let (Some(from), Some(to)) = (files::wide_path(from), files::wide_path(to)) else {
         set_error(ERROR_FILE_NOT_FOUND);
@@ -4369,6 +4374,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             SetFileAttributesW,
             GetDiskFreeSpaceExW,
             GetTempPathW,
+            MoveFileW,
             MoveFileExW,
             CreateFile2,
             CopyFile2,

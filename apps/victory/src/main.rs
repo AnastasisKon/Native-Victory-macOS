@@ -115,6 +115,13 @@ enum Command {
         /// (with `--pipelines`, then the shader pack's pipelines).
         #[arg(long, conflicts_with_all = ["validate", "list"])]
         cache: bool,
+        /// With `--cache`: measure the translation switches instead of warming
+        /// up. Every container earlier runs kept is translated twice, once as
+        /// the defaults do and once with the paired form and the strict `vccz`
+        /// refusal on, and the two are counted: what they would recover in a
+        /// run, and what they would lose. Nothing is written to the cache.
+        #[arg(long, requires = "cache")]
+        compare_switches: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -343,10 +350,16 @@ fn main() -> Result<()> {
             jobs,
             pipelines,
             cache: true,
+            compare_switches,
             ..
         } => {
             #[cfg(windows)]
             {
+                // The kept containers are the native host's (`shaders::keep`).
+                anyhow::ensure!(
+                    !compare_switches,
+                    "--compare-switches reads the containers the native host kept, which only a Mac run keeps"
+                );
                 translate::warm(paths, jobs, pipelines)
             }
             // The native host's warm-up goes from the containers earlier runs
@@ -358,11 +371,11 @@ fn main() -> Result<()> {
                     paths.is_empty(),
                     "on a Mac the warm-up translates the containers earlier runs kept, not files: give no paths"
                 );
-                warm::native(jobs)
+                if compare_switches { warm::switch_delta(jobs) } else { warm::native(jobs) }
             }
             #[cfg(not(any(windows, target_os = "macos")))]
             {
-                let _ = (paths, jobs, pipelines);
+                let _ = (paths, jobs, pipelines, compare_switches);
                 anyhow::bail!("translate needs a Windows host for now")
             }
         }
@@ -373,6 +386,7 @@ fn main() -> Result<()> {
             list,
             jobs,
             cache: false,
+            compare_switches: _,
         } => {
             #[cfg(windows)]
             {

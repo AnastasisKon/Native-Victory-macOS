@@ -62,8 +62,19 @@ run_gate "suite-hle" sh -c \
 run_gate "suite-shader" sh -c \
     "$RUNNER cargo test -p victory-shader -p victory-hle"
 
+# One GPU test at a time on a Mac, as test-native.sh already runs them. Every
+# test that needs Metal makes its own device and command queues, and in parallel
+# they reached a high-water mark of eighty queues, hung the GPU of an M1 Pro and
+# took WindowServer with it, the kernel panicking two minutes later (#548). One
+# at a time all 493 pass; this gate measured them at 16 s either way, so the
+# safety costs nothing here. libtest reads RUST_TEST_THREADS, and a caller asking
+# for more still gets it.
+GPU_ENV=""
+if [ "$(uname)" = "Darwin" ]; then
+    GPU_ENV="RUST_TEST_THREADS=${RUST_TEST_THREADS:-1}"
+fi
 run_gate "suite-gpu" sh -c \
-    "$RUNNER cargo test -p victory-gpu"
+    "$GPU_ENV $RUNNER cargo test -p victory-gpu"
 
 if [ "$GATE" = "full" ]; then
     run_gate "policy" sh -c \

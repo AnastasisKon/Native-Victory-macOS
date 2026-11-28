@@ -572,6 +572,7 @@ pub extern "system" fn SetEvent(handle: *mut c_void) -> i32 {
     };
     e.set();
     sync::signalled();
+    watched(handle as usize, "set", 0);
     1
 }
 
@@ -716,9 +717,10 @@ pub extern "system" fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32 
 
 static LEDGER: LazyLock<Mutex<HashMap<usize, (Vec<usize>, u64, u64)>>> = LazyLock::new(Default::default);
 
-static WATCHED: LazyLock<Mutex<std::collections::HashSet<usize>>> = LazyLock::new(Default::default);
-
-/// `VICTORY_WATCH_HANDLE=<hex>`: logs every wait and release on that handle.
+/// `VICTORY_TRACE_HANDLES=<any>`: logs the waits that got their object and the releases, on
+/// every handle, so a run that waits for something it never gets names the handle.
+/// `VICTORY_WATCH_HANDLE=<hex>` narrows that to one handle, which is the same switch a run of
+/// thousands of waits needs.
 fn watched(handle: usize, what: &str, arg: u32) {
     static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_TRACE_HANDLES").is_some());
     if !*ON {
@@ -737,7 +739,14 @@ fn watched(handle: usize, what: &str, arg: u32) {
             _ => {}
         }
     }
-    if (handle == *WATCH && handle != 0 || lock(&WATCHED).contains(&handle)) && what != "wait timed out" {
+    // A wait that timed out says nothing happened, and most titles turn `WaitForSingleObject`
+    // with a timeout into a sleep: it is the one thing a log of a stuck run is already full of.
+    if what == "wait timed out" {
+        return;
+    }
+    let watch = *WATCH;
+    let wanted = watch == 0 || handle == watch;
+    if wanted {
         tracing::warn!("watch {handle:#x}: {what} ({arg}) at image+ {:x?}", native::dump::caller_chain());
     }
 }

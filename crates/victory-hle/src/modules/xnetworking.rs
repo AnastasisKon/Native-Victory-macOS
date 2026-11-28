@@ -31,7 +31,10 @@ pub static OBJECT: Object = Object::new("networking", &VTABLE);
 pub const INTERFACES: &[Interface] =
     &[(PROVIDER, PROVIDER, &OBJECT), (PROVIDER, IID_2026, &OBJECT)];
 
-/// `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)`: what needs the service.
+/// `HRESULT_FROM_WIN32(ERROR_HOST_UNREACHABLE)` (1231): what needs the service. The GDK's
+/// `XNetworking.h` pins no code for the offline case, so what a title matches is its own choice;
+/// `ERROR_NETWORK_UNREACHABLE` (1232, `0x800704D0`) is the other one a title may look for, and the
+/// two differ by one.
 pub const UNREACHABLE: HRESULT = 0x8007_04CF_u32 as i32;
 
 /// The documented default for the preferred local UDP multiplayer port.

@@ -13,8 +13,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use crate::modules::xmem_physical::{self, Held, Owner, enter, tracing_owners};
@@ -35,6 +35,7 @@ mod sync;
 mod system;
 pub(crate) mod ucrt;
 mod winhttp;
+pub(crate) mod winrt;
 mod winsock;
 mod wasapi;
 mod xaudio2;
@@ -478,6 +479,8 @@ pub(crate) struct ThreadObject {
     state: Mutex<ThreadState>,
     start: usize,
     param: usize,
+    /// Its OS id, which a thread knows only once it is running.
+    id: AtomicU32,
 }
 
 struct ThreadState {
@@ -490,6 +493,10 @@ struct ThreadState {
 
 static HANDLES: LazyLock<Mutex<HashMap<usize, Object>>> = LazyLock::new(Default::default);
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+/// The title's threads by OS id, which is how `OpenThread` names one. Weak
+/// because a running thread is kept alive by its own stack, not by this table.
+static THREADS: LazyLock<Mutex<HashMap<u32, Weak<ThreadObject>>>> = LazyLock::new(Default::default);
 
 fn new_handle(object: Object) -> *mut c_void {
     let handle = (NEXT_HANDLE.fetch_add(1, Ordering::Relaxed) as usize) << 2;
@@ -854,6 +861,7 @@ pub extern "system" fn CreateThread(
         }),
         start,
         param: param as usize,
+        id: AtomicU32::new(0),
     });
     let (me, finished) = (object.clone(), object.clone());
     // SAFETY: `start` is the title's own thread routine.
@@ -866,6 +874,14 @@ pub extern "system" fn CreateThread(
             // Before anything of the title's runs: park if suspended.
             move || {
                 lock(&me.state).port = Some(native::threadctl::ThreadPort::current());
+                // Its id is known here and nowhere earlier, and the title's first code on this
+                // thread can ask for it: record it before that code runs.
+                let id = thread::current_id();
+                me.id.store(id, Ordering::Release);
+                let mut threads = lock(&THREADS);
+                threads.retain(|_, t| t.strong_count() > 0);
+                threads.insert(id, Arc::downgrade(&me));
+                drop(threads);
                 // A suspension that came in before the thread was up. The count is read and
                 // `running` set under one lock: a `SuspendThread` in between saw the thread not
                 // running, did not stop it, and it then ran suspended.
@@ -1015,6 +1031,32 @@ pub extern "system" fn GetExitCodeThread(handle: *mut c_void, code: *mut u32) ->
     1
 }
 
+/// `GetThreadId`: the OS id of a thread handle. `GetCurrentThread`'s -2 names
+/// the calling thread, which has no object of its own in this table.
+pub extern "system" fn GetThreadId(handle: *mut c_void) -> u32 {
+    if handle as isize == system::GetCurrentThread() {
+        return thread::current_id();
+    }
+    let Some(t) = thread_of(handle) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    t.id.load(Ordering::Acquire)
+}
+
+/// `OpenThread`: a new handle to the thread the title knows by id. A thread
+/// that has ended, and an id never handed out, are both "no such thread".
+pub extern "system" fn OpenThread(_access: u32, _inherit: i32, id: u32) -> *mut c_void {
+    let thread = lock(&THREADS).get(&id).and_then(Weak::upgrade);
+    let Some(t) = thread else {
+        // The entry outlives the thread it named; drop it now that it is known dead.
+        lock(&THREADS).remove(&id);
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    };
+    new_handle(Object::Thread(t))
+}
+
 /// The function table `HostPolicy` consults on macOS.
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     let dll = dll.to_ascii_lowercase();
@@ -1024,6 +1066,7 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         .or_else(|| winhttp::lookup(&dll, name))
         .or_else(|| mf::lookup(&dll, name))
         .or_else(|| xaudio2::lookup(&dll, name))
+        .or_else(|| winrt::lookup(&dll, name))
     {
         return Some(address);
     }
@@ -1091,6 +1134,8 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         ResumeThread,
         GetThreadContext,
         GetExitCodeThread,
+        GetThreadId,
+        OpenThread,
     )
 }
 
@@ -1674,5 +1719,68 @@ mod duplicate_handle_tests {
     fn duplicate_handle_is_answered_rather_than_stubbed() {
         assert!(lookup("api-ms-win-core-handle-l1-1-0.dll", "DuplicateHandle").is_some());
         assert!(lookup("kernel32.dll", "DuplicateHandle").is_some());
+    }
+}
+
+#[cfg(test)]
+mod thread_handle_tests {
+    use super::*;
+
+    fn object(id: u32) -> Arc<ThreadObject> {
+        Arc::new(ThreadObject {
+            done: Arc::new(Event::new(true, false).expect("event")),
+            gate: Event::new(true, false).expect("event"),
+            state: Mutex::new(ThreadState {
+                suspend_count: 0,
+                running: true,
+                port: None,
+                exit_code: 0,
+            }),
+            start: 0,
+            param: 0,
+            id: AtomicU32::new(id),
+        })
+    }
+
+    /// `OpenThread` answers with a handle to the thread the title names by id,
+    /// and that handle reports the same id; an id it never handed out is not a
+    /// thread, and neither is one that has ended.
+    #[test]
+    fn a_thread_opens_by_id_while_it_lives() {
+        let thread = object(4242);
+        lock(&THREADS).insert(4242, Arc::downgrade(&thread));
+
+        let handle = OpenThread(0x1F_FFFF, 0, 4242);
+        assert!(!handle.is_null());
+        assert_eq!(GetThreadId(handle), 4242);
+        let mut code = 0u32;
+        assert_eq!(GetExitCodeThread(handle, &mut code), 1);
+        assert_eq!(CloseHandle(handle), 1);
+
+        assert!(OpenThread(0x1F_FFFF, 0, 4243).is_null());
+        assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+
+        // The entry outlives the thread it named, and is dropped when found dead.
+        drop(thread);
+        assert!(OpenThread(0x1F_FFFF, 0, 4242).is_null());
+        assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+        assert!(!lock(&THREADS).contains_key(&4242));
+    }
+
+    /// `GetCurrentThread`'s -2 names the calling thread, which is in no table.
+    #[test]
+    fn the_current_thread_pseudo_handle_names_the_calling_thread() {
+        let pseudo = system::GetCurrentThread() as usize as *mut c_void;
+        assert_eq!(GetThreadId(pseudo), thread::current_id());
+        assert_eq!(GetThreadId(std::ptr::null_mut()), 0);
+        assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn opening_a_thread_is_answered_rather_than_stubbed() {
+        for dll in ["kernel32.dll", "api-ms-win-core-processthreads-l1-1-0.dll"] {
+            assert!(lookup(dll, "OpenThread").is_some(), "{dll}!OpenThread");
+            assert!(lookup(dll, "GetThreadId").is_some(), "{dll}!GetThreadId");
+        }
     }
 }

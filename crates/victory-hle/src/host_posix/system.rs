@@ -29,8 +29,10 @@ const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_NOT_SUPPORTED: u32 = 50;
 const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_NOT_OWNER: u32 = 288;
+const ERROR_IO_PENDING: u32 = 997;
 const ERROR_INVALID_FLAGS: u32 = 1004;
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
@@ -229,46 +231,93 @@ pub extern "system" fn CompareStringEx(
 
 const CT_CTYPE1: u32 = 1;
 
-pub extern "system" fn GetStringTypeW(kind: u32, src: *const u16, len: i32, out: *mut u16) -> i32 {
+/// The `CT_CTYPE1` categories of one character (`winnls.h`).
+fn ctype1(character: u16) -> u16 {
+    const UPPER: u16 = 0x0001;
+    const LOWER: u16 = 0x0002;
+    const DIGIT: u16 = 0x0004;
+    const SPACE: u16 = 0x0008;
+    const PUNCT: u16 = 0x0010;
+    const CNTRL: u16 = 0x0020;
+    const BLANK: u16 = 0x0040;
+    const XDIGIT: u16 = 0x0080;
+    const ALPHA: u16 = 0x0100;
+    const DEFINED: u16 = 0x0200;
+    let Some(c) = char::from_u32(u32::from(character)) else {
+        // A lone surrogate: not a character, so nothing is true of it.
+        return 0;
+    };
+    // A digit is a digit in any script: `C1_DIGIT` is not ASCII-only here, and a
+    // numeric character is never punctuation.
+    let (alpha, digit) = (c.is_alphabetic(), c.is_numeric());
+    let (space, control) = (c.is_whitespace(), c.is_control());
+    let mut flags = DEFINED;
+    if alpha {
+        flags |= ALPHA;
+    }
+    if c.is_uppercase() {
+        flags |= UPPER;
+    }
+    if c.is_lowercase() {
+        flags |= LOWER;
+    }
+    if digit {
+        flags |= DIGIT;
+    }
+    if space {
+        flags |= SPACE;
+    }
+    if control {
+        flags |= CNTRL;
+    }
+    if c == ' ' || c == '\t' {
+        flags |= BLANK;
+    }
+    if c.is_ascii_hexdigit() {
+        flags |= XDIGIT;
+    }
+
+    // `ispunct` is a graphical character that is neither a letter, a digit nor a
+    // space - which is what makes an apostrophe one and a non-breaking space
+    // none.
+    if !alpha && !digit && !space && !control {
+        flags |= PUNCT;
+    }
+    flags
+}
+
+fn get_string_type(kind: u32, src: *const u16, len: i32, out: *mut u16) -> i32 {
     if kind != CT_CTYPE1 || src.is_null() || out.is_null() {
+        if kind != CT_CTYPE1 {
+            // The bidirectional and width-and-kana tables are not answered here;
+            // saying so beats answering zero for every character.
+            tracing::warn!("GetStringType: CT_CTYPE{kind} is not answered");
+        }
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
     // SAFETY: see above.
     for (i, &unit) in unsafe { units(src, len) }.iter().enumerate() {
-        let c = char::from_u32(u32::from(unit)).unwrap_or('\0');
-        let mut t = 0u16;
-        if c.is_uppercase() {
-            t |= 1;
-        }
-        if c.is_lowercase() {
-            t |= 2;
-        }
-        if c.is_ascii_digit() {
-            t |= 4;
-        }
-        if c.is_whitespace() {
-            t |= 8;
-        }
-        if c.is_ascii_punctuation() {
-            t |= 0x10;
-        }
-        if c.is_control() {
-            t |= 0x20;
-        }
-        if c == ' ' || c == '\t' {
-            t |= 0x40;
-        }
-        if c.is_ascii_hexdigit() {
-            t |= 0x80;
-        }
-        if c.is_alphabetic() {
-            t |= 0x100;
-        }
         // SAFETY: the title's output array has one word per unit.
-        unsafe { out.add(i).write(t) };
+        unsafe { out.add(i).write(ctype1(unit)) }
     }
     1
+}
+
+pub extern "system" fn GetStringTypeW(kind: u32, src: *const u16, len: i32, out: *mut u16) -> i32 {
+    get_string_type(kind, src, len, out)
+}
+
+/// The same question, asked with a locale: this host's is the one its
+/// classification already uses.
+pub extern "system" fn GetStringTypeExW(
+    _locale: u32,
+    kind: u32,
+    src: *const u16,
+    len: i32,
+    out: *mut u16,
+) -> i32 {
+    get_string_type(kind, src, len, out)
 }
 
 pub extern "system" fn GetCPInfo(code_page: u32, info: *mut u8) -> i32 {
@@ -632,6 +681,199 @@ pub extern "system" fn UpdateProcThreadAttribute(
 
 /// `DeleteProcThreadAttributeList`: there is no list, and nothing to free.
 pub extern "system" fn DeleteProcThreadAttributeList(_list: *mut c_void) {}
+
+// Resources, read out of the mapped image's own directory: a module's resource
+// tree is type, then name, then language, so a lookup walks three levels of it.
+
+const ERROR_RESOURCE_TYPE_NOT_FOUND: u32 = 1813;
+const ERROR_RESOURCE_NAME_NOT_FOUND: u32 = 1814;
+const ERROR_RESOURCE_LANG_NOT_FOUND: u32 = 1815;
+
+/// Where a module's resource directory starts, from the headers of the image
+/// mapped at `base`, or `None` when it has none.
+fn resource_directory(base: usize) -> Option<*const u8> {
+    if base == 0 {
+        return None;
+    }
+    // SAFETY: `base` is a mapped image and these are its own headers, which the
+    // loader wrote and which stay for the life of the process.
+    unsafe {
+        let image = base as *const u8;
+        let pe_at = image.add(0x3C).cast::<u32>().read_unaligned() as usize;
+        let pe = image.add(pe_at);
+        if pe.cast::<u32>().read_unaligned() != 0x0000_4550 {
+            return None;
+        }
+        // The file header is 20 bytes after the signature, then the optional
+        // header, whose data directory follows its fixed part.
+        let optional = pe.add(24);
+        let directory = match optional.cast::<u16>().read_unaligned() {
+            0x20B => optional.add(112), // PE32+
+            0x10B => optional.add(96),  // PE32
+            _ => return None,
+        };
+        // Entry 2 is the resource directory: its address, then its size.
+        let rva = directory.add(2 * 8).cast::<u32>().read_unaligned() as usize;
+        (rva != 0).then(|| image.add(rva))
+    }
+}
+
+/// One level of the tree: the entry for `name` (compared as Windows compares it,
+/// without case) or for the integer `id` when `name` is `None`.
+///
+/// Returns the entry's own offset word, whose top bit says whether it points at
+/// the next level or at the data.
+///
+/// # Safety
+///
+/// `level` and `base` are inside a mapped image's resource directory, and
+/// `level` is a directory rather than a leaf.
+unsafe fn resource_level(
+    level: *const u8,
+    base: *const u8,
+    name: Option<&str>,
+    id: u32,
+) -> Option<u32> {
+    // SAFETY: the caller's promise: both pointers are inside a mapped image.
+    unsafe {
+        let named = level.add(12).cast::<u16>().read_unaligned() as usize;
+        let ids = level.add(14).cast::<u16>().read_unaligned() as usize;
+        for i in 0..named + ids {
+            let entry = level.add(16 + i * 8);
+            let key = entry.cast::<u32>().read_unaligned();
+            let offset = entry.add(4).cast::<u32>().read_unaligned();
+            match name {
+                // A named entry holds the offset of its string, which is a length
+                // and then that many UTF-16 characters.
+                Some(wanted) if key & 0x8000_0000 != 0 => {
+                    let text = base.add((key & 0x7FFF_FFFF) as usize);
+                    let len = text.cast::<u16>().read_unaligned() as usize;
+                    let units = std::slice::from_raw_parts(text.add(2).cast::<u16>(), len);
+                    if String::from_utf16_lossy(units).eq_ignore_ascii_case(wanted) {
+                        return Some(offset);
+                    }
+                }
+                Some(_) => {}
+                None if key & 0x8000_0000 == 0 && key == id => return Some(offset),
+                None => {}
+            }
+        }
+    }
+    None
+}
+
+/// A type or name argument: an integer id below 0x10000, or the address of a
+/// string, which is how `MAKEINTRESOURCE` and a plain string are told apart.
+fn resource_id(value: usize) -> Option<u32> {
+    (value < 0x1_0000).then_some(value as u32)
+}
+
+/// The name a string argument holds.
+///
+/// # Safety
+///
+/// `value` is the address of a NUL-terminated wide string.
+unsafe fn resource_name(value: usize) -> String {
+    // SAFETY: the caller's promise: a NUL-terminated string.
+    unsafe {
+        let text = value as *const u16;
+        let mut n = 0usize;
+        while *text.add(n) != 0 {
+            n += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, n))
+    }
+}
+
+/// The module a call names: its own base, or the title image's when it passes
+/// null, which is what Windows means by null there.
+fn resource_base(module: *mut c_void) -> usize {
+    if module.is_null() {
+        crate::runtime::main_image().unwrap_or(0)
+    } else {
+        module as usize
+    }
+}
+
+/// `FindResourceExW`: the image's own resource entry, or the reason there is
+/// none.
+pub extern "system" fn FindResourceExW(
+    module: *mut c_void,
+    kind: usize,
+    name: usize,
+    language: u16,
+) -> *mut c_void {
+    let base = resource_base(module);
+    let Some(directory) = resource_directory(base) else {
+        tracing::warn!("FindResourceExW: the module at {base:#x} has no resources");
+        set_error(ERROR_RESOURCE_TYPE_NOT_FOUND);
+        return std::ptr::null_mut();
+    };
+    // SAFETY: every part of the directory below is inside the mapped image.
+    unsafe {
+        let kind_name = resource_id(kind).map_or_else(|| Some(resource_name(kind)), |_| None);
+        let Some(kind_offset) = resource_level(directory, directory, kind_name.as_deref(), kind as u32)
+        else {
+            set_error(ERROR_RESOURCE_TYPE_NOT_FOUND);
+            return std::ptr::null_mut();
+        };
+        if kind_offset & 0x8000_0000 == 0 {
+            // A leaf where a level belongs: not a resource tree.
+            set_error(ERROR_RESOURCE_TYPE_NOT_FOUND);
+            return std::ptr::null_mut();
+        }
+        let by_name = resource_id(name).map_or_else(|| Some(resource_name(name)), |_| None);
+        let names = directory.add((kind_offset & 0x7FFF_FFFF) as usize);
+        let Some(name_offset) = resource_level(names, directory, by_name.as_deref(), name as u32)
+        else {
+            set_error(ERROR_RESOURCE_NAME_NOT_FOUND);
+            return std::ptr::null_mut();
+        };
+        if name_offset & 0x8000_0000 == 0 {
+            set_error(ERROR_RESOURCE_NAME_NOT_FOUND);
+            return std::ptr::null_mut();
+        }
+        // The languages: the one asked for, or the first when zero means any.
+        let languages = directory.add((name_offset & 0x7FFF_FFFF) as usize);
+        let found = if language == 0 {
+            let ids = languages.add(14).cast::<u16>().read_unaligned();
+            (ids > 0).then(|| languages.add(20).cast::<u32>().read_unaligned())
+        } else {
+            resource_level(languages, directory, None, u32::from(language))
+        };
+        let Some(leaf) = found else {
+            set_error(ERROR_RESOURCE_LANG_NOT_FOUND);
+            return std::ptr::null_mut();
+        };
+        if leaf & 0x8000_0000 != 0 {
+            set_error(ERROR_RESOURCE_LANG_NOT_FOUND);
+            return std::ptr::null_mut();
+        }
+        // `HRSRC` is the image's own data entry, which is what Windows hands out
+        // for a mapped module.
+        directory.add(leaf as usize) as *mut c_void
+    }
+}
+
+/// `LoadResource`: the resource's bytes, already in the mapped image, so the data
+/// entry's address is all that is needed.
+pub extern "system" fn LoadResource(module: *mut c_void, resource: *mut c_void) -> *mut c_void {
+    if resource.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let base = resource_base(module);
+    if base == 0 {
+        set_error(ERROR_INVALID_HANDLE);
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `resource` is a data entry of the image at `base`.
+    unsafe {
+        let entry = resource as *const u8;
+        let rva = entry.cast::<u32>().read_unaligned() as usize;
+        (base + rva) as *mut c_void
+    }
+}
 
 /// `GetConsoleWindow`: this host writes to the standard streams, so a console
 /// is here and its window is a handle of its own (as `CreateWindowExA` above
@@ -1310,11 +1552,6 @@ pub extern "system" fn GetCurrentThread() -> isize {
 
 pub extern "system" fn GetProcessId(_process: isize) -> u32 {
     std::process::id()
-}
-
-pub extern "system" fn OpenThread(_access: u32, _inherit: i32, _id: u32) -> *mut c_void {
-    set_error(ERROR_ACCESS_DENIED);
-    std::ptr::null_mut()
 }
 
 pub extern "system" fn GetThreadPriority(_thread: *mut c_void) -> i32 {
@@ -2016,6 +2253,106 @@ pub extern "system" fn InitOnceExecuteOnce(
     }
 }
 
+/// The flags `InitOnceBeginInitialize` and `InitOnceComplete` take.
+const INIT_ONCE_CHECK_ONLY: u32 = 0x1;
+const INIT_ONCE_ASYNC: u32 = 0x2;
+const INIT_ONCE_INIT_FAILED: u32 = 0x4;
+
+/// Writes a finished one-time initialization's context to the caller's out word.
+fn write_once_context(state: u64, context: *mut *mut c_void) {
+    if !context.is_null() {
+        // SAFETY: the title's output word.
+        unsafe { context.write((state & !3) as *mut c_void) };
+    }
+}
+
+/// `InitOnceBeginInitialize`: claims the run `InitOnceExecuteOnce` would have run, or reports
+/// the one that already finished, on the same word: 0 new, 1 running, the context with bit 1
+/// set done. With `INIT_ONCE_CHECK_ONLY` nothing is claimed and a run still under way is
+/// reported as pending instead of waited for.
+///
+/// An asynchronous begin hands back the slot the winner's context goes in, which this
+/// emulation has nowhere to keep: it says so rather than hand back a slot nobody fills.
+pub extern "system" fn InitOnceBeginInitialize(
+    once: *mut AtomicU64,
+    flags: u32,
+    pending: *mut i32,
+    context: *mut *mut c_void,
+) -> i32 {
+    if flags & INIT_ONCE_ASYNC != 0 {
+        set_error(ERROR_CALL_NOT_IMPLEMENTED);
+        return 0;
+    }
+    // SAFETY: the title's INIT_ONCE, a pointer-sized word.
+    let word = unsafe { &*once };
+    if flags & INIT_ONCE_CHECK_ONLY != 0 {
+        let state = word.load(Ordering::Acquire);
+        if state & 3 != 2 {
+            if !pending.is_null() {
+                // SAFETY: the title's output word.
+                unsafe { pending.write(1) };
+            }
+            set_error(ERROR_IO_PENDING);
+            return 0;
+        }
+        write_once_context(state, context);
+        if !pending.is_null() {
+            // SAFETY: as above.
+            unsafe { pending.write(0) };
+        }
+        return 1;
+    }
+    loop {
+        match word.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                if !pending.is_null() {
+                    // SAFETY: the title's output word.
+                    unsafe { pending.write(1) };
+                }
+                return 1;
+            }
+            Err(state) if state & 3 == 2 => {
+                write_once_context(state, context);
+                if !pending.is_null() {
+                    // SAFETY: as above.
+                    unsafe { pending.write(0) };
+                }
+                return 1;
+            }
+            Err(_) => std::thread::sleep(Duration::from_micros(200)),
+        }
+    }
+}
+
+/// `InitOnceComplete`: stores the context of the run a begin claimed the word for. Only the
+/// claim may complete it; a failed attempt hands the word back for the next caller to try.
+pub extern "system" fn InitOnceComplete(
+    once: *mut AtomicU64,
+    flags: u32,
+    context: *mut c_void,
+) -> i32 {
+    if flags & INIT_ONCE_ASYNC != 0 {
+        set_error(ERROR_CALL_NOT_IMPLEMENTED);
+        return 0;
+    }
+    // SAFETY: the title's INIT_ONCE, a pointer-sized word.
+    let word = unsafe { &*once };
+    let done = if flags & INIT_ONCE_INIT_FAILED != 0 {
+        0
+    } else {
+        context as u64 | 2
+    };
+    if word
+        .compare_exchange(1, done, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // Nothing was claimed, or the run already finished: this caller never began it.
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    1
+}
+
 // Fiber local storage, per thread (a fiber is a thread here).
 
 const FLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
@@ -2653,6 +2990,261 @@ pub extern "system" fn CoCreateInstance(
     0x8004_0154_u32 as i32 // REGDB_E_CLASSNOTREG
 }
 
+/// `CoTaskMemAlloc`: a block from the process heap, as `LocalAlloc` gives one.
+///
+/// `CoTaskMemFree` keeps nothing to free (see its note), so what this allocates
+/// is not returned.
+pub extern "system" fn CoTaskMemAlloc(bytes: usize) -> *mut c_void {
+    if bytes == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a non-zero size; the block is the title's.
+    unsafe { libc::malloc(bytes) }
+}
+
+/// `CoGetApartmentType`: every thread of this host is in the multithreaded
+/// apartment, which is the model `CoInitializeEx` is answered with.
+pub extern "system" fn CoGetApartmentType(kind: *mut u32, qualifier: *mut u32) -> i32 {
+    const APTTYPE_MTA: u32 = 1;
+    const APTTYPEQUALIFIER_IMPLICIT_MTA: u32 = 1;
+    // SAFETY: the title's out words, each optional.
+    unsafe {
+        if !kind.is_null() {
+            kind.write(APTTYPE_MTA);
+        }
+        if !qualifier.is_null() {
+            qualifier.write(APTTYPEQUALIFIER_IMPLICIT_MTA);
+        }
+    }
+    0
+}
+
+/// The count `CoAddRefServerProcess` keeps: nothing here shuts down with it, so
+/// it is a count of callers and no more.
+static SERVER_REFS: AtomicU32 = AtomicU32::new(0);
+
+pub extern "system" fn CoAddRefServerProcess() -> u32 {
+    SERVER_REFS.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+pub extern "system" fn CoReleaseServerProcess() -> u32 {
+    SERVER_REFS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            Some(n.saturating_sub(1))
+        })
+        .map_or(0, |before| before.saturating_sub(1))
+}
+
+/// The object-context calls are answered as a machine with no COM+ context
+/// answers them: there is no context to describe, and saying so is the answer a
+/// caller checks for.
+pub extern "system" fn CoGetObjectContext(_interface: *const c_void, out: *mut *mut c_void) -> i32 {
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { out.write(std::ptr::null_mut()) };
+    }
+    0x8000_4002_u32 as i32 // E_NOINTERFACE
+}
+
+pub extern "system" fn CoGetContextToken(out: *mut usize) -> i32 {
+    if !out.is_null() {
+        // SAFETY: the title's out word.
+        unsafe { out.write(0) };
+    }
+    0x8000_4002_u32 as i32 // E_NOINTERFACE
+}
+
+/// The free-threaded marshaler and the stream marshaling are refused with
+/// `E_NOTIMPL`, which is a legal answer for a class that does not aggregate one:
+/// a refused hand-off is visible, while a marshaler that marshals nothing would
+/// hand the other apartment a pointer to it that does not work.
+pub extern "system" fn CoCreateFreeThreadedMarshaler(
+    _outer: *mut c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    tracing::warn!("CoCreateFreeThreadedMarshaler: no marshaler is created here");
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { out.write(std::ptr::null_mut()) };
+    }
+    0x8000_4001_u32 as i32 // E_NOTIMPL
+}
+
+pub extern "system" fn CoMarshalInterThreadInterfaceInStream(
+    _interface: *const c_void,
+    _unknown: *mut c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    tracing::warn!("CoMarshalInterThreadInterfaceInStream: interfaces are not marshaled here");
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { out.write(std::ptr::null_mut()) };
+    }
+    0x8000_4001_u32 as i32 // E_NOTIMPL
+}
+
+pub extern "system" fn CoGetInterfaceAndReleaseStream(
+    _stream: *mut c_void,
+    _interface: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    tracing::warn!("CoGetInterfaceAndReleaseStream: no stream was made here");
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { out.write(std::ptr::null_mut()) };
+    }
+    0x8000_4001_u32 as i32 // E_NOTIMPL
+}
+
+// WinRT: initialization, the apartment, and the errors a call's failure carries.
+
+/// The model this thread was initialised with, and how many times: `RoInitialize`
+/// answers `S_FALSE` for the same model again and `RPC_E_CHANGED_MODE` for a
+/// different one, as COM does.
+thread_local! {
+    static RO_APARTMENT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+pub extern "system" fn RoInitialize(model: u32) -> i32 {
+    const RO_INIT_MULTITHREADED: u32 = 1;
+    const S_FALSE: i32 = 1;
+    const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+    // This host has one apartment, so a request for it is honoured and a request
+    // for another model is told the model changed.
+    if model != RO_INIT_MULTITHREADED {
+        return RPC_E_CHANGED_MODE;
+    }
+    RO_APARTMENT.with(|apartment| match apartment.get() {
+        Some(_) => S_FALSE,
+        None => {
+            apartment.set(Some(model));
+            0
+        }
+    })
+}
+
+pub extern "system" fn RoUninitialize() {
+    RO_APARTMENT.with(|apartment| apartment.set(None));
+}
+
+/// `RoGetApartmentIdentifier`: the one apartment, which every thread is in.
+pub extern "system" fn RoGetApartmentIdentifier(out: *mut u64) -> i32 {
+    if out.is_null() {
+        return 0x8000_4003_u32 as i32; // E_POINTER
+    }
+    // SAFETY: the title's out word.
+    unsafe { out.write(1) };
+    0
+}
+
+/// `RoRegisterForApartmentShutdown` and its inverse: nothing shuts an apartment
+/// down here, so the registration is answered and never called back.
+pub extern "system" fn RoRegisterForApartmentShutdown(
+    _callback: *const c_void,
+    _context: *mut c_void,
+    registration: *mut u64,
+) -> i32 {
+    if registration.is_null() {
+        return 0x8000_4003_u32 as i32; // E_POINTER
+    }
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    // SAFETY: the title's out registration id.
+    unsafe { registration.write(NEXT.fetch_add(1, Ordering::Relaxed)) };
+    0
+}
+
+pub extern "system" fn RoUnregisterForApartmentShutdown(_registration: u64) {}
+
+/// The activation factories: no runtime class is implemented by this host, and
+/// the name is logged so a title asking for one says which.
+pub extern "system" fn RoGetActivationFactory(
+    class: usize,
+    _interface: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { out.write(std::ptr::null_mut()) };
+    }
+    // SAFETY: the caller's `HSTRING`.
+    let name = unsafe {
+        let mut len = 0u32;
+        let data = super::winrt::WindowsGetStringRawBuffer(class as *mut u8, &mut len);
+        String::from_utf16_lossy(std::slice::from_raw_parts(data, len as usize))
+    };
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&name) {
+        seen.push(name.clone());
+        tracing::info!(class = %name, "RoGetActivationFactory: no such runtime class");
+    }
+    drop(seen);
+    0x8004_0154_u32 as i32 // REGDB_E_CLASSNOTREG
+}
+
+pub extern "system" fn RoRegisterActivationFactories(
+    _classes: *const usize,
+    _factories: *const usize,
+    count: u32,
+    cookie: *mut u32,
+) -> i32 {
+    if cookie.is_null() {
+        return 0x8000_4003_u32 as i32; // E_POINTER
+    }
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    tracing::info!(count, "RoRegisterActivationFactories: activation is not served here");
+    // SAFETY: the title's out cookie.
+    unsafe { cookie.write(NEXT.fetch_add(1, Ordering::Relaxed)) };
+    0
+}
+
+pub extern "system" fn RoRevokeActivationFactories(_cookie: u32) {}
+
+/// The error a failed WinRT call carries: the message is kept per thread and
+/// logged at once, so a failure inside the title is readable in the log even
+/// though no `IRestrictedErrorInfo` object is handed out.
+thread_local! {
+    static RO_ERROR: std::cell::RefCell<Option<(i32, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn record_error(code: i32, message: usize) -> i32 {
+    // SAFETY: the caller's optional `HSTRING`.
+    let text = unsafe {
+        let mut len = 0u32;
+        let data = super::winrt::WindowsGetStringRawBuffer(message as *mut u8, &mut len);
+        String::from_utf16_lossy(std::slice::from_raw_parts(data, len as usize))
+    };
+    tracing::warn!("WinRT error {code:#010x}: {text}");
+    RO_ERROR.with(|slot| *slot.borrow_mut() = Some((code, text)));
+    1
+}
+
+pub extern "system" fn RoOriginateError(code: i32, message: usize) -> i32 {
+    record_error(code, message)
+}
+
+pub extern "system" fn RoTransformError(old: i32, new: i32, message: usize) -> i32 {
+    let _ = old;
+    record_error(new, message)
+}
+
+/// No `IRestrictedErrorInfo` object exists here, so setting one is refused and
+/// getting one answers nothing: `S_FALSE` is what Windows answers when there is
+/// no error to report.
+pub extern "system" fn SetRestrictedErrorInfo(_info: *mut c_void) -> i32 {
+    0x8000_4001_u32 as i32 // E_NOTIMPL
+}
+
+pub extern "system" fn GetRestrictedErrorInfo(out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return 0x8000_4003_u32 as i32; // E_POINTER
+    }
+    // SAFETY: the title's out pointer.
+    unsafe { out.write(std::ptr::null_mut()) };
+    1 // S_FALSE: there is none
+}
+
 pub extern "system" fn CoTaskMemFree(_memory: *mut c_void) {}
 
 pub extern "system" fn CoCreateGuid(out: *mut u8) -> i32 {
@@ -3269,6 +3861,9 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             lstrcmpW,
             CompareStringEx,
             GetStringTypeW,
+            GetStringTypeExW,
+            FindResourceExW,
+            LoadResource,
             GetCPInfo,
             LCMapStringEx,
             GetUserDefaultLocaleName,
@@ -3319,7 +3914,6 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             GetCurrentProcess,
             GetCurrentThread,
             GetProcessId,
-            OpenThread,
             GetThreadPriority,
             SetThreadPriority,
             SetProcessPriorityBoost,
@@ -3356,6 +3950,8 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             InterlockedFlushSList,
             QueryDepthSList,
             InitOnceExecuteOnce,
+            InitOnceBeginInitialize,
+            InitOnceComplete,
             FlsAlloc,
             FlsFree,
             FlsGetValue,
@@ -3396,6 +3992,27 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             CoInitializeEx,
             CoUninitialize,
             CoCreateInstance,
+            CoTaskMemAlloc,
+            CoGetApartmentType,
+            CoAddRefServerProcess,
+            CoReleaseServerProcess,
+            CoGetObjectContext,
+            CoGetContextToken,
+            CoCreateFreeThreadedMarshaler,
+            CoMarshalInterThreadInterfaceInStream,
+            CoGetInterfaceAndReleaseStream,
+            RoInitialize,
+            RoUninitialize,
+            RoGetApartmentIdentifier,
+            RoRegisterForApartmentShutdown,
+            RoUnregisterForApartmentShutdown,
+            RoGetActivationFactory,
+            RoRegisterActivationFactories,
+            RoRevokeActivationFactories,
+            RoOriginateError,
+            RoTransformError,
+            SetRestrictedErrorInfo,
+            GetRestrictedErrorInfo,
             CoTaskMemFree,
             CoCreateGuid,
             StringFromGUID2,
@@ -4875,5 +5492,465 @@ mod logical_processor_tests {
             )
             .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod string_type_tests {
+    use super::*;
+
+    /// The categories of `winnls.h`, which is what `ispunct`, `isdigit` and
+    /// their neighbours ask about through this call.
+    const UPPER: u16 = 0x0001;
+    const LOWER: u16 = 0x0002;
+    const DIGIT: u16 = 0x0004;
+    const SPACE: u16 = 0x0008;
+    const PUNCT: u16 = 0x0010;
+    const CNTRL: u16 = 0x0020;
+    const BLANK: u16 = 0x0040;
+    const XDIGIT: u16 = 0x0080;
+    const ALPHA: u16 = 0x0100;
+    const DEFINED: u16 = 0x0200;
+
+    fn kinds_of(text: &str) -> Vec<u16> {
+        let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        let mut out = vec![0u16; text.encode_utf16().count()];
+        assert_eq!(
+            GetStringTypeW(1, wide.as_ptr(), -1, out.as_mut_ptr()),
+            1,
+            "{text}"
+        );
+        out
+    }
+
+    /// A letter in each case, a digit, a blank, punctuation, a control and the
+    /// characters that are all of those at once (a hex digit is a digit).
+    #[test]
+    fn the_categories_are_what_the_characters_are() {
+        // `A` is a hex digit as well as a capital letter.
+        assert_eq!(kinds_of("A")[0], UPPER | ALPHA | XDIGIT | DEFINED);
+        // And `a` is a hex digit too, which the lower-case letters `b`..`z` after
+        // `f` are not.
+        assert_eq!(kinds_of("a")[0], LOWER | ALPHA | XDIGIT | DEFINED);
+        assert_eq!(kinds_of("7")[0], DIGIT | XDIGIT | DEFINED);
+        assert_eq!(kinds_of("f")[0], LOWER | ALPHA | XDIGIT | DEFINED);
+        assert_eq!(kinds_of(" ") [0], SPACE | BLANK | DEFINED);
+        assert_eq!(kinds_of("\t")[0], SPACE | BLANK | CNTRL | DEFINED);
+        assert_eq!(kinds_of("\n")[0], SPACE | CNTRL | DEFINED);
+        assert_eq!(kinds_of("'")[0], PUNCT | DEFINED);
+        assert_eq!(kinds_of(".")[0], PUNCT | DEFINED);
+        // A non-ASCII punctuation is still punctuation, which an ASCII-only test
+        // would miss.
+        assert_eq!(kinds_of("\u{ab}")[0], PUNCT | DEFINED);
+        // An accented letter is a letter, and a lower-case one.
+        assert_eq!(kinds_of("\u{e9}")[0], LOWER | ALPHA | DEFINED);
+        assert_eq!(kinds_of("\u{c9}")[0], UPPER | ALPHA | DEFINED);
+        // `g` is a letter and not a hex digit, which is where the hex letters
+        // stop.
+        assert_eq!(kinds_of("g")[0], LOWER | ALPHA | DEFINED);
+        // A digit outside ASCII is a digit, not punctuation.
+        assert_eq!(kinds_of("\u{660}")[0], DIGIT | DEFINED);
+        // A non-breaking space is a space, not a blank.
+        assert_eq!(kinds_of("\u{a0}")[0], SPACE | DEFINED);
+    }
+
+    /// A count is honoured, and a negative one means the string's own end.
+    #[test]
+    fn the_count_decides_how_much_is_classified() {
+        let wide: Vec<u16> = "a1bc".encode_utf16().collect();
+        let mut out = [0u16; 2];
+        assert_eq!(GetStringTypeExW(0x400, 1, wide.as_ptr(), 2, out.as_mut_ptr()), 1);
+        assert_eq!(out, [LOWER | ALPHA | XDIGIT | DEFINED, DIGIT | XDIGIT | DEFINED]);
+
+        // A NUL-terminated call stops at the terminator, and the call takes the
+        // locale as its first word.
+        let mut all = [0u16; 4];
+        assert_eq!(
+            GetStringTypeExW(0x400, 1, wide.as_ptr(), -1, all.as_mut_ptr()),
+            1
+        );
+        assert_eq!(all[2], LOWER | ALPHA | XDIGIT | DEFINED, "`b` is a hex digit");
+
+        // The tables this host does not answer are refused, and a null pointer
+        // with them.
+        for kind in [2, 3, 0] {
+            assert_eq!(GetStringTypeW(kind, wide.as_ptr(), 1, all.as_mut_ptr()), 0);
+            assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        }
+        assert_eq!(
+            GetStringTypeW(1, std::ptr::null(), 1, all.as_mut_ptr()),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn the_two_names_are_answered_rather_than_stubbed() {
+        assert!(lookup("api-ms-win-core-string-l1-1-0.dll", "GetStringTypeExW").is_some());
+        assert!(lookup("api-ms-win-core-string-l1-1-0.dll", "GetStringTypeW").is_some());
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    fn put(bytes: &mut [u8], at: usize, value: u32) {
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put16(bytes: &mut [u8], at: usize, value: u16) {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// An entry of a directory: the key (an id, or an offset with the top bit
+    /// set) and where it points (another directory's offset with the top bit
+    /// set, or a leaf's offset).
+    fn entry(bytes: &mut [u8], at: usize, key: u32, offset: u32) {
+        put(bytes, at, key);
+        put(bytes, at + 4, offset);
+    }
+
+    /// An image with the headers and the resource tree a real one has:
+    ///
+    /// - type 10 (by id) and type `ABC` (by name) both holding
+    /// - name 101 in language 0x409, whose data is
+    /// - the five bytes `hello`, at 0x300.
+    fn image() -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x400];
+        // The headers: `e_lfanew`, the signature, and a PE32+ optional header
+        // whose data directory entry 2 names the resource directory at 0x200.
+        put(&mut bytes, 0x3C, 0x40);
+        bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
+        put16(&mut bytes, 0x58, 0x20B);
+        let directory = 0x40 + 24 + 2 * 8;
+        put(&mut bytes, directory + 112, 0x200);
+        put(&mut bytes, directory + 116, 0x200);
+
+        // The root: one id and one named type, both pointing at 0x230.
+        put16(&mut bytes, 0x200 + 12, 1); // NumberOfNamedEntries
+        put16(&mut bytes, 0x200 + 14, 1); // NumberOfIdEntries
+        entry(&mut bytes, 0x210, 10, 0x8000_0030);
+        entry(&mut bytes, 0x218, 0x8000_0090, 0x8000_0030);
+
+        // Type 10's names: id 101, whose languages are at 0x250.
+        put16(&mut bytes, 0x230 + 14, 1);
+        entry(&mut bytes, 0x240, 101, 0x8000_0050);
+
+        // Name 101's languages: 0x409, whose data entry is at 0x270.
+        put16(&mut bytes, 0x250 + 14, 1);
+        entry(&mut bytes, 0x260, 0x409, 0x70);
+
+        // The data entry: where the bytes are, and how many.
+        put(&mut bytes, 0x270, 0x300);
+        put(&mut bytes, 0x274, 5);
+
+        // The name `ABC`: a length and then its characters.
+        put16(&mut bytes, 0x290, 3);
+        for (i, c) in "ABC".encode_utf16().enumerate() {
+            put16(&mut bytes, 0x292 + i * 2, c);
+        }
+        bytes[0x300..0x305].copy_from_slice(b"hello");
+        bytes
+    }
+
+    /// A resource is found through its type, its name and its language, and what
+    /// comes back is the image's own data, not a copy.
+    #[test]
+    fn a_resource_is_found_by_its_three_levels_and_loaded() {
+        let bytes = image();
+        let base = bytes.as_ptr() as usize;
+        let module = base as *mut c_void;
+        let found = FindResourceExW(module, 10, 101, 0x409);
+        assert!(!found.is_null(), "type 10 name 101 was not found");
+        // The handle is the image's data entry, as Windows hands out for a mapped
+        // module.
+        assert_eq!(found as usize, base + 0x270);
+
+        let data = LoadResource(module, found);
+        assert_eq!(data as usize, base + 0x300);
+        // SAFETY: the five bytes this test wrote into its own image.
+        assert_eq!(unsafe { std::slice::from_raw_parts(data.cast::<u8>(), 5) }, b"hello");
+
+        // Language zero means any, and the same entry comes back.
+        assert_eq!(FindResourceExW(module, 10, 101, 0), found);
+        // A type given by name, without case.
+        let name: Vec<u16> = "abc\0".encode_utf16().collect();
+        assert_eq!(
+            FindResourceExW(module, name.as_ptr() as usize, 101, 0x409),
+            found
+        );
+    }
+
+    /// Three levels, three reasons: a type, a name and a language that are not
+    /// there are told apart, and a handle that is not one is refused.
+    #[test]
+    fn what_is_missing_is_named() {
+        let bytes = image();
+        let module = bytes.as_ptr() as *mut c_void;
+        assert!(FindResourceExW(module, 11, 101, 0x409).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_RESOURCE_TYPE_NOT_FOUND);
+        assert!(FindResourceExW(module, 10, 102, 0x409).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_RESOURCE_NAME_NOT_FOUND);
+        assert!(FindResourceExW(module, 10, 101, 0x40C).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_RESOURCE_LANG_NOT_FOUND);
+
+        assert!(LoadResource(module, std::ptr::null_mut()).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn the_two_names_are_answered_rather_than_stubbed() {
+        for name in ["FindResourceExW", "LoadResource"] {
+            assert!(
+                lookup("api-ms-win-core-libraryloader-l1-2-0.dll", name).is_some(),
+                "{name} is not answered"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod init_once_tests {
+    use super::*;
+
+    #[test]
+    fn a_begin_claims_the_word_and_complete_hands_the_context_back() {
+        let once = AtomicU64::new(0);
+        let word = (&once) as *const AtomicU64 as *mut AtomicU64;
+        let data = 0u64;
+        let context_value = (&data) as *const u64 as *mut c_void;
+        let (mut pending, mut context) = (-1i32, std::ptr::null_mut());
+
+        // Check-only claims nothing: an untouched word is pending and has no context yet.
+        assert_eq!(
+            InitOnceBeginInitialize(word, INIT_ONCE_CHECK_ONLY, &mut pending, &mut context),
+            0
+        );
+        assert_eq!((pending, context, once.load(Ordering::Relaxed)), (1, std::ptr::null_mut(), 0));
+        assert_eq!(super::super::GetLastError(), ERROR_IO_PENDING);
+
+        // A plain begin claims it, and says the caller must run the initialization.
+        assert_eq!(InitOnceBeginInitialize(word, 0, &mut pending, &mut context), 1);
+        assert_eq!((pending, once.load(Ordering::Relaxed)), (1, 1));
+
+        // A second begin waits for the claim, so it is only answered by the complete.
+        assert_eq!(InitOnceComplete(word, 0, context_value), 1);
+        assert_eq!(once.load(Ordering::Relaxed), context_value as u64 | 2);
+        assert_eq!(InitOnceComplete(word, 0, context_value), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        for flags in [0, INIT_ONCE_CHECK_ONLY] {
+            context = std::ptr::null_mut();
+            assert_eq!(InitOnceBeginInitialize(word, flags, &mut pending, &mut context), 1);
+            assert_eq!((pending, context), (0, context_value));
+        }
+    }
+
+    #[test]
+    fn a_failed_run_hands_the_word_back_and_async_says_it_is_not_implemented() {
+        let once = AtomicU64::new(0);
+        let word = (&once) as *const AtomicU64 as *mut AtomicU64;
+        let (mut pending, mut context) = (-1i32, std::ptr::null_mut());
+
+        assert_eq!(InitOnceBeginInitialize(word, 0, &mut pending, &mut context), 1);
+        assert_eq!(InitOnceComplete(word, INIT_ONCE_INIT_FAILED, std::ptr::null_mut()), 1);
+        assert_eq!(once.load(Ordering::Relaxed), 0);
+        assert_eq!(InitOnceBeginInitialize(word, 0, &mut pending, &mut context), 1);
+        assert_eq!(pending, 1);
+
+        assert_eq!(
+            InitOnceBeginInitialize(word, INIT_ONCE_ASYNC, &mut pending, &mut context),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_CALL_NOT_IMPLEMENTED);
+        assert_eq!(InitOnceComplete(word, INIT_ONCE_ASYNC, std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_CALL_NOT_IMPLEMENTED);
+
+        // A complete with nothing claimed is the caller's own mistake.
+        let fresh = AtomicU64::new(2);
+        let done = (&fresh) as *const AtomicU64 as *mut AtomicU64;
+        assert_eq!(InitOnceComplete(done, 0, std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(fresh.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[cfg(test)]
+mod apartment_and_winrt_tests {
+    use super::*;
+
+    const S_FALSE: i32 = 1;
+    const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
+    const E_NOTIMPL: i32 = 0x8000_4001u32 as i32;
+    const E_POINTER: i32 = 0x8000_4003u32 as i32;
+    const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+    const REGDB_E_CLASSNOTREG: i32 = 0x8004_0154u32 as i32;
+
+    /// This host has one apartment, and the calls that describe it say the same
+    /// thing rather than leaving it unanswered.
+    #[test]
+    fn the_apartment_is_the_multithreaded_one() {
+        let (mut kind, mut qualifier) = (u32::MAX, u32::MAX);
+        assert_eq!(CoGetApartmentType(&mut kind, &mut qualifier), 0);
+        assert_eq!((kind, qualifier), (1, 1));
+
+        // Initialising again with the same model is S_FALSE, with another model
+        // is a mode change, as COM answers it. Each thread has its own answer, so
+        // this runs on one.
+        std::thread::spawn(|| {
+            assert_eq!(RoInitialize(1), 0);
+            assert_eq!(RoInitialize(1), S_FALSE);
+            assert_eq!(RoInitialize(0), RPC_E_CHANGED_MODE);
+            let mut apartment = 0u64;
+            assert_eq!(RoGetApartmentIdentifier(&mut apartment), 0);
+            assert_eq!(apartment, 1);
+            let mut registration = 0u64;
+            assert_eq!(
+                RoRegisterForApartmentShutdown(std::ptr::null(), std::ptr::null_mut(), &mut registration),
+                0
+            );
+            assert_ne!(registration, 0);
+            RoUnregisterForApartmentShutdown(registration);
+            RoUninitialize();
+            // The next initialisation is the first one again.
+            assert_eq!(RoInitialize(1), 0);
+            RoUninitialize();
+        })
+        .join()
+        .unwrap();
+
+        // A count of callers, which never goes below zero.
+        assert_eq!(CoAddRefServerProcess(), 1);
+        assert_eq!(CoAddRefServerProcess(), 2);
+        assert_eq!(CoReleaseServerProcess(), 1);
+        assert_eq!(CoReleaseServerProcess(), 0);
+        assert_eq!(CoReleaseServerProcess(), 0);
+        CoAddRefServerProcess();
+    }
+
+    /// What needs an object behind it is refused with the reason, so a caller's
+    /// failure is visible rather than silent.
+    #[test]
+    fn what_needs_an_object_is_refused_with_its_reason() {
+        let mut context: *mut c_void = 1 as *mut c_void;
+        assert_eq!(CoGetObjectContext(std::ptr::null(), &mut context), E_NOINTERFACE);
+        assert!(context.is_null());
+        let mut token = usize::MAX;
+        assert_eq!(CoGetContextToken(&mut token), E_NOINTERFACE);
+        assert_eq!(token, 0);
+
+        let mut marshaler: *mut c_void = 1 as *mut c_void;
+        assert_eq!(
+            CoCreateFreeThreadedMarshaler(std::ptr::null_mut(), &mut marshaler),
+            E_NOTIMPL
+        );
+        assert!(marshaler.is_null());
+        let mut stream: *mut c_void = 1 as *mut c_void;
+        assert_eq!(
+            CoMarshalInterThreadInterfaceInStream(std::ptr::null(), std::ptr::null_mut(), &mut stream),
+            E_NOTIMPL
+        );
+        assert!(stream.is_null());
+        assert_eq!(
+            CoGetInterfaceAndReleaseStream(std::ptr::null_mut(), std::ptr::null(), &mut stream),
+            E_NOTIMPL
+        );
+
+        // No error-info object is handed out, and none is claimed when there is
+        // nothing to report.
+        let mut info: *mut c_void = 1 as *mut c_void;
+        assert_eq!(GetRestrictedErrorInfo(&mut info), S_FALSE);
+        assert!(info.is_null());
+        assert_eq!(SetRestrictedErrorInfo(std::ptr::null_mut()), E_NOTIMPL);
+        assert_eq!(GetRestrictedErrorInfo(std::ptr::null_mut()), E_POINTER);
+    }
+
+    /// A task block is the process heap's, and the constants of the calls are the
+    /// ones Windows uses.
+    #[test]
+    fn task_memory_comes_from_the_heap() {
+        let block = CoTaskMemAlloc(16).cast::<u8>();
+        assert!(!block.is_null());
+        // SAFETY: the 16 bytes this call allocated.
+        unsafe {
+            std::ptr::write_bytes(block, 0xAB, 16);
+            assert_eq!(*block, 0xAB);
+        }
+        // Freeing it is the documented shortcut, so this only checks the call is
+        // answered.
+        CoTaskMemFree(block.cast());
+        assert!(CoTaskMemAlloc(0).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    /// A runtime class this host does not implement is reported as not
+    /// registered, and its name comes out of the `HSTRING` the caller passed.
+    #[test]
+    fn a_runtime_class_is_reported_as_not_registered() {
+        let wide: Vec<u16> = "Windows.Foundation.Uri".encode_utf16().collect();
+        let mut class = std::ptr::null_mut();
+        assert_eq!(
+            super::super::winrt::WindowsCreateString(wide.as_ptr(), wide.len() as u32, &mut class),
+            0
+        );
+        let mut factory: *mut c_void = 1 as *mut c_void;
+        assert_eq!(
+            RoGetActivationFactory(class as usize, std::ptr::null(), &mut factory),
+            REGDB_E_CLASSNOTREG
+        );
+        assert!(factory.is_null());
+
+        // Registering factories is answered with a cookie, and the cookie is
+        // revocable.
+        let mut cookie = 0u32;
+        assert_eq!(
+            RoRegisterActivationFactories(std::ptr::null(), std::ptr::null(), 0, &mut cookie),
+            0
+        );
+        assert_ne!(cookie, 0);
+        RoRevokeActivationFactories(cookie);
+
+        // An error's message is read out of its `HSTRING` and kept, which is what
+        // makes a failure inside the title readable.
+        let message: Vec<u16> = "no".encode_utf16().collect();
+        let mut text = std::ptr::null_mut();
+        assert_eq!(
+            super::super::winrt::WindowsCreateString(message.as_ptr(), message.len() as u32, &mut text),
+            0
+        );
+        assert_eq!(RoOriginateError(0x8000_0001u32 as i32, text as usize), 1);
+        assert_eq!(RoTransformError(0x8000_0001u32 as i32, 0x8000_0005u32 as i32, text as usize), 1);
+        assert_eq!(super::super::winrt::WindowsDeleteString(text), 0);
+        assert_eq!(super::super::winrt::WindowsDeleteString(class), 0);
+    }
+
+    #[test]
+    fn the_com_and_winrt_names_are_answered_rather_than_stubbed() {
+        for (dll, name) in [
+            ("api-ms-win-core-com-l1-1-0.dll", "CoTaskMemAlloc"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoGetApartmentType"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoAddRefServerProcess"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoReleaseServerProcess"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoGetObjectContext"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoGetContextToken"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoCreateFreeThreadedMarshaler"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoMarshalInterThreadInterfaceInStream"),
+            ("api-ms-win-core-com-l1-1-0.dll", "CoGetInterfaceAndReleaseStream"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoInitialize"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoUninitialize"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoGetApartmentIdentifier"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoRegisterForApartmentShutdown"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoUnregisterForApartmentShutdown"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoGetActivationFactory"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoRegisterActivationFactories"),
+            ("api-ms-win-core-winrt-l1-1-0.dll", "RoRevokeActivationFactories"),
+            ("api-ms-win-core-winrt-error-l1-1-0.dll", "RoOriginateError"),
+            ("api-ms-win-core-winrt-error-l1-1-0.dll", "RoTransformError"),
+            ("api-ms-win-core-winrt-error-l1-1-0.dll", "GetRestrictedErrorInfo"),
+            ("api-ms-win-core-winrt-error-l1-1-0.dll", "SetRestrictedErrorInfo"),
+        ] {
+            assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
+        }
     }
 }

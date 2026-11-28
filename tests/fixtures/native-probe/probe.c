@@ -53,6 +53,10 @@ IMPORT u32 ResumeThread(ptr);
 IMPORT int GetThreadContext(ptr, ptr);
 IMPORT void ExitThread(u32);
 IMPORT int GetExitCodeThread(ptr, u32 *);
+IMPORT u32 FlsAlloc(ptr);
+IMPORT int FlsSetValue(u32, ptr);
+IMPORT ptr FlsGetValue(u32);
+IMPORT int FlsFree(u32);
 IMPORT u32 WaitForMultipleObjects(u32, const ptr *, int, u32);
 IMPORT int SwitchToThread(void);
 IMPORT void InitializeCriticalSection(ptr);
@@ -547,6 +551,8 @@ enum {
     T_CV_TIMEOUT = 1u << 17,
     T_SWITCH = 1u << 18,
     T_EXIT_THREAD = 1u << 19,
+    T_FLS_DESTRUCTOR = 1u << 20,
+    T_FLS_FREE_DESTRUCTOR = 1u << 21,
 };
 
 static volatile u32 ran_flag, spin_stop;
@@ -582,6 +588,21 @@ static u32 __attribute__((noinline)) exit_worker(ptr param)
     ExitThread(7);
     after_exit_flag = 1;
     return 9;
+}
+
+/* FLS: the destructor a slot is given runs with the value the ending thread held, and,
+ * for the thread that frees the slot, with its own. */
+static volatile u32 fls_destroyed;
+
+static void fls_destructor(ptr value)
+{
+    fls_destroyed = (u32)(u64)value;
+}
+
+static u32 fls_worker(ptr param)
+{
+    FlsSetValue((u32)(u64)param, (ptr)0x5A5A);
+    return 0;
 }
 
 /* A CONTEXT is 0x4D0 bytes, 16-aligned. */
@@ -660,6 +681,24 @@ u32 probe_threads(ptr unused)
         if (GetExitCodeThread(xt, &exit_code) && exit_code == 7 && !after_exit_flag)
             ok |= T_EXIT_THREAD;
         CloseHandle(xt);
+    }
+
+    /* FlsAlloc's destructor runs on the thread that ends holding a value in the slot. */
+    fls_destroyed = 0;
+    u32 fls = FlsAlloc((ptr)fls_destructor);
+    if (fls != 0xFFFFFFFFu) {
+        ptr ft = CreateThread(0, 0, (ptr)fls_worker, (ptr)(u64)fls, 0, 0);
+        if (ft) {
+            WaitForSingleObject(ft, 5000);
+            CloseHandle(ft);
+        }
+        if (fls_destroyed == 0x5A5A && FlsGetValue(fls) == 0)
+            ok |= T_FLS_DESTRUCTOR;
+
+        /* And on the thread that frees the slot, with the value it holds there. */
+        fls_destroyed = 0;
+        if (FlsSetValue(fls, (ptr)0x1234) && (FlsFree(fls) == 1) && fls_destroyed == 0x1234)
+            ok |= T_FLS_FREE_DESTRUCTOR;
     }
 
     CloseHandle(done);

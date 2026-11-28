@@ -2197,7 +2197,7 @@ impl Owed {
         if fills.is_empty() {
             return;
         }
-        *self.refund.lock().unwrap_or_else(|e| e.into_inner()) = fills;
+        self.refund.lock().unwrap_or_else(|e| e.into_inner()).extend(fills);
         // The completion handler already ran (the command buffer was done before this call): its
         // passes have run, so paying at once is the console's order. Else the handler pays.
         if self.completed.load(std::sync::atomic::Ordering::Acquire) {
@@ -2207,8 +2207,10 @@ impl Owed {
 
     /// Writes each refunded fill, in order. Called from the completion handler, so a waiter sees
     /// the writes only after this command buffer's passes have run — the order the console kept.
+    /// The fills are taken out under the lock, so the handler and a racing attach never both pay
+    /// them (a second payment could overwrite a newer value the title wrote in between).
     fn pay_refund(&self) {
-        let refund = self.refund.lock().unwrap_or_else(|e| e.into_inner());
+        let refund = std::mem::take(&mut *self.refund.lock().unwrap_or_else(|e| e.into_inner()));
         if refund.is_empty() {
             return;
         }
@@ -4218,7 +4220,6 @@ mod owed_tests {
         let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
         // SAFETY: inside the region; the GPU is idle.
         unsafe { std::ptr::write_bytes(region.ptr, 0xEE, 16) };
-        let q = m.create_queue().unwrap();
         let owed = std::sync::Arc::new(Owed::of(vec![], &[], 0));
 
         // In flight: an attach is stored, not paid (the completion pays it in the GPU's order).
@@ -4239,6 +4240,71 @@ mod owed_tests {
         // SAFETY: inside the region.
         let bytes = unsafe { std::slice::from_raw_parts(region.ptr, 16) };
         assert_eq!(&bytes[8..], &[0x22; 8], "paid at once past the completion");
+        // Paid once only: a second payment writes nothing.
+        // SAFETY: inside the region.
+        unsafe { std::ptr::write_bytes(region.ptr, 0x44, 16) };
+        owed.pay_refund();
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 16) }, [0x44; 16], "nothing paid twice");
+    }
+
+    /// The race the attach has with the completion handler: the attach stores its fills, the
+    /// handler runs (flag up, pays them), the title writes a newer value, and only then does the
+    /// attach see the flag and pay. The fills are paid once, by the handler; the newer value stays.
+    #[test]
+    fn a_completion_between_an_attach_and_its_flag_check_pays_the_fills_once() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        let owed = Owed::of(vec![], &[], 0);
+        // The attach's store (its first half).
+        owed.refund.lock().unwrap().push((buf.buf.clone(), 0, 8, 0x11));
+        // The completion handler, in between.
+        owed.completed.store(true, std::sync::atomic::Ordering::Release);
+        owed.pay_refund();
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, [0x11; 8], "the handler paid");
+        // The title writes a newer value; then the attach's second half sees the flag and pays.
+        // SAFETY: inside the region.
+        unsafe { std::ptr::write_bytes(region.ptr, 0x33, 8) };
+        assert!(owed.completed.load(std::sync::atomic::Ordering::Acquire));
+        owed.pay_refund();
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, [0x33; 8], "not paid again over it");
+    }
+
+    /// A real piece committed through `commit_piece`: Metal runs its completion handler (the
+    /// block must reach Metal as a block and stay alive), which pays a fill attached after the
+    /// commit, once.
+    #[test]
+    fn a_committed_piece_pays_its_attached_fills_from_the_completion_handler() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        // SAFETY: inside the region; the GPU is idle.
+        unsafe { std::ptr::write_bytes(region.ptr, 0xEE, 16) };
+        let q = m.create_queue().unwrap();
+        let cb = m.new_command_buffer(&q).unwrap();
+        let owed = m.commit_piece(&q, &cb, Owed::of(vec![], &[], 0), 1, None);
+        owed.attach_refund(vec![BlitOp::Fill { dst: (&buf, region.ptr as *const u8), len: 8, value: 0x11 }]);
+        cb.waitUntilCompleted();
+        // The handler raises the flag before it pays: wait for the bytes.
+        let start = std::time::Instant::now();
+        // SAFETY: inside the region; volatile, as the handler's thread writes it.
+        while unsafe { region.ptr.read_volatile() } != 0x11 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10), "the completion handler never paid");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // SAFETY: inside the region; the GPU is done with it.
+        let bytes = unsafe { std::slice::from_raw_parts(region.ptr, 16) };
+        assert_eq!(&bytes[..8], &[0x11; 8], "paid");
+        assert_eq!(&bytes[8..], &[0xEE; 8], "and only the attached range");
+        // SAFETY: inside the region.
+        unsafe { std::ptr::write_bytes(region.ptr, 0x33, 8) };
+        owed.pay_refund();
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, [0x33; 8], "paid once");
     }
 
     #[test]

@@ -338,6 +338,34 @@ unsafe fn resume(ctx: *const Context) -> ! {
     unsafe { victory_restore_context(ctx, teb::current()) }
 }
 
+/// Diagnostics: title `int3` asserts to step over and resume, the way a debugger continues past
+/// one, to see how far init gets. Their RVAs in the title image, from
+/// `VICTORY_SKIP_TITLE_INT3=1330a44,...` (#24, which had it on the Windows path only).
+#[cfg(feature = "diagnostics")]
+static SKIP_TITLE_INT3: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+/// The RVAs in a `VICTORY_SKIP_TITLE_INT3` list (hex, `0x` optional, comma-separated); entries
+/// that do not parse are left out.
+#[cfg(any(feature = "diagnostics", test))]
+fn skip_list(value: &str) -> Vec<u32> {
+    value
+        .split(',')
+        .filter_map(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
+/// Whether `rva` is a title `int3` to step over (diagnostics builds).
+#[cfg(feature = "diagnostics")]
+fn skip_int3(rva: u32) -> bool {
+    SKIP_TITLE_INT3
+        .get_or_init(|| {
+            std::env::var("VICTORY_SKIP_TITLE_INT3")
+                .map(|v| skip_list(&v))
+                .unwrap_or_default()
+        })
+        .contains(&rva)
+}
+
 /// Runs on the host's GS base, entered from `victory_exception_entry`.
 extern "C" fn dispatch_exception(ctx: *mut Context, rec: *mut ExceptionRecord, _teb: usize) -> ! {
     let marker = 0u8;
@@ -375,6 +403,57 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
     if unsafe { super::super::dump::write_trap(&*ctx, &*rec) } {
         // SAFETY: forwarded from the caller.
         unsafe { resume(ctx) };
+    }
+    // A title `int3` assert in the list: step over the one-byte `int3` and resume where it left
+    // off, as a debugger continues past an assert. Every other assert still stops the run.
+    #[cfg(feature = "diagnostics")]
+    // SAFETY: both are ours for this dispatch.
+    unsafe {
+        let (c, r) = (&*ctx, &*rec);
+        let base = teb::image_base();
+        if r.code == 0x8000_0003
+            && base != 0
+            && (base..base + 0x1000_0000).contains(&(c.rip as usize))
+            && let Ok(rva) = u32::try_from(c.rip as usize - base)
+            && skip_int3(rva)
+        {
+            // The first step over an assert is logged, and the rest at debug: one of the title's
+            // asserts sits in a loop that runs tens of thousands of times a second, and a warn per
+            // hit buries every other line of the log.
+            static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+            let first = {
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.contains(&rva) {
+                    false
+                } else {
+                    seen.push(rva);
+                    true
+                }
+            };
+            if first {
+                // The chain names the callers of the assert: a frame in the title image as its
+                // RVA, one anywhere else (a DLL) as an absolute address.
+                let chain: Vec<String> = backtrace(*c, stack_bounds())
+                    .into_iter()
+                    .map(|pc| match pc.checked_sub(base) {
+                        Some(rva) if rva < 0x1000_0000 => format!("{rva:#x}"),
+                        _ => format!("{pc:#x}"),
+                    })
+                    .collect();
+                tracing::warn!(
+                    rva = format_args!("{rva:#x}"),
+                    chain = %chain.join(" "),
+                    "stepped over a title int3 (VICTORY_SKIP_TITLE_INT3); further hits at debug"
+                );
+            } else {
+                tracing::debug!(
+                    rva = format_args!("{rva:#x}"),
+                    "stepped over a title int3 (VICTORY_SKIP_TITLE_INT3)"
+                );
+            }
+            (*ctx).rip += 1;
+            resume(ctx);
+        }
     }
     // First-chance log: the title's own handlers may hide where a fault started.
     // SAFETY: both are ours for this dispatch.
@@ -881,5 +960,23 @@ pub mod api {
             };
         }
         EXCEPTION_CONTINUE_SEARCH_DISPOSITION
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stepped-over assert is named by RVA, hex with or without `0x`; an entry that does not
+    /// parse is left out, so a typo cannot stop the rest of a list from being stepped over.
+    #[test]
+    fn the_skip_list_is_hex_rvas() {
+        assert_eq!(skip_list("1330a44"), vec![0x0133_0a44]);
+        assert_eq!(
+            skip_list("0x1330a44, 1dac734"),
+            vec![0x0133_0a44, 0x01da_c734]
+        );
+        assert_eq!(skip_list("1330a44,zz,0x"), vec![0x0133_0a44]);
+        assert!(skip_list("").is_empty());
     }
 }

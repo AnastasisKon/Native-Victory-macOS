@@ -132,6 +132,12 @@ pub fn set_image_base(base: usize) {
     unsafe { ((peb() + OFF_PEB_IMAGE_BASE) as *mut usize).write(base) };
 }
 
+/// The title's main image (the PEB's `ImageBaseAddress`), `0` before [`set_image_base`].
+pub fn image_base() -> usize {
+    // SAFETY: inside our PEB block.
+    unsafe { ((peb() + OFF_PEB_IMAGE_BASE) as *const usize).read() }
+}
+
 struct ThreadTeb {
     teb: *mut u8,
     tls_array: Box<[AtomicUsize; MAX_TLS_MODULES]>,

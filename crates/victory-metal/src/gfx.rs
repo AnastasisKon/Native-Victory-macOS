@@ -2153,19 +2153,25 @@ fn gated_args(serial: u64, forget: bool) -> String {
     let args = if forget { gated.remove(&serial) } else { gated.get(&serial).cloned() };
     let mut out = String::new();
     for (name, at, words) in args.unwrap_or_default() {
-        // SAFETY: a shared buffer of `words` words, alive while its command buffer is in flight; a
-        // landed one is read in its completion handler, before Metal releases it.
-        let w: Vec<u32> = (0..words).map(|k| unsafe { (at as *const u32).add(k).read_unaligned() }).collect();
-        // A dispatch's gate holds what it runs, then what the record asked for.
-        let asked = if words == 6 { &w[3..] } else { &w[..] };
+        // SAFETY: a shared buffer of twice `words` words (what the gate ran, then what the record
+        // asked for), alive while its command buffer is in flight; a landed one is read in its
+        // completion handler, before Metal releases it.
+        let w: Vec<u32> = (0..2 * words).map(|k| unsafe { (at as *const u32).add(k).read_unaligned() }).collect();
+        let (ran, asked) = w.split_at(words);
         out.push_str(&format!(" | gpu read {name} {asked:?}"));
-        // A record past the most groups the gate runs, which ran nothing: each pipeline's first few.
-        if words == 6 && asked.iter().map(|g| u128::from(*g)).product::<u128>() > 1 << 22 {
+        // A record past what the gate runs, which ran nothing (not one its count buffer left
+        // out, or a rectangle list's, rewritten): each pipeline's first few.
+        let total = |n: &[u32]| n.iter().map(|g| u64::from(*g)).fold(1u128, |a, g| a * u128::from(g));
+        let past = match words {
+            3 => total(asked) > 1 << 22,
+            _ => asked[1] > 1 << 20 || total(&asked[..2]) > 1 << 26,
+        };
+        if past && ran.iter().all(|x| *x == 0) {
             static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
             let mut seen = SEEN.lock().unwrap();
             if seen.iter().filter(|n| **n == name).count() < 4 {
                 seen.push(name.clone());
-                tracing::warn!("metal: an indirect dispatch past the most groups ran nothing: {name} {asked:?}");
+                tracing::warn!("metal: an indirect record past the most the gate runs ran nothing: {name} {asked:?}");
             }
         }
     }
@@ -2552,10 +2558,14 @@ pub fn direct_copy(a: Format, b: Format) -> bool {
 /// ended, and every one behind it on the queue timed out). A guard of ours, not a console rule:
 /// the title's own records ask for far less (9,192 groups at most seen here), but for more than
 /// D3D12's 65,535 in one dimension on larger targets, so the limit is on the product.
+/// A draw's record draws nothing if it asks for more than 2^20 instances or 2^26 vertices in all,
+/// for the same reason: one read as 3 vertices and 864,026,624 instances (stale float bits where
+/// the count should be) kept the GPU at 100 % until the process was gone, and the driver then
+/// kept the process's 19 GB. Guess: no draw of the title's comes near either limit.
 /// Bound at 20 and up, apart from the converter's slots. `at`: the record's index, its words,
 /// whether a count applies, 1 for a rectangle list's record or 2 for a dispatch's or a mesh
-/// dispatch's (six words out: the three it runs, then the three the record asked for, for
-/// `VICTORY_TRACE_GPU_FAILS`).
+/// dispatch's (three words). After the words it runs, `out` holds the words the record asked for
+/// (`VICTORY_TRACE_GPU_FAILS`).
 const GATE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2568,14 +2578,15 @@ kernel void gate(device const uint *count [[buffer(20)]],
         // Two steps: the product of three words does not fit 64 bits.
         ulong plane = ulong(record[0]) * record[1];
         run = run && plane <= 4194304ul && plane * record[2] <= 4194304ul;
-        for (uint w = 0; w < 3u; w++) {
-            out[w] = run ? record[w] : 0u;
-            out[3u + w] = record[w];
-        }
-        return;
+    } else if (at.w == 1u) {
+        // A rectangle a vertex triple.
+        run = run && record[0] <= (3u << 20);
+    } else {
+        run = run && record[1] <= (1u << 20) && ulong(record[0]) * record[1] <= (1ul << 26);
     }
     for (uint w = 0; w < at.y; w++) {
         out[w] = run ? record[w] : 0u;
+        out[at.y + w] = record[w];
     }
     if (at.w == 1u) {
         // shortcut: an instanced rectangle list draws nothing (the rectangle translation takes the
@@ -2628,8 +2639,8 @@ impl Metal {
         let out = self
             .dev
             .newBufferWithLength_options(
-                // A dispatch's gate also keeps what the record asked for.
-                if kind == 2 { 24 } else { words as usize * 4 },
+                // The words it runs, then the words the record asked for.
+                words as usize * 8,
                 // Tracing reads the record the GPU used back (`GATED`).
                 if self.trace_fails { MTLResourceOptions::StorageModeShared } else { MTLResourceOptions::StorageModePrivate },
             )
@@ -2712,7 +2723,7 @@ impl Metal {
             if let (true, Some(g)) = (self.trace_fails, &gated) {
                 let k = Retained::as_ptr(&d.pipeline.0) as *const u8 as usize;
                 let name = self.pipe_names.borrow().get(&k).cloned().unwrap_or_else(|| format!("{k:#x}"));
-                self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, 6));
+                self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, 3));
             }
             e.setComputePipelineState(&d.pipeline.0);
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
@@ -2909,13 +2920,9 @@ impl Metal {
                 None => a.setLoadAction(MTLLoadAction::Load),
             }
         }
-        // Counted indirect draws, indirect rectangle lists and indirect mesh dispatches (for the
-        // most groups they may ask for) are gated first, in a compute pass of their own; when
-        // tracing, every indirect draw is, so what the GPU read is known.
-        let gated = |d: &Draw<'_, Metal>| {
-            d.indirect.is_some()
-                && (d.count.is_some() || matches!(d.call, DrawCall::Rects | DrawCall::Mesh { .. }) || self.trace_fails)
-        };
+        // Indirect draws are gated first, in a compute pass of their own: the count buffer's
+        // limit, a rectangle list's record, and the most a record may ask for.
+        let gated = |d: &Draw<'_, Metal>| d.indirect.is_some();
         let mut gates = Vec::new();
         if rp.draws.iter().any(gated) {
             let c = cb.computeCommandEncoder().ok_or("no compute encoder")?;
@@ -2940,7 +2947,7 @@ impl Metal {
                         let g = self.encode_gate(&c, d.count, record, words, kind, set_on_queue).inspect_err(|_| c.endEncoding())?;
                         if self.trace_fails {
                             let name = format!("{} {}", if kind == 2 { "mesh draw" } else { "draw" }, gates.len());
-                            self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, if kind == 2 { 6 } else { words as usize }));
+                            self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, words as usize));
                         }
                         Some(g)
                     }

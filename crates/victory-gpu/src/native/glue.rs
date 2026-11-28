@@ -684,6 +684,19 @@ fn records_in(buffers: &std::collections::BTreeSet<(u64, u64)>, executions: &std
         .fold([0; 2], |a, (_, n)| [a[0] + n[0], a[1] + n[1]])
 }
 
+/// A dropped pipeline is named once, so the log says which one, and the keys stop growing at the
+/// limit rather than a title with thousands of dropped pipelines writing a line each frame.
+#[cfg(test)]
+#[test]
+fn a_dropped_pipeline_is_named_once() {
+    let mut seen = Vec::new();
+    assert!(first_of_pipeline(&mut seen, "a", 2));
+    assert!(!first_of_pipeline(&mut seen, "a", 2), "the same pipeline named twice");
+    assert!(first_of_pipeline(&mut seen, "b", 2));
+    assert!(!first_of_pipeline(&mut seen, "c", 2), "past the limit nothing more is named");
+    assert_eq!(seen, ["a", "b"]);
+}
+
 #[cfg(test)]
 #[test]
 fn records_are_counted_for_the_buffers_that_hold_their_first_record() {
@@ -1523,6 +1536,33 @@ pub(crate) fn trace_drop_pipe(key: String) {
     }
 }
 
+/// Pipelines [`warn_drop_pipe`] names: a title with thousands of them logs the first few rather
+/// than a line each.
+const DROP_PIPE_KEYS: usize = 64;
+
+/// Whether `key` is the first of its pipeline seen, keeping it while there is room for `limit`.
+fn first_of_pipeline(seen: &mut Vec<String>, key: &str, limit: usize) -> bool {
+    if seen.iter().any(|k| k.as_str() == key) || seen.len() == limit {
+        return false;
+    }
+    seen.push(key.to_owned());
+    true
+}
+
+/// Logs a draw or execution dropped for want of a host pipeline, with its shaders and targets, the
+/// first time for each. The reason alone ("refused or not translated") does not say which pipeline
+/// went, so a run's log could not name the drops nothing else had explained (#531).
+fn warn_drop_pipe(key: &str) {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if first_of_pipeline(&mut seen, key, DROP_PIPE_KEYS) {
+        tracing::warn!(
+            pipeline = key,
+            "a draw or execution dropped for want of a host pipeline (first of this pipeline)"
+        );
+    }
+}
+
 /// Work dropped since the last present, by reason, for the `VICTORY_TRACE_TARGETS` frame line.
 pub(crate) fn trace_reason(why: &'static str) {
     if tracing_targets() {
@@ -1823,6 +1863,8 @@ fn dropped_dispatch(t: &MetalTitle, l: &mut MetalList, how: &str) {
         pass_note(t, l, &format!("dispatch {how}"), "a dispatch without a host compute pipeline", true, 1);
     }
     trace_record_dispatch(t, l, "dropped");
+    let pipe = format!("{:?} {how}", stage_hashes(l.pipeline));
+    warn_drop_pipe(&pipe);
     if tracing_targets() {
         let uavs: Vec<String> = t
             .host
@@ -1834,7 +1876,7 @@ fn dropped_dispatch(t: &MetalTitle, l: &mut MetalList, how: &str) {
                 format!("{r:#x} fmt {f} {w}x{h}")
             })
             .collect();
-        trace_drop_pipe(format!("{:?} {how} uavs {uavs:?}", stage_hashes(l.pipeline)));
+        trace_drop_pipe(format!("{pipe} uavs {uavs:?}"));
     }
 }
 
@@ -1911,6 +1953,7 @@ pub(crate) fn dispatch_threads(this: This, threads: [u32; 3]) {
         }
         _ => {
             dropped("a dispatch of thread counts without a host compute pipeline");
+            warn_drop_pipe(&format!("{:?} threads {threads:?}", stage_hashes(l.pipeline)));
             if pass_on() {
                 pass_note(t, l, &format!("dispatch-threads{threads:?}"), "a dispatch of thread counts without a host compute pipeline", true, 1);
             }
@@ -2127,8 +2170,10 @@ fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<b
     let Pipe::Render(pso, binding) = made else {
         dropped("a draw without a host render pipeline (refused or not translated)");
         trace_drop(l);
+        let pipe = format!("{:?} into {:?}", stage_hashes(l.pipeline), l.targets);
+        warn_drop_pipe(&pipe);
         if tracing_targets() {
-            trace_drop_pipe(format!("{:?} into {:?}", stage_hashes(l.pipeline), l.targets));
+            trace_drop_pipe(pipe);
         }
         return None;
     };

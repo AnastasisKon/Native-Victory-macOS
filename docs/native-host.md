@@ -1034,7 +1034,12 @@ an indexed rectangle list, a guessed mesh pipeline, mesh and indirect mesh
 dispatches, texture copies and resolves, and indirect executions (one warning
 per signature). A texture in a format the host cannot realize warns once per
 format value, with its size and flags. No switch is needed; `RUST_LOG` filters
-them as usual.
+them as usual. A draw or dispatch dropped for want of a host pipeline also names
+that pipeline - its stages' shader hashes and its render targets, `pipeline =`
+on the warning - once for each, up to 64, so a run's log says which pipeline a
+drop was even when its refusal was logged earlier or happened without one (#531;
+before, that only happened under `VICTORY_TRACE_TARGETS`). Test:
+`glue::a_dropped_pipeline_is_named_once`.
 
 Two more kinds are dropped one command at a time when a piece is submitted
 (`NativeHost::execute`), where the whole piece used to be refused: a draw or

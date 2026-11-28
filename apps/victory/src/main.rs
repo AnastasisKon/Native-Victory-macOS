@@ -3,7 +3,15 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../build_git.rs"]
+mod build_git;
 mod census;
+// `VICTORY_CRASH_SAVE` saves title memory from the fatal-signal handler, which only the
+// native host (x86_64 macOS) runs: elsewhere the module would be dead code.
+#[cfg(all(unix, feature = "diagnostics", target_os = "macos", target_arch = "x86_64"))]
+mod crash_save;
 mod inspect;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod native_run;
@@ -181,7 +189,10 @@ fn stop_gpu_on_signals() {
         // SAFETY: as above.
         unsafe { pthread_sigmask(SIG_UNBLOCK, &set, std::ptr::null_mut()) };
         tracing::warn!(signal = sig, "stopping: waking and draining the GPU's queued work first");
-        let (in_flight, left) = victory_gpu::stop_gpu(std::time::Duration::from_secs(3));
+        // A command buffer still running on the GPU gets up to 20 s in all: run-native.sh's
+        // `timeout` gives a run 30 s past its --seconds stop.
+        let (in_flight, left) =
+            victory_gpu::stop_gpu(std::time::Duration::from_secs(3), std::time::Duration::from_secs(20));
         tracing::warn!(in_flight, left, "stopped the GPU's work; exiting");
         std::process::exit(128 + sig);
     });
@@ -189,6 +200,106 @@ fn stop_gpu_on_signals() {
         // No thread to take them: leave the signals their default action.
         // SAFETY: as above; no other thread has started yet.
         unsafe { pthread_sigmask(SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+    }
+}
+
+/// A fatal signal (SIGSEGV, SIGBUS, SIGILL, SIGFPE) is logged to stderr before the process dies
+/// by it: nothing else says anything when native code faults, so a run that ends in a segfault
+/// leaves the log without a line naming the fault (#392: a 122 s run died at `Segmentation fault:
+/// 11` with no crash line, after GPU errors). The handler writes one line, with the signal, its
+/// code and the faulting address, through async-signal-safe calls only — no allocation, no
+/// tracing — then re-raises: `SA_RESETHAND` restored the default action, so the process dies by
+/// the signal as before, with the same exit code and the same crash report.
+#[cfg(unix)]
+fn log_fatal_signals() {
+    unsafe extern "C" fn fatal(sig: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+        /// `n` hex digits of `v` at `at`, async-signal-safe.
+        fn hex(line: &mut [u8], at: usize, v: usize, n: usize) {
+            for k in 0..n {
+                line[at + k] = b"0123456789abcdef"[(v >> (4 * (n - 1 - k))) & 15];
+            }
+        }
+        /// Two decimal digits of `v` at `at`, async-signal-safe.
+        fn dec(line: &mut [u8], at: usize, v: usize) {
+            line[at] = b'0' + (v / 10 % 10) as u8;
+            line[at + 1] = b'0' + (v % 10) as u8;
+        }
+        const LINE: &[u8; 65] =
+            b"victory: fatal signal 00 (code 00) at address 0x0000000000000000\n";
+        let sig_at = LINE.windows(7).position(|w| w == b"signal ").unwrap() + 7;
+        let code_at = LINE.windows(6).position(|w| w == b"(code ").unwrap() + 6;
+        let addr_at = LINE.windows(2).position(|w| w == b"0x").unwrap() + 2;
+        // SAFETY: the kernel passed a valid siginfo for this fault.
+        let (addr, code) = unsafe { ((*info).si_addr() as usize, (*info).si_code as usize) };
+        let mut line = *LINE;
+        dec(&mut line, sig_at, sig.unsigned_abs() as usize);
+        hex(&mut line, code_at, code, 2);
+        hex(&mut line, addr_at, addr, 16);
+        // SAFETY: a fixed line on the stack; write is async-signal-safe.
+        unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+        // The ranges `VICTORY_CRASH_SAVE` names, before the default action kills the
+        // process: async-signal-safe, as the line was.
+        #[cfg(all(feature = "diagnostics", target_os = "macos", target_arch = "x86_64"))]
+        // SAFETY: the ranges are title memory, named at startup.
+        unsafe { crate::crash_save::write_all() };
+        // SAFETY: SA_RESETHAND made SIG_DFL the disposition again; raise terminates.
+        unsafe { libc::raise(sig) };
+    }
+    // SAFETY: sa_mask left empty (an empty set); a zeroed struct on every unix libc models.
+    let act = libc::sigaction {
+        sa_sigaction: fatal as *const () as libc::sighandler_t,
+        sa_flags: libc::SA_SIGINFO | libc::SA_RESETHAND,
+        ..unsafe { std::mem::zeroed() }
+    };
+    for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
+        // SAFETY: act outlives the calls; the old actions are not wanted.
+        unsafe { libc::sigaction(sig, &act, std::ptr::null_mut()) };
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fatal_signal_tests {
+    use super::log_fatal_signals;
+    use std::os::fd::FromRawFd;
+
+    /// A child that installs the logger and faults: the line naming the fault comes out on
+    /// stderr, and the child still dies by the signal, with the same status a run without the
+    /// logger leaves (#392).
+    #[test]
+    fn a_fatal_signal_is_logged_before_the_process_dies_by_it() {
+        let mut pipe = [0; 2];
+        // SAFETY: a two-word buffer for two fds.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        // SAFETY: the test's own process; the child takes the calls below.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            // SAFETY: the child only takes async-signal-safe calls until it faults.
+            unsafe {
+                libc::close(pipe[0]);
+                libc::dup2(pipe[1], 2);
+            }
+            log_fatal_signals();
+            // SAFETY: the handler logs this fault and re-raises it.
+            unsafe { libc::raise(libc::SIGSEGV) };
+            // SAFETY: unreachable; the fault kills the child.
+            unsafe { libc::_exit(0) };
+        }
+        // SAFETY: the write end is the child's now.
+        unsafe { libc::close(pipe[1]) };
+        // SAFETY: the read end is ours alone; the File closes it.
+        let read = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let mut line = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::BufReader::new(read), &mut line).unwrap();
+        let mut status = 0;
+        // SAFETY: a one-word status for this child.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSEGV);
+        assert!(
+            line.starts_with(b"victory: fatal signal 11 (code "),
+            "{:?}",
+            String::from_utf8_lossy(&line)
+        );
     }
 }
 
@@ -201,6 +312,8 @@ fn main() -> Result<()> {
     victory_core::logging::init("info");
     #[cfg(target_os = "macos")]
     stop_gpu_on_signals();
+    #[cfg(unix)]
+    log_fatal_signals();
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
@@ -348,4 +461,110 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod build_git_tests {
+    use super::build_git;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn unique_temp(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "victory-build-git-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn linked_worktree_watches_common_branch_ref_and_packed_refs() {
+        let root = unique_temp("worktree");
+        let common = root.join("main-repo/.git");
+        let worktree_git = common.join("worktrees/feature");
+        let worktree_checkout = root.join("wt/apps/victory");
+        fs::create_dir_all(common.join("refs/heads/feat")).unwrap();
+        fs::create_dir_all(&worktree_git).unwrap();
+        fs::create_dir_all(&worktree_checkout).unwrap();
+
+        fs::write(
+            root.join("wt/.git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+        fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+        fs::write(worktree_git.join("HEAD"), "ref: refs/heads/feat/hud\n").unwrap();
+        fs::write(
+            common.join("refs/heads/feat/hud"),
+            "e20c939000000000000000000000000000000000\n",
+        )
+        .unwrap();
+        fs::write(
+            common.join("packed-refs"),
+            "# pack-refs with: peeled fully-peeled sorted\n1111111000000000000000000000000000000000 refs/heads/main\n",
+        )
+        .unwrap();
+
+        let watched = build_git::watch_paths(&worktree_checkout);
+        assert!(watched.iter().all(|p| p.exists()));
+        assert!(watched.iter().any(|p| p.ends_with("HEAD")));
+        assert!(watched.iter().any(|p| p.ends_with("refs/heads/feat/hud")));
+        assert!(watched.iter().any(|p| p.ends_with("packed-refs")));
+        assert_eq!(
+            build_git::commit_from_files(&worktree_checkout).as_deref(),
+            Some("e20c939")
+        );
+
+        // Advancing the branch ref without touching the worktree's HEAD updates
+        // a watched file and resolves the new short commit (#533).
+        fs::write(
+            common.join("refs/heads/feat/hud"),
+            "41d6563000000000000000000000000000000000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            build_git::commit_from_files(&worktree_checkout).as_deref(),
+            Some("41d6563")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn packed_branch_watches_existing_ancestor_dir_and_resolves_packed_ref() {
+        let root = unique_temp("packed");
+        let git = root.join(".git");
+        let sub = root.join("apps/victory");
+        fs::create_dir_all(git.join("refs/heads")).unwrap();
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            git.join("packed-refs"),
+            "abcdef0123456789abcdef0123456789abcdef01 refs/heads/main\n",
+        )
+        .unwrap();
+
+        let watched = build_git::watch_paths(&sub);
+        assert!(watched.iter().all(|p| p.exists()));
+        assert!(watched.contains(&git.join("HEAD")));
+        assert!(watched.contains(&git.join("refs/heads")));
+        assert!(watched.contains(&git.join("packed-refs")));
+        assert_eq!(
+            build_git::commit_from_files(&sub).as_deref(),
+            Some("abcdef0")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn binary_carries_current_git_commit_env() {
+        let commit = env!("VICTORY_GIT_COMMIT");
+        assert!(!commit.is_empty());
+    }
 }

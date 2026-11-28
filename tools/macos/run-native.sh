@@ -22,7 +22,12 @@ while [[ $# -gt 0 ]]; do
       [[ -n "${2:-}" && "$2" != -* ]] || { echo "--console requires a model" >&2; exit 2; }
       console="$2"; shift 2 ;;
     --console=) echo "--console requires a model" >&2; exit 2 ;;
-    --console=*) console="${1#--console=}"; shift ;;
+    --console=*)
+      # The same rule as the space form: a value starting with `-` is the next switch, not a
+      # model, so a forgotten model is refused here rather than by the game's own parser later.
+      console="${1#--console=}"
+      [[ "$console" != -* ]] || { echo "--console requires a model" >&2; exit 2; }
+      shift ;;
     -h|--help) sed -n 2,9p "$0"; exit 0 ;;
     *) break ;;
   esac
@@ -50,7 +55,15 @@ cd "$(dirname "$0")/../.."
 source tools/macos/native-binary.sh
 [[ -n "$console" ]] || console=$(default_console "$ram_gb")
 bin=$(native_binary) || exit 2
-[[ -x "$bin" ]] || { echo "victory is not executable at $bin: run tools/macos/native-setup.sh first"; exit 2; }
+[[ -x "$bin" ]] || {
+  if [[ -n "${VICTORY_BINARY:-}" ]]; then
+    echo "VICTORY_BINARY points at $bin, which is not executable"
+  else
+    echo "victory is not executable at $bin: run tools/macos/native-setup.sh first"
+  fi
+  exit 2
+}
+app_bin=$(stage_native_bundle "$bin") || { echo "Failed to stage Game Mode bundle for $bin" >&2; exit 1; }
 
 mkdir -p runs || exit 1
 run_dir=$(mktemp -d "runs/$(date +%Y%m%d-%H%M%S)-XXXXXX") || exit 1
@@ -66,7 +79,7 @@ export VICTORY_KEYS="${VICTORY_KEYS:-$(seq 4 2 80 | sed 's/$/:Enter/' | paste -s
 echo "Running $exe (console=$console)"
 echo "Log: $log"
 
-"$bin" run --execute --console "$console" ${headless[@]+"${headless[@]}"} --unimplemented zero "$exe" >> "$log" 2>&1 &
+"$app_bin" run --execute --console "$console" ${headless[@]+"${headless[@]}"} --unimplemented zero "$exe" >> "$log" 2>&1 &
 pid=$!
 timer=""
 if (( decimal_seconds > 0 )); then

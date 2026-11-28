@@ -242,6 +242,17 @@ pub fn run(
         image.base(),
         image.info().image_base
     );
+    // The output size, render scale and upscaler the switches ask for, patched into the title's
+    // code before it runs: the image is writable until `bind` finalizes it, and nothing has run.
+    if execute {
+        // SAFETY: before bind/finalize, TLS callbacks, DllMain and the title entry point.
+        unsafe {
+            victory_loader::resolution::apply_asked(
+                image.base(),
+                image.info().size_of_image as usize,
+            );
+        }
+    }
     if let Some(tls) = image.tls() {
         teb::register_tls(tls);
     }
@@ -304,6 +315,14 @@ pub fn run(
     // The manifest names the title and its storage quota; the console's
     // fixed drives are the package as `G:` and temporary files `T:`.
     let cfg = victory_core::Config::load()?;
+    // `VICTORY_CRASH_SAVE` names title ranges the fatal-signal handler writes on a crash; read
+    // and resolved here, since the handler may allocate nothing (see `crash_save`).
+    #[cfg(feature = "diagnostics")]
+    crate::crash_save::configure(
+        image.base(),
+        image.info().size_of_image as usize,
+        &cfg.cache_dir,
+    );
     victory_gpu::shader_cache::use_native_cache(cfg.cache_subdir("native-shaders")?);
     let manifest = match dll::find_file(title_dir, "MicrosoftGame.config") {
         Some(path) => std::fs::read_to_string(path).unwrap_or_default(),

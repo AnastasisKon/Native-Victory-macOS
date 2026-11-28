@@ -949,6 +949,49 @@ mod watch_tests {
         unsafe { mem::release(p as *mut u8, 2 * page) }.unwrap();
     }
 
+    /// A fault the handler takes while an update is in flight is still the watch's: the table
+    /// `CURRENT` named can be the one the writer is writing by the time it is read, and a fault
+    /// called someone else's leaves its page read-only — which the store's second fault dies on.
+    /// Nothing here faults (no handler would save the process), so the rule is asked directly
+    /// while another thread swaps the sets as fast as it can.
+    #[test]
+    fn a_fault_during_an_update_is_the_watchs() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        super::install();
+        let page = mem::page_size();
+        // SAFETY: fresh memory of this test's.
+        let p = unsafe { mem::alloc(None, 2 * page, Protect::READ_WRITE) }.unwrap() as usize;
+        watch::set_image(0, usize::MAX);
+        let sets = [
+            [(p, p + 64), (p + page, p + page + 64)],
+            [(p + 128, p + 192), (p + page + 128, p + page + 192)],
+        ];
+        watch::watch(&sets[0]);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut i = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    watch::watch(&sets[i % 2]);
+                    i += 1;
+                }
+            });
+            for _ in 0..20_000 {
+                for at in [p + 8, p + 136, p + page + 8, p + page + 136] {
+                    assert!(
+                        watch::on_write_fault(at, 0x1000),
+                        "a store at {at:#x} during an update is the watch's"
+                    );
+                }
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        watch::watch(&[]);
+        assert!(!watch::active());
+        // SAFETY: the allocation above.
+        unsafe { mem::release(p as *mut u8, 2 * page) }.unwrap();
+    }
+
     /// Stores into pages two alternating range sets share, while another thread swaps the sets
     /// as fast as it can: every fault must be the watch's. One that is not goes down the
     /// exception chain, which ends this test process (an update used to empty the published

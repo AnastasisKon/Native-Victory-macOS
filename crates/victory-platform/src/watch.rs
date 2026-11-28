@@ -226,14 +226,28 @@ pub fn on_write_fault(addr: usize, rip: usize) -> bool {
         IMAGE[0].load(Ordering::Relaxed),
         IMAGE[1].load(Ordering::Acquire),
     );
-    // The table in use and the one before it (skipped if it is being written: the pages read-only
-    // then are all in the one in use).
-    let current = CURRENT.load(Ordering::Acquire);
-    let (mut a, mut b) = ([(0, 0); RANGES], [(0, 0); RANGES]);
-    let na = TABLES[current].read(&mut a).unwrap_or(0);
-    let nb = TABLES[1 - current].read(&mut b).unwrap_or(0);
+    // The table in use and the one before it: the pages read-only now are all in the one in use,
+    // and the one before it covers a fault that `CURRENT` named before this update flipped it.
+    //
+    // `CURRENT` and the tables are read one after the other, and the writer can move between
+    // them: the table the index named can be the one it is writing by the time it is read (a
+    // store into the page the update protects then looks like someone else's, the page stays
+    // read-only, and the second fault kills the process). Look again -- a write is a handful of
+    // stores, so the next look finds it whole -- rather than read a table that is not there.
+    let mut a = [(0, 0); RANGES];
+    let mut b = [(0, 0); RANGES];
+    let mut read = None;
+    for _ in 0..128 {
+        let current = CURRENT.load(Ordering::Acquire);
+        if let Some(na) = TABLES[current].read(&mut a) {
+            read = Some((na, TABLES[1 - current].read(&mut b).unwrap_or(0)));
+            break;
+        }
+    }
+    // Nothing read at all: the update in flight is writing the very table `CURRENT` names.
+    let ((na, nb), unread) = read.map_or(((0, 0), true), |(na, nb)| ((na, nb), false));
     let ranges = a[..na].iter().chain(&b[..nb]).copied();
-    let at = match classify(addr, rip, ranges, image, page) {
+    let at = match fault(addr, rip, ranges, image, page, unread) {
         Fault::NotOurs => return false,
         Fault::Open { page } => page,
         Fault::Count { page, site } => {
@@ -243,6 +257,27 @@ pub fn on_write_fault(addr: usize, rip: usize) -> bool {
     };
     // SAFETY: a page of a range the caller of `watch` owns; it only becomes writable again.
     unsafe { set(at, page, READ_WRITE) }
+}
+
+/// [`classify`], and the case where the table in use could not be read at all: a page that is
+/// read-only then was made so by a `watch`, and the update that did it is still writing that
+/// table, so the page is the watch's whether or not the ranges that could be read name it. It is
+/// opened and nothing is counted. (Reading a not-ours there leaves the page read-only, and the
+/// store that faults on it again ends the process.)
+fn fault(
+    addr: usize,
+    rip: usize,
+    ranges: impl IntoIterator<Item = (usize, usize)>,
+    (image, image_end): (usize, usize),
+    page: usize,
+    unread: bool,
+) -> Fault {
+    match classify(addr, rip, ranges, (image, image_end), page) {
+        Fault::NotOurs if unread => Fault::Open {
+            page: addr & !(page - 1),
+        },
+        other => other,
+    }
 }
 
 /// Watches `ranges` (each `[start, end)`, read-write memory of the caller's) until the next call:
@@ -352,6 +387,36 @@ mod tests {
             Fault::NotOurs
         );
         assert_eq!(classify(0x10_0180, title, [], image, page), Fault::NotOurs);
+    }
+
+    /// A fault the handler takes while the table in use cannot be read at all is the watch's:
+    /// the page was made read-only by an update that is between its two tables, so it is opened
+    /// and nothing counted. Against the ranges that could be read alone it is someone else's —
+    /// which leaves the page read-only, and the store that faults on it again kills the process.
+    #[test]
+    fn a_fault_whose_table_is_being_written_is_the_watchs() {
+        let page = 0x1000;
+        let image = (0x1_4000_0000, 0x1_5000_0000);
+        let title = 0x1_4000_0010;
+        let (old, new) = ([(0x10_0000, 0x10_0040)], [(0x30_0000, 0x30_0040)]);
+        // Readable, and naming the page: counted as before.
+        assert_eq!(
+            fault(0x30_0010, title, new.iter().copied(), image, page, false),
+            Fault::Count {
+                page: 0x30_0000,
+                site: 0x10
+            }
+        );
+        // The page of the update in flight, which neither readable table names.
+        let readable = new.iter().chain(&old).copied();
+        assert_eq!(
+            fault(0x50_0010, title, readable.clone(), image, page, false),
+            Fault::NotOurs
+        );
+        assert_eq!(
+            fault(0x50_0010, title, readable, image, page, true),
+            Fault::Open { page: 0x50_0000 }
+        );
     }
 
     /// An update moves the watch from page 0x10_0000 to 0x30_0000. Until the old page is opened,

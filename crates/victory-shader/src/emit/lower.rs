@@ -9441,6 +9441,33 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
                 int(self, r)
             }
+            "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32" => {
+                // Two 32-bit integers saturated to 16 bits, src0 in the low half and src1 in the
+                // high one (RDNA2 ISA, VOP3 opcodes 0x36a and 0x36b; Mesa's ACO selects
+                // `pack_uint_2x16` and `pack_sint_2x16`, which NIR defines as clamping, to them).
+                let signed = name == "v_cvt_pk_i16_i32";
+                let mut halves = [self.s.m.i32(0); 2];
+                for (k, half) in halves.iter_mut().enumerate() {
+                    let a = s(self, k)?;
+                    let x = if signed {
+                        let (lo, hi) = (self.s.m.i32(-32768i32 as u32), self.s.m.i32(32767));
+                        let below = self.s.m.cmp(c, pred::SLT, a, lo);
+                        let a = self.s.m.select(c, below, lo, a);
+                        let above = self.s.m.cmp(c, pred::SGT, a, hi);
+                        self.s.m.select(c, above, hi, a)
+                    } else {
+                        let max = self.s.m.i32(0xFFFF);
+                        let above = self.s.m.cmp(c, pred::IUGT, a, max);
+                        self.s.m.select(c, above, max, a)
+                    };
+                    let low = self.s.m.i32(0xFFFF);
+                    *half = self.s.m.bin(c, Bin::And, x, low);
+                }
+                let k16 = self.s.m.i32(16);
+                let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
+                let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
+                int(self, r)
+            }
             "v_cvt_pknorm_u16_f32" | "v_cvt_pknorm_i16_f32" => {
                 // Two floats as 16-bit normalized integers, src0 in the low
                 // half and src1 in the high one: round(clamp(x, lo, 1) * max)

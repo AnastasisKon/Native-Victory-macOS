@@ -775,6 +775,18 @@ writes (a program with one is not changed). Of 30 dumped story-load shaders refu
 9 translate with this and the barriers behind uniform branches (27 November). 16-bit wave reductions across the halves are refused. Fixing the
 divergent case needs if-conversion of the region so both halves always arrive (not done).
 
+What that if-conversion has to cover, pinned by synthetic programs in `emit/wave32_tests.rs` (#527): a
+vote read as a number and used as a branch, at a block not every thread of the group runs once. With
+`s_bcnt1_i32_b64 sN, vcc` behind an `s_cbranch_execz` region, the group of one console wave translates
+(four barriers, one exchange at the lane read) and the group of two waves is refused
+(`DIVERGENT_EXCHANGE`): the vote needs the console's 64-lane mask, and only the exchange can give it.
+`s_and vcc, exec, mask` then `s_cbranch_vccz` is the other half of the problem and worse: it translates,
+at every group size, with no exchange and no barrier, because each half branches on its own 32 bits of
+`vcc`. That is not the console's answer where the halves disagree — the console takes the branch for the
+wave as a whole, so a lane that holds EXEC but no mask bit still runs the body, while here its half skips
+it — so the second shape is a wrong answer rather than a refusal, and a fix has to replace it too, not
+just translate it.
+
 Verified: unit tests with synthetic programs (`emit/wave32_tests.rs`); the lowered containers pass
 `metal-shaderconverter` (no IRError 6). Not measured: the 528 corpus shaders (the cache holds translated DXIL,
 not console shaders; re-translate with the option to count). Not run on the GPU: the compute backend has no

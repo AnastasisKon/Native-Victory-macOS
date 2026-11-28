@@ -577,3 +577,66 @@ fn permlane16_and_permlanex16_lower_within_host32_half() {
     // Both stay within the 32-lane half, so no cross-half LDS exchange barriers are needed.
     assert_eq!(l.barriers, 0);
 }
+
+/// #527's first shape as the title's lighting computes have it: a vote read as a number
+/// (`s_bcnt1_i32_b64 sN, vcc`) behind a real branch, so the block is not one every thread of the
+/// group runs once. `s_cbranch_execz 5` would skip the body when no lane is on; `s_cbranch_scc0 3`
+/// branches on the vote's count.
+const VOTE_COUNT_IN_BRANCH: &[u32] = &[
+    0x7D88_008A, // v_cmp_gt_u32_e32 vcc, 10, v0
+    0xBF88_0006, // s_cbranch_execz 6
+    0x7D82_0085, // v_cmp_lt_u32_e32 vcc, 5, v0
+    0xBE86_106A, // s_bcnt1_i32_b64 s6, vcc      (the vote as a number)
+    0xBF84_0003, // s_cbranch_scc0 3            (used as a branch)
+    0xD760_0006,
+    0x0201_5101, // v_readlane_b32 s6, v1, 40    (a lane of the upper half: the exchange)
+    0x7E0A_0206, // v_mov_b32_e32 v5, s6
+    S_ENDPGM,
+];
+
+/// The acceptance test #527 asks for: both halves of a console wave in a group of two waves, the
+/// vote used as a branch at a block not every thread runs once. Refused today; a lowering that
+/// translates it must keep the two halves of a wave agreeing at the exchange's barrier while each
+/// console wave follows its own branch.
+#[test]
+fn a_vote_used_as_a_branch_behind_a_branch_is_refused_in_a_two_wave_group() {
+    // One console wave (64 lanes in the group): the halves are the whole group, the exchange is
+    // legal there, and it translates (write, barrier, read, barrier).
+    let l = host32(VOTE_COUNT_IN_BRANCH, 64);
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.exchanges);
+    assert_eq!(l.barriers, 4);
+    // Two console waves: the vote needs the console's 64-lane mask, and being behind a branch the
+    // block is not one every thread reaches once.
+    let r = lowered(VOTE_COUNT_IN_BRANCH, 128, false, true);
+    assert!(
+        matches!(r, Err(crate::ShaderError::Unsupported { what, .. }) if what == lower::DIVERGENT_EXCHANGE),
+        "expected {} for a vote used as a branch in a two-wave group",
+        lower::DIVERGENT_EXCHANGE
+    );
+}
+
+/// #527's second shape, `s_and vcc, exec, mask` then `s_cbranch_vccz`, reads each half's own vcc
+/// and translates with no exchange at any group size. Where the halves' vcc differ that is not the
+/// console's answer: the console takes the branch for the wave as a whole, so its lanes that hold
+/// EXEC but no mask bit still run the body, while here their half skips it. This pins the shape a
+/// lowering for #527 has to replace; it is not a correct answer to build on.
+#[test]
+fn a_vccz_branch_on_exec_and_a_mask_reads_the_half_not_the_wave() {
+    const AND_IN_BRANCH: &[u32] = &[
+        0x7D88_008A, // v_cmp_gt_u32_e32 vcc, 10, v0
+        0xBF88_0005, // s_cbranch_execz 5
+        0x87EA_047E, // s_and_b64 vcc, exec, s[4:5]   (vcc = exec & mask)
+        0xBF86_0003, // s_cbranch_vccz 3
+        0xD760_0006,
+        0x0201_5101, // v_readlane_b32 s6, v1, 40
+        0x7E0A_0206, // v_mov_b32_e32 v5, s6
+        S_ENDPGM,
+    ];
+    for lanes in [64u32, 128] {
+        let l = host32(AND_IN_BRANCH, lanes);
+        assert_eq!(l.wave_size, Some(32));
+        assert!(!l.exchanges, "each half reads its own vcc (lanes={lanes})");
+        assert_eq!(l.barriers, 0, "no exchange means no barrier (lanes={lanes})");
+    }
+}

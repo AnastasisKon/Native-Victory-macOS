@@ -340,6 +340,46 @@ pub unsafe fn write_together(base: usize, size: usize, parts: &[(&Site, &[u8])])
     Patched::Done
 }
 
+/// `VICTORY_BREAK_AT=<rva>,...`: puts an `int3` at each of those image offsets before the title
+/// runs, so a run stops there. The dispatch that reports the fault names the registers and what
+/// `VICTORY_PEEK` asked for, and the run ends — a debugger's breakpoint, for a place a reader
+/// picked out of the image. Nothing is restored afterwards: the byte stays `int3`, so the run it
+/// stops is the last step of that run.
+///
+/// # Safety
+/// The image of `size` bytes at `base` stays mapped and is writable, and no thread runs its code:
+/// before `NativeImage::finalize`, as the sites are.
+#[cfg(any(windows, target_os = "macos"))]
+pub unsafe fn apply_break_at(base: usize, size: usize) {
+    let table = parse_rvas(&std::env::var("VICTORY_BREAK_AT").unwrap_or_default());
+    if table.is_empty() {
+        return;
+    }
+    for offset in table {
+        if offset >= size {
+            tracing::warn!(
+                rva = format_args!("{offset:#x}"),
+                "break at: outside the image, left alone"
+            );
+            continue;
+        }
+        // SAFETY: inside the mapped, writable image, with no thread running it yet.
+        unsafe { ((base + offset) as *mut u8).write_volatile(0xcc) };
+        tracing::info!(
+            rva = format_args!("{offset:#x}"),
+            "break at: an int3 written"
+        );
+    }
+}
+
+/// The image offsets in a comma-separated hex list (`0x` optional), the spelling the other
+/// switches take; an entry that is no hex is left out.
+pub fn parse_rvas(spec: &str) -> Vec<usize> {
+    spec.split(',')
+        .filter_map(|entry| usize::from_str_radix(entry.trim().trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
 /// Sites written together, each with its replacement.
 #[cfg(any(windows, target_os = "macos"))]
 type Group = Vec<(&'static Site, Vec<u8>)>;
@@ -400,6 +440,24 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn break_at_entries_are_hex_offsets_and_an_int3_goes_where_they_name() {
+        assert_eq!(parse_rvas("133129f, 0x1330a44 ,nonsense"), vec![0x133129f, 0x1330a44]);
+        assert!(parse_rvas("").is_empty());
+        let mut image = [0x90u8; 8];
+        let base = image.as_mut_ptr() as usize;
+        // SAFETY: a writable byte array, with no code executing.
+        unsafe {
+            std::env::set_var("VICTORY_BREAK_AT", "2,0xffff");
+            apply_break_at(base, image.len());
+            std::env::remove_var("VICTORY_BREAK_AT");
+        }
+        assert_eq!(image[2], 0xcc);
+        // The entry past the image is left alone rather than written past its end.
+        assert_eq!(&image[3..], &[0x90; 5]);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

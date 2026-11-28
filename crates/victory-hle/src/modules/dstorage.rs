@@ -44,8 +44,14 @@ const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 /// A request whose run panicked (a bug of ours; logged). No other failure uses it.
 const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
-/// `HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)`: the source ends early.
-const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
+/// `E_DSTORAGE_END_OF_FILE` (`dstorageerr.h`: "the specified offset and length exceeds the size of
+/// the file"), which is what a title matches to skip or wait for a chunk that is not there; the
+/// status entry of the failed request carries it too. Not `HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)`,
+/// which a title's own I/O path would take as a plain read fault.
+const END_OF_FILE: HRESULT = 0x8924_0007_u32 as i32;
+/// `E_DSTORAGE_INVALID_DESTINATION_SIZE` (`dstorageerr.h`): with no decompression the destination
+/// must equal the request's length, and with decompression it must be larger.
+const INVALID_DESTINATION_SIZE: HRESULT = 0x8924_000f_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_DATA)`: a bad compressed stream.
 const INVALID_DATA: HRESULT = 0x8007_000D_u32 as i32;
 
@@ -1152,8 +1158,13 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
     if options & (ZLIB | BCPACK) == 0 {
-        if request.source_size > request.destination_size {
-            return Err(fail(E_INVALIDARG, "source larger than destination"));
+        // No decompression: the destination must be exactly the request's length (`dstorageerr.h`),
+        // not merely large enough -- a larger one would leave the tail of the title's buffer stale.
+        if request.source_size != request.destination_size {
+            return Err(fail(
+                INVALID_DESTINATION_SIZE,
+                "destination is not the request's length",
+            ));
         }
         let size = request.source_size as usize;
         let mut read = None;
@@ -1472,6 +1483,10 @@ mod tests {
         assert_eq!(calls, [3, 3, 5, 7]);
         let short = fill_at(&mut [0; 4], 0, |_, _| Ok(0)).unwrap_err();
         assert_eq!(read_hresult(&short), END_OF_FILE);
+        // The vendor's own numbers (`dstorageerr.h`), which a title matches on:
+        // `E_DSTORAGE_END_OF_FILE` and `E_DSTORAGE_INVALID_DESTINATION_SIZE`.
+        assert_eq!(END_OF_FILE, 0x8924_0007_u32 as i32);
+        assert_eq!(INVALID_DESTINATION_SIZE, 0x8924_000f_u32 as i32);
     }
 
     /// Host errors reach the title as the Win32 errors Windows would give (`_dosmaperr`).

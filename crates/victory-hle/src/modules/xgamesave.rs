@@ -60,10 +60,23 @@ pub const QUOTA_EXCEEDED: HRESULT = 0x8083_0006_u32 as i32;
 pub const BUFFER_TOO_SMALL: HRESULT = 0x8083_0007_u32 as i32;
 pub const BLOB_NOT_FOUND: HRESULT = 0x8083_0008_u32 as i32;
 
-/// Per user and title, as documented.
+/// The quota of one provider, as the GDK documents it (`XGameSave.h`: "Each
+/// provider can contain multiple containers and has a default quota of
+/// 256MB"); a provider is per user and configuration id.
 const QUOTA: u64 = 256 << 20;
-/// What one update may write in all, as documented.
-const MAX_UPDATE: usize = 16 << 20;
+/// The largest blob the GDK allows (`GS_MAX_BLOB_SIZE`). There is no
+/// per-update cap: an update writes as many blobs as it likes, each within
+/// this, up to the provider's quota.
+const MAX_BLOB: usize = 16 << 20;
+/// Characters in a container's name: `GS_MAX_CONTAINER_NAME_SIZE` is 256
+/// bytes *including* the NUL.
+const MAX_CONTAINER_NAME: usize = 255;
+/// Characters in a blob's name: `GS_MAX_BLOB_NAME_SIZE` is 65 bytes
+/// including the NUL.
+const MAX_BLOB_NAME: usize = 64;
+/// Characters in a container's display name: `GS_MAX_CONTAINER_DISPLAY_NAME_SIZE`
+/// is 128 bytes including the NUL.
+const MAX_DISPLAY_NAME: usize = 127;
 const MANIFEST: &str = "manifest";
 /// Readable part of a container's folder name, at most.
 const READABLE: usize = 100;
@@ -117,10 +130,11 @@ fn container_dir(root: &Path, name: &str) -> PathBuf {
 
 /// Documented: the path part (up to the last `/`) letters, digits, `_` and
 /// `/`; the file part letters, digits, `_`, `.` and `-`, not empty, not
-/// ending in `.`, no `..`; 256 characters at most.
+/// ending in `.`, no `..`; 255 characters at most (`GS_MAX_CONTAINER_NAME_SIZE`
+/// counts the NUL).
 fn valid_container(name: &str) -> bool {
     let (path, file) = name.rsplit_once('/').unwrap_or(("", name));
-    name.len() <= 256
+    name.len() <= MAX_CONTAINER_NAME
         && path
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'/')
@@ -468,6 +482,19 @@ fn io_error(dir: &Path, e: &std::io::Error) -> HRESULT {
 impl Update {
     /// Applies the update as one new version of the container.
     fn submit(&self) -> HRESULT {
+        // The same names and sizes `write_blob` refuses, refused again where they land: a change
+        // made on a path that did not check them is not a save the console would have written.
+        if self.display.as_deref().is_some_and(|d| d.len() > MAX_DISPLAY_NAME) {
+            return E_INVALIDARG;
+        }
+        for (name, data) in &self.changes {
+            if name.is_empty() || name.len() > MAX_BLOB_NAME {
+                return E_INVALIDARG;
+            }
+            if data.as_ref().is_some_and(|d| d.len() > MAX_BLOB) {
+                return UPDATE_TOO_BIG;
+            }
+        }
         let _saves = saves_lock();
         let current = match current(&self.dir) {
             Ok(v) => v,
@@ -493,6 +520,8 @@ impl Update {
             }
         }
         blobs.sort_by(|a, b| a.0.cmp(b.0));
+        // Each blob was checked against `MAX_BLOB` when it was written; what one
+        // update may write in all is the provider's quota, below.
         let written: usize = blobs
             .iter()
             .map(|(_, s)| match s {
@@ -500,9 +529,6 @@ impl Update {
                 Source::Kept(_) => 0,
             })
             .sum();
-        if written > MAX_UPDATE {
-            return UPDATE_TOO_BIG;
-        }
         let replaced: u64 = current.as_ref().map_or(0, |v| {
             let sizes = v.sizes();
             let changed = sizes
@@ -907,12 +933,17 @@ extern "system" fn create_update(
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
+    let display = text(display);
+    // `GS_MAX_CONTAINER_DISPLAY_NAME_SIZE` is 128 bytes counting the NUL.
+    if display.as_deref().is_some_and(|d| d.len() > MAX_DISPLAY_NAME) {
+        return E_INVALIDARG;
+    }
     put(
         out,
         give(Update {
             name: c.name.clone(),
             dir: c.dir.clone(),
-            display: text(display),
+            display,
             changes: Vec::new(),
         }),
     )
@@ -932,10 +963,10 @@ extern "system" fn write_blob(
     let (Some(update), Some(name)) = (unsafe { update.as_mut() }, text(name)) else {
         return E_INVALIDARG;
     };
-    if name.is_empty() || (data.is_null() && size > 0) {
+    if name.is_empty() || name.len() > MAX_BLOB_NAME || (data.is_null() && size > 0) {
         return E_INVALIDARG;
     }
-    if size > MAX_UPDATE {
+    if size > MAX_BLOB {
         return UPDATE_TOO_BIG;
     }
     let data = if size == 0 {
@@ -1078,6 +1109,42 @@ mod tests {
         ))
     }
 
+    /// What one update may write is the provider's quota, not a blob's size: the GDK caps a blob
+    /// at `GS_MAX_BLOB_SIZE` (16 MB) and the provider at 256 MB, and states no update-level cap, so
+    /// an atomic update of three 6 MB blobs (18 MB in all) is legal.
+    #[test]
+    fn an_update_may_write_more_than_one_blob_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let six = "x".repeat(6 << 20);
+        let blobs = [
+            ("one", Some(six.as_str())),
+            ("two", Some(six.as_str())),
+            ("three", Some(six.as_str())),
+        ];
+        assert_eq!(update(root, "big", &blobs), S_OK);
+        let (_, saved) = state(root).unwrap();
+        assert_eq!(saved.len(), 3);
+        assert!(saved.iter().all(|(_, d)| d.len() == 6 << 20));
+    }
+
+    /// The names the GDK bounds: a blob's at `GS_MAX_BLOB_NAME_SIZE` (65 bytes counting the NUL)
+    /// and a container's display name at `GS_MAX_CONTAINER_DISPLAY_NAME_SIZE` (128 bytes counting
+    /// it), so 64 and 127 characters.
+    #[test]
+    fn names_outside_the_gdk_limits_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let at_the_limit = "n".repeat(MAX_BLOB_NAME);
+        assert_eq!(update(root, &"d".repeat(MAX_DISPLAY_NAME), &[(&at_the_limit, Some("a"))]), S_OK);
+        let too_long = "n".repeat(MAX_BLOB_NAME + 1);
+        assert_eq!(update(root, "ok", &[(&too_long, Some("a"))]), E_INVALIDARG);
+        assert_eq!(update(root, &"d".repeat(MAX_DISPLAY_NAME + 1), &[("a", Some("a"))]), E_INVALIDARG);
+        // The blob the long name was refused on did not land, and the name at the limit did.
+        let (_, saved) = state(root).unwrap();
+        assert_eq!(saved.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), vec![at_the_limit.as_str()]);
+    }
+
     /// Run by the crash test in a child process; does nothing otherwise.
     #[test]
     fn crash_child() {
@@ -1202,7 +1269,14 @@ mod tests {
             assert_eq!(decode(&file).as_deref(), Some(name));
         }
         assert_eq!(decode("x.new"), None);
-        for good in ["Profile/Slot_1", "a/b/Save-2.sav", "x", &"a".repeat(256)] {
+        // `GS_MAX_CONTAINER_NAME_SIZE` is 256 bytes counting the NUL, so a name is 255
+        // characters at most.
+        for good in [
+            "Profile/Slot_1",
+            "a/b/Save-2.sav",
+            "x",
+            &"a".repeat(MAX_CONTAINER_NAME),
+        ] {
             assert!(valid_container(good), "{good}");
         }
         for bad in [
@@ -1213,7 +1287,7 @@ mod tests {
             "a..b",
             "a.b/c",
             "a-b/c",
-            &"a".repeat(257),
+            &"a".repeat(MAX_CONTAINER_NAME + 1),
         ] {
             assert!(!valid_container(bad), "{bad}");
         }
@@ -1224,7 +1298,7 @@ mod tests {
         let p = Provider {
             root: dir.path().into(),
         };
-        let long = "n".repeat(300);
+        let long = "n".repeat(MAX_BLOB_NAME);
         let blobs = [
             "A",
             "a",

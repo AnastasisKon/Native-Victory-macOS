@@ -410,6 +410,34 @@ fn step_over_assert(ctx: &mut Context, rec: &ExceptionRecord) -> bool {
             rva = format_args!("{rva:#x}"),
             "stepped over a title int3 (VICTORY_SKIP_TITLE_INT3)"
         );
+        // The first skip of an assert also names the callers that reached it: the title's assert
+        // sites carry no message string (an inlined `__debugbreak`-style `int3`, then a jump), so
+        // the chain is what identifies one. Once per RVA, since a skip can run a million times.
+        static CHAINED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        let first = {
+            let mut chained = CHAINED.lock().unwrap_or_else(|e| e.into_inner());
+            if chained.contains(&rva) {
+                false
+            } else {
+                chained.push(rva);
+                true
+            }
+        };
+        if first {
+            let chain: Vec<String> = backtrace(*ctx, stack_bounds())
+                .into_iter()
+                .map(|pc| match pc.checked_sub(base) {
+                    Some(rva) if rva < 0x1000_0000 => format!("{rva:#x}"),
+                    _ => format!("{pc:#x}"),
+                })
+                .collect();
+            tracing::warn!(
+                rva = format_args!("{rva:#x}"),
+                chain = %chain.join(" "),
+                "the first step over this assert: the chain that reached it, in the title image \
+                 as RVAs and anything else as an absolute address"
+            );
+        }
         ctx.rip += 1;
         true
     }

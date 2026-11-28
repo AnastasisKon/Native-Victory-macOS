@@ -1127,6 +1127,168 @@ pub extern "system" fn VerQueryValueW(
     1
 }
 
+// The modules a title's own crash handler walks: which images are mapped, how big
+// they are, and where their entry points are (psapi.dll).
+
+/// A mapped image's own headers: its `SizeOfImage` and its entry point's RVA.
+fn mapped_image_info(base: usize) -> Option<(usize, usize)> {
+    if base == 0 {
+        return None;
+    }
+    // SAFETY: the image's own headers are at its base, and every read below is inside
+    // them: the DOS header's `e_lfanew` names the NT headers, which are part of the
+    // mapping the loader made.
+    unsafe {
+        let dos = base as *const u8;
+        if dos.read_unaligned() != b'M' || dos.add(1).read_unaligned() != b'Z' {
+            return None;
+        }
+        let nt = dos.add(dos.add(0x3C).cast::<u32>().read_unaligned() as usize);
+        if nt.cast::<u32>().read_unaligned() != 0x0000_4550 {
+            return None;
+        }
+        // Optional header: signature (4) and file header (20) come first. PE32 and
+        // PE32+ put SizeOfImage at 56 and AddressOfEntryPoint at 16 either way.
+        let optional = nt.add(24);
+        if !matches!(optional.cast::<u16>().read_unaligned(), 0x10B | 0x20B) {
+            return None;
+        }
+        let size = optional.add(56).cast::<u32>().read_unaligned() as usize;
+        let entry = optional.add(16).cast::<u32>().read_unaligned() as usize;
+        Some((size, entry))
+    }
+}
+
+fn enum_modules(process: *mut c_void, modules: *mut *mut c_void, cb: u32, needed: *mut u32) -> i32 {
+    if !is_this_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if needed.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let images = crate::runtime::images();
+    let bytes = images.len() * std::mem::size_of::<*mut c_void>();
+    let room = if modules.is_null() { 0 } else { cb as usize };
+    let count = (room / std::mem::size_of::<*mut c_void>()).min(images.len());
+    for (i, (base, _)) in images.iter().take(count).enumerate() {
+        // SAFETY: the title's array, with room for `count` handles.
+        unsafe { modules.add(i).write(*base as *mut c_void) };
+    }
+    // SAFETY: the title's out word: the bytes the whole list takes, whether it fit or
+    // not, which is how a caller sizes its second call.
+    unsafe { needed.write(bytes as u32) };
+    1
+}
+
+/// `EnumProcessModules`: the bases of the images this host has mapped, which is what a
+/// crash handler walks to turn an address into a module and an offset.
+pub extern "system" fn EnumProcessModules(
+    process: *mut c_void,
+    modules: *mut *mut c_void,
+    cb: u32,
+    needed: *mut u32,
+) -> i32 {
+    enum_modules(process, modules, cb, needed)
+}
+
+/// `EnumProcessModulesEx`: the same list; the filter (`LIST_MODULES_*`) has one
+/// process's images either way here.
+pub extern "system" fn EnumProcessModulesEx(
+    process: *mut c_void,
+    modules: *mut *mut c_void,
+    cb: u32,
+    needed: *mut u32,
+    _filter: u32,
+) -> i32 {
+    enum_modules(process, modules, cb, needed)
+}
+
+/// `GetModuleInformation`: `MODULEINFO` - base, `SizeOfImage`, entry point - read from
+/// the image's own headers, which are in the mapping.
+pub extern "system" fn GetModuleInformation(
+    process: *mut c_void,
+    module: *mut c_void,
+    info: *mut u8,
+    cb: u32,
+) -> i32 {
+    const MODULEINFO: usize = 3 * std::mem::size_of::<usize>();
+    if !is_this_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if info.is_null() || cb as usize != MODULEINFO {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let base = module as usize;
+    let Some((size, entry)) = mapped_image_info(base) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    // SAFETY: the title's MODULEINFO, whose size it just confirmed.
+    unsafe {
+        info.cast::<usize>().write_unaligned(base);
+        info.add(8).cast::<usize>().write_unaligned(size);
+        info.add(16).cast::<usize>().write_unaligned(base + entry);
+    }
+    1
+}
+
+/// `GetModuleFileNameExW`: a module's path, which is `GetModuleFileName` here.
+pub extern "system" fn GetModuleFileNameExW(
+    process: *mut c_void,
+    module: *mut c_void,
+    out: *mut u16,
+    size: u32,
+) -> u32 {
+    if !is_this_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    crate::modules::kernel::GetModuleFileNameW(module, out, size)
+}
+
+/// `GetModuleBaseNameW`: the file name of a module's path, without the folders.
+pub extern "system" fn GetModuleBaseNameW(
+    process: *mut c_void,
+    module: *mut c_void,
+    out: *mut u16,
+    size: u32,
+) -> u32 {
+    if !is_this_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if out.is_null() || size == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut path = vec![0u16; 4096];
+    let written =
+        crate::modules::kernel::GetModuleFileNameW(module, path.as_mut_ptr(), 4096) as usize;
+    if written == 0 {
+        return 0;
+    }
+    path.truncate(written);
+    let name = match path.iter().rposition(|&unit| unit == u16::from(b'\\') || unit == u16::from(b'/')) {
+        Some(at) => &path[at + 1..],
+        None => &path[..],
+    };
+    let room = size as usize - 1;
+    let len = name.len().min(room);
+    // SAFETY: a buffer of `size` units, which holds `len` and a NUL.
+    unsafe {
+        std::ptr::copy_nonoverlapping(name.as_ptr(), out, len);
+        out.add(len).write(0);
+    }
+    (len > 0).then_some(len as u32).unwrap_or_else(|| {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        0
+    })
+}
+
 /// `GetConsoleWindow`: this host writes to the standard streams, so a console
 /// is here and its window is a handle of its own (as `CreateWindowExA` above
 /// answers for a library's message window). Nothing draws on it.
@@ -4807,6 +4969,9 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
         // `version.dll` reads the version resource this table now serves.
         || dll == "ntdll.dll"
         || dll == "version.dll"
+        // The module list is psapi's.
+        || dll == "psapi.dll"
+        || dll.starts_with("api-ms-win-psapi-")
         || dll.starts_with("api-ms-win-core-")
         || dll.starts_with("api-ms-win-eventing-");
     if kernel {
@@ -4817,6 +4982,11 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             CompareStringEx,
             GetStringTypeW,
             GetStringTypeExW,
+            EnumProcessModules,
+            EnumProcessModulesEx,
+            GetModuleInformation,
+            GetModuleFileNameExW,
+            GetModuleBaseNameW,
             FindResourceExW,
             FindResourceW,
             SizeofResource,
@@ -7103,6 +7273,133 @@ mod apartment_and_winrt_tests {
             ("api-ms-win-core-winrt-error-l1-1-0.dll", "SetRestrictedErrorInfo"),
         ] {
             assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
+        }
+    }
+}
+
+#[cfg(test)]
+mod module_list_tests {
+    use super::*;
+
+    /// A minimal image mapped in memory: DOS header, NT headers and an optional header
+    /// with the fields `GetModuleInformation` reports.
+    fn image(size_of_image: u32, entry: u32) -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x2000];
+        bytes[0] = b'M';
+        bytes[1] = b'Z';
+        bytes[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(&0x0000_4550u32.to_le_bytes());
+        let optional = 0x80 + 24;
+        bytes[optional..optional + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        bytes[optional + 16..optional + 20].copy_from_slice(&entry.to_le_bytes());
+        bytes[optional + 56..optional + 60].copy_from_slice(&size_of_image.to_le_bytes());
+        bytes
+    }
+
+    /// The sizes an image reports come out of its own headers, and a module that is not
+    /// an image is refused instead of guessed at.
+    #[test]
+    fn a_module_reports_the_headers_it_is_mapped_from() {
+        let mapped = image(0x2000, 0x1000);
+        let base = mapped.as_ptr() as usize;
+        assert_eq!(mapped_image_info(base), Some((0x2000, 0x1000)));
+
+        let process = GetCurrentProcess() as usize as *mut c_void;
+        let mut info = [0u8; 24];
+        assert_eq!(
+            GetModuleInformation(process, base as *mut c_void, info.as_mut_ptr(), 24),
+            1
+        );
+        let field = |at: usize| usize::from_le_bytes(info[at..at + 8].try_into().unwrap());
+        assert_eq!(field(0), base, "lpBaseOfDll");
+        assert_eq!(field(8), 0x2000, "SizeOfImage");
+        assert_eq!(field(16), base + 0x1000, "EntryPoint");
+
+        // Not an image: no MZ, or a size the caller got wrong.
+        let nothing = [0u8; 64];
+        assert_eq!(mapped_image_info(nothing.as_ptr() as usize), None);
+        set_error(0);
+        assert_eq!(
+            GetModuleInformation(
+                process,
+                nothing.as_ptr() as *mut c_void,
+                info.as_mut_ptr(),
+                24
+            ),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
+        assert_eq!(
+            GetModuleInformation(process, base as *mut c_void, info.as_mut_ptr(), 16),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    /// The module list is the images this host mapped, and its byte count comes back
+    /// whether or not the caller's array is big enough.
+    #[test]
+    fn the_module_list_is_reported_with_its_size() {
+        let process = GetCurrentProcess() as usize as *mut c_void;
+        let mut needed = 0u32;
+        assert_eq!(
+            EnumProcessModules(process, std::ptr::null_mut(), 0, &mut needed),
+            1
+        );
+        assert_eq!(needed as usize % 8, 0, "the count is in whole handles");
+
+        let images = crate::runtime::images();
+        let mut list = vec![std::ptr::null_mut::<c_void>(); images.len().max(1)];
+        let mut needed = 0u32;
+        let bytes = (list.len() * 8) as u32;
+        assert_eq!(
+            EnumProcessModulesEx(process, list.as_mut_ptr(), bytes, &mut needed, 0x03),
+            1
+        );
+        assert_eq!(needed as usize, images.len() * 8);
+        // Whatever was handed out is one of the mapped bases.
+        for handle in list.iter().take(images.len()) {
+            let base = *handle as usize;
+            assert!(
+                images.iter().any(|(b, _)| *b == base),
+                "{base:#x} is not a mapped image"
+            );
+        }
+
+        set_error(0);
+        assert_eq!(
+            EnumProcessModules(0xdead as *mut c_void, list.as_mut_ptr(), bytes, &mut needed),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
+
+        // A module name that cannot be asked for is a failure, not an empty name.
+        let mut name = [0u16; 8];
+        set_error(0);
+        assert_eq!(
+            GetModuleBaseNameW(process, std::ptr::null_mut(), name.as_mut_ptr(), 0),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(
+            GetModuleFileNameExW(0xdead as *mut c_void, std::ptr::null_mut(), name.as_mut_ptr(), 8),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
+
+        for dll in ["psapi.dll", "kernel32.dll", "api-ms-win-psapi-l1-1-0.dll"] {
+            for name in [
+                "EnumProcessModules",
+                "EnumProcessModulesEx",
+                "GetModuleInformation",
+                "GetModuleFileNameExW",
+                "GetModuleBaseNameW",
+            ] {
+                assert!(
+                    super::super::lookup(dll, name).is_some(),
+                    "{dll}!{name} is not answered"
+                );
+            }
         }
     }
 }

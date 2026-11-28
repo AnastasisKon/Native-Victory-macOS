@@ -1111,6 +1111,32 @@ impl<B: PresentBackend> Title<B> {
         }
         // Through the pool's own mapping; `None` when the title unmapped the memory meanwhile.
         let Ok((_buffer, at)) = self.host.resolve(info.memory as u64, info.size as u64) else { return };
+        // The title may have unmapped the range and remapped it into another pool since the view
+        // was placed: copying back would then write over whatever holds it now, one way a freed
+        // block's link ends up with a garbage offset (#339).
+        let address = info.memory as u64;
+        if let Some(&(_, pool)) = self.placed.get(&address).filter(|&&(k, _)| k == key) {
+            let mapped = self.host.memory().resolve(address, info.size as u64).map(|(p, _)| p.id);
+            if Some(pool) != mapped {
+                if self.back.logged.insert(key) {
+                    tracing::warn!(
+                        texture = key,
+                        ?described,
+                        "a GPU-written texture's title memory is not the pool its view was placed in any more: not copied back (#339)"
+                    );
+                }
+                return;
+            }
+        }
+        // With VICTORY_TRACE_FREED=1, a copy-back into a range the title's allocator freed is
+        // logged and skipped (#339): writing over a freed block corrupts whatever holds it now.
+        if crate::native::freed::overlaps(address, info.size as u64) {
+            crate::native::freed::check(address, info.size as u64, "texture copy-back");
+            if self.back.logged.insert(key) {
+                tracing::warn!(texture = key, ?described, "a GPU-written texture's copy-back was skipped: its title memory is in a freed range (#339)");
+            }
+            return;
+        }
         // SAFETY: `resolve` gives `size` mapped, writable bytes of the pool; the buffer is kept.
         unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), at.cast_mut(), tiled.len()) };
         // What the host texture holds, so the scanner's sighting of this write uploads nothing.

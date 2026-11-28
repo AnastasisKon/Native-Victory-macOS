@@ -18,7 +18,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, c_char, c_void};
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
@@ -541,12 +541,13 @@ struct Lane {
     /// Enqueued, not yet submitted.
     unsubmitted: Vec<Command>,
     /// Left out when the queue submitted itself, until the title's Submit:
-    /// reads into physical pages and the status entries behind them.
-    held: Vec<Command>,
+    /// reads into physical pages and the status entries behind them, keeping
+    /// the sequence numbers assigned in enqueue order (#550).
+    held: Vec<(u64, Command)>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
-    statuses: VecDeque<(u64, Status)>,
+    reads: BTreeMap<u64, Request>,
+    statuses: BTreeMap<u64, Status>,
     running: BTreeMap<u64, Running>,
     failures: BTreeMap<u64, HRESULT>,
     closed: bool,
@@ -720,17 +721,17 @@ impl Lanes {
         let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
         let (_, _, id) = busy()
             .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
+            .filter_map(|(&id, l)| Some((l.clock, *l.reads.keys().next()?, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
+        let (&seq, &request) = lane.reads.first_key_value()?;
         let staging = staging_bytes(&request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        lane.reads.pop_first();
         let started = std::time::Instant::now();
         let thread = std::thread::current();
         lane.running.insert(
@@ -798,27 +799,40 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        let mut commands = if explicit {
+        let unsubmitted = std::mem::take(&mut lane.unsubmitted);
+        let mut sequenced = if explicit {
             std::mem::take(&mut lane.held)
         } else {
             Vec::new()
         };
-        commands.append(&mut lane.unsubmitted);
-        for command in commands {
+        for command in unsubmitted {
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            sequenced.push((seq, command));
+        }
+        let Some(lane) = self.lanes.get_mut(&id) else {
+            return;
+        };
+        for (seq, command) in sequenced {
             let hold = !explicit
                 && match &command {
                     Command::Read(r) => r.options & PAGE_DESTINATION != 0,
-                    Command::Status(_) => !lane.held.is_empty(),
+                    Command::Status(_) => lane
+                        .held
+                        .iter()
+                        .any(|&(s, ref c)| s < seq && matches!(c, Command::Read(_))),
                 };
             if hold {
-                lane.held.push(command);
+                lane.held.push((seq, command));
                 continue;
             }
-            let seq = self.next_seq;
-            self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
-                Command::Status(status) => lane.statuses.push_back((seq, status)),
+                Command::Read(request) => {
+                    lane.reads.insert(seq, request);
+                }
+                Command::Status(status) => {
+                    lane.statuses.insert(seq, status);
+                }
             }
         }
         lane.flush();
@@ -833,8 +847,8 @@ impl Lane {
             clock: 0,
             unsubmitted: Vec::new(),
             held: Vec::new(),
-            reads: VecDeque::new(),
-            statuses: VecDeque::new(),
+            reads: BTreeMap::new(),
+            statuses: BTreeMap::new(),
             running: BTreeMap::new(),
             failures: BTreeMap::new(),
             closed: false,
@@ -852,16 +866,21 @@ impl Lane {
 
     /// Writes the status entries whose earlier reads have all finished.
     fn flush(&mut self) {
-        while let Some(&(seq, _)) = self.statuses.front() {
-            let waiting = self.reads.front().map(|r| r.0);
-            if waiting
+        while let Some((&seq, _)) = self.statuses.first_key_value() {
+            let held_read = self
+                .held
+                .iter()
+                .find_map(|&(s, ref c)| matches!(c, Command::Read(_)).then_some(s));
+            let waiting = self.reads.keys().next().copied();
+            if held_read
                 .into_iter()
+                .chain(waiting)
                 .chain(self.running.keys().next().copied())
                 .any(|s| s < seq)
             {
                 return;
             }
-            let Some((_, status)) = self.statuses.pop_front() else {
+            let Some((_, status)) = self.statuses.pop_first() else {
                 return;
             };
             let later = self.failures.split_off(&seq);
@@ -2274,6 +2293,64 @@ mod tests {
         assert!(!l.lanes[&0].statuses.is_empty());
         l.finish(&paged, Ok(()));
         assert!(l.lanes[&0].statuses.is_empty());
+    }
+
+    #[test]
+    fn held_auto_submits_keep_sequence_order_status_boundaries_and_errors() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let array = status_array(2).cast::<Instance<StatusArray>>();
+        let status = |index| {
+            add_ref_instance(array);
+            // SAFETY: an array we created.
+            unsafe { (*array).state.entries[index as usize].store(E_PENDING, Ordering::Release) };
+            Command::Status(Status { array, index })
+        };
+
+        // Batch 1 auto-submits: a page read (seq 0) and status 0 (seq 2) are held, while plain
+        // read A (seq 1) runs immediately.
+        read(&mut l, 0, PAGE_DESTINATION, 16);
+        read(&mut l, 0, 0, 16);
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(status(0));
+        l.submit_as(0, false);
+
+        let plain_a = l.start().unwrap();
+        assert_eq!(plain_a.seq, 1);
+        l.finish(&plain_a, Ok(()));
+        assert_eq!(result(array.cast(), 0), E_PENDING);
+
+        // Batch 2 auto-submits before `Submit()`: plain read B (seq 3) runs and fails, status 1
+        // (seq 4) is held, and plain read C (seq 5) stays unstarted in `reads`.
+        read(&mut l, 0, 0, 32);
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(status(1));
+        read(&mut l, 0, 0, 64);
+        l.submit_as(0, false);
+
+        let plain_b = l.start().unwrap();
+        assert_eq!((plain_b.seq, plain_b.request.destination_size), (3, 32));
+        l.finish(&plain_b, Err(INVALID_DATA));
+        let results = || (result(array.cast(), 0), result(array.cast(), 1));
+        assert_eq!(results(), (E_PENDING, E_PENDING));
+
+        // Explicit `Submit()` releases the held page read (seq 0) ahead of unstarted plain read C
+        // (seq 5), and keeps status 0 (seq 2) isolated from plain read B's failure (seq 3).
+        l.submit(0);
+        let paged = l.start().unwrap();
+        assert_eq!((paged.seq, paged.request.options), (0, PAGE_DESTINATION));
+        assert_eq!(results(), (E_PENDING, E_PENDING));
+
+        l.finish(&paged, Ok(()));
+        // Even while plain read C (seq 5) has not started, both status 0 and status 1 complete
+        // with their own segment's outcome.
+        assert_eq!(
+            results(),
+            (S_OK, INVALID_DATA),
+            "status 0 must not steal segment 1's failure"
+        );
+
+        let plain_c = l.start().unwrap();
+        assert_eq!((plain_c.seq, plain_c.request.destination_size), (5, 64));
+        l.finish(&plain_c, Ok(()));
     }
 
     #[test]

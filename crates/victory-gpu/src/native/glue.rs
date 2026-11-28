@@ -781,6 +781,9 @@ fn trace_present(resource: This) {
 /// `VICTORY_TRACE_PRESENT=<every>`: the title resources `PresentX` has shown.
 static PRESENTED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+/// Presents so far, counted before each one presents ([`skip_this_present`]).
+static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn present_every() -> Option<u32> {
     static EVERY: OnceLock<Option<u32>> = OnceLock::new();
     *EVERY.get_or_init(|| std::env::var("VICTORY_TRACE_PRESENT").ok().and_then(|v| v.parse().ok()))
@@ -820,6 +823,7 @@ fn trace_present_draw(t: &MetalTitle, l: &MetalList) {
 /// others (`Title::present`). The traces name the first.
 pub(crate) fn present(queue: This, planes: &[This]) {
     let Some(&resource) = planes.first() else { return };
+    PRESENTS.fetch_add(1, Ordering::Relaxed);
     if present_every().is_some() {
         let mut shown = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
         for &p in planes {
@@ -1800,15 +1804,38 @@ fn stage_hashes(pipeline: usize) -> Vec<String> {
 
 /// `VICTORY_SKIP_PIPELINES=<hash>[,<hash>...]` (debugging): whether title pipeline `pipeline`
 /// has a shader of one of the listed 16-digit hashes, so that its draws and dispatches are
-/// dropped (to see which work makes a fault in the picture). Read once; off when unset.
+/// dropped (to see which work makes a fault in the picture). Read once; off when unset. With
+/// `VICTORY_SKIP_PIPELINES_ALTERNATE=1` they are dropped in alternating frames instead.
 fn skipped_pipeline(pipeline: usize) -> bool {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         crate::pipeline::parse_skip_hashes(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default())
     });
     !hashes.is_empty()
+        && skip_this_present(
+            env_set!("VICTORY_SKIP_PIPELINES_ALTERNATE"),
+            PRESENTS.load(Ordering::Relaxed),
+        )
         && crate::pipeline::native_stages(pipeline as This)
             .is_some_and(|(stages, _)| stages.iter().any(|(_, sh)| hashes.contains(&sh.hash)))
+}
+
+/// Whether the frame recorded after `presents` presents drops the work
+/// [`skipped_pipeline`] names: always, unless `alternate` asks for every other one, in which
+/// case a frame after an even number of presents drops it and one after an odd number keeps it,
+/// so one run's consecutive frames show the scene with and without it.
+fn skip_this_present(alternate: bool, presents: u64) -> bool {
+    !alternate || presents % 2 == 0
+}
+
+#[cfg(test)]
+#[test]
+fn skip_pipelines_drop_every_frame_or_every_other_one() {
+    assert!(skip_this_present(false, 0), "without alternate every frame drops it");
+    assert!(skip_this_present(false, 1));
+    assert!(skip_this_present(true, 0), "alternate: the frame after an even number of presents");
+    assert!(!skip_this_present(true, 1), "and the one after an odd number keeps it");
+    assert!(skip_this_present(true, 2));
 }
 
 /// A dispatch of a pipeline `VICTORY_SKIP_PIPELINES` lists: counted as dropped and noted in the

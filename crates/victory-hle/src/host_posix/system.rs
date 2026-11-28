@@ -2425,6 +2425,59 @@ pub extern "system" fn CertFindChainInStore(
 
 pub extern "system" fn CertFreeCertificateChain(_chain: *const c_void) {}
 
+// The same answer for the store a library opens by provider rather than by
+// name, and for what it looks up in it: this host has no certificate store, so
+// there is nothing to open and nothing to find. Saying so is what a machine
+// without the store does; a handle nobody can read would have the caller
+// believe it has certificates.
+
+pub extern "system" fn CertOpenStore(
+    _provider: *const u8,
+    _encoding: u32,
+    _crypt: usize,
+    _flags: u32,
+    _para: *const c_void,
+) -> *mut c_void {
+    set_error(ERROR_FILE_NOT_FOUND);
+    std::ptr::null_mut()
+}
+
+pub extern "system" fn CertFindCertificateInStore(
+    _store: *mut c_void,
+    _encoding: u32,
+    _flags: u32,
+    _kind: u32,
+    _to_find: *const c_void,
+    _previous: *const c_void,
+) -> *const c_void {
+    set_error(ERROR_FILE_NOT_FOUND);
+    std::ptr::null()
+}
+
+pub extern "system" fn CertFreeCertificateContext(_context: *const c_void) -> i32 {
+    1
+}
+
+/// `RaiseFailFastException`: the process ends here, which is what fail-fast
+/// means — the record's code becomes the exit status, and nothing after the
+/// call runs (no unwinding, no exit handlers, as on Windows).
+pub extern "system" fn RaiseFailFastException(
+    record: *const c_void,
+    _context: *const c_void,
+    _flags: u32,
+) {
+    /// `STATUS_FAIL_FAST_EXCEPTION`, when the caller hands no record.
+    const STATUS_FAIL_FAST_EXCEPTION: u32 = 0xC000_0409;
+    let code = if record.is_null() {
+        STATUS_FAIL_FAST_EXCEPTION
+    } else {
+        // SAFETY: the title's `EXCEPTION_RECORD`, whose first field is its code.
+        unsafe { record.cast::<u32>().read() }
+    };
+    tracing::error!("the title raised a fail-fast exception, code {code:#010x}");
+    std::process::exit(code as i32);
+}
+
 // user32: the console has one window of the title's own; these are for
 // libraries that make a message window and pump it.
 
@@ -2553,6 +2606,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             IsProcessorFeaturePresent,
             IsDebuggerPresent,
             UnhandledExceptionFilter,
+            RaiseFailFastException,
             RtlCaptureStackBackTrace,
             RtlUnwind,
             WerRegisterFile,
@@ -2669,8 +2723,11 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
     if dll == "crypt32.dll" {
         return table!(
             CertOpenSystemStoreW,
+            CertOpenStore,
             CertCloseStore,
             CertFindChainInStore,
+            CertFindCertificateInStore,
+            CertFreeCertificateContext,
             CertFreeCertificateChain
         );
     }
@@ -3364,6 +3421,57 @@ mod trace_tests {
                 &mut registration,
             ),
             ERROR_INVALID_PARAMETER
+        );
+    }
+}
+
+#[cfg(test)]
+mod cert_and_fail_fast_tests {
+    use super::*;
+
+    #[test]
+    fn a_store_that_does_not_exist_is_reported_as_missing() {
+        // `XCurl` opens the store by provider rather than by name, and looks a
+        // certificate up in it. This host has no store: saying so is what a
+        // machine without one does, and a handle nobody can read would have the
+        // caller believe it has certificates.
+        for name in [
+            "CertOpenStore",
+            "CertFindCertificateInStore",
+            "CertFreeCertificateContext",
+        ] {
+            assert!(
+                lookup("crypt32.dll", name).is_some(),
+                "{name} is not answered"
+            );
+        }
+        assert!(CertOpenStore(std::ptr::null(), 0, 0, 0, std::ptr::null()).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_FILE_NOT_FOUND);
+        assert!(
+            CertFindCertificateInStore(
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                std::ptr::null(),
+                std::ptr::null()
+            )
+            .is_null()
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_FILE_NOT_FOUND);
+        // Freeing a certificate nobody has is not an error.
+        assert_eq!(CertFreeCertificateContext(std::ptr::null()), 1);
+    }
+
+    #[test]
+    fn the_fail_fast_call_is_answered_rather_than_stubbed() {
+        // Not called: it ends the process, which is the point of it.
+        assert!(
+            lookup(
+                "api-ms-win-core-errorhandling-l1-1-2.dll",
+                "RaiseFailFastException"
+            )
+            .is_some()
         );
     }
 }

@@ -55,7 +55,14 @@ cd "$(dirname "$0")/../.."
 source tools/macos/native-binary.sh
 [[ -n "$console" ]] || console=$(default_console "$ram_gb")
 bin=$(native_binary) || exit 2
-[[ -x "$bin" ]] || { echo "victory is not executable at $bin: run tools/macos/native-setup.sh first"; exit 2; }
+[[ -x "$bin" ]] || {
+  if [[ -n "${VICTORY_BINARY:-}" ]]; then
+    echo "VICTORY_BINARY points at $bin, which is not executable"
+  else
+    echo "victory is not executable at $bin: run tools/macos/native-setup.sh first"
+  fi
+  exit 2
+}
 
 mkdir -p runs || exit 1
 run_dir=$(mktemp -d "runs/$(date +%Y%m%d-%H%M%S)-XXXXXX") || exit 1

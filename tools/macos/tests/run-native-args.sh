@@ -73,5 +73,23 @@ try "$dir"
 [ "$rc" = 2 ] || fail "wrong file name: exit $rc, expected 2"
 case "$out" in *"No game_*master.exe found in $dir"*) ;; *) fail "wrong file name: expected the folder message" ;; esac
 
+# VICTORY_BINARY names the build to run, so the diagnostics build can be used without renaming
+# anything. A path that is not executable stops the run and names the variable, rather than sending
+# the user to native-setup.sh, which has nothing to do with a path they chose.
+: > "$dir/game_scarlett_master.exe"
+out=$(VICTORY_BINARY="$dir/no-such-victory" "$script" "$dir" 2>&1)
+rc=$?
+[ "$rc" = 2 ] || fail "VICTORY_BINARY: exit $rc, expected 2"
+case "$out" in
+  *"VICTORY_BINARY points at $dir/no-such-victory, which is not executable"*) ;;
+  *) fail "VICTORY_BINARY: expected the message to name the variable and the path" ;;
+esac
+# The resolver prints the path as given and asks Cargo nothing, which is what lets the run start
+# without a build of the plain binary beside it.
+root="$(cd "$(dirname "$script")/../.." && pwd)"
+out=$(VICTORY_BINARY=/opt/somewhere/victory-diag bash -c "cd '$root' && source tools/macos/native-binary.sh && native_binary")
+[ "$out" = /opt/somewhere/victory-diag ] || fail "native_binary: printed \"$out\", expected the path VICTORY_BINARY names"
+rm -f "$dir/game_scarlett_master.exe"
+
 [ "$ok" = 1 ] || exit 1
 echo "run-native arguments: ok"

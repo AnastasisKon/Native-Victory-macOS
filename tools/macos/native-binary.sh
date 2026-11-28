@@ -31,6 +31,13 @@ default_console() {
 # plutil is part of macOS and decodes JSON strings without losing path quoting.
 native_binary() {
   local target_dir
+  # A build of one's own, named by VICTORY_BINARY: the diagnostics build takes the switches marked
+  # "Diagnostics build only" (VICTORY_CRASH_SAVE, VICTORY_SKIP_TITLE_INT3), which a plain release
+  # build compiles out. Printed as given: the caller checks it is executable.
+  if [[ -n "${VICTORY_BINARY:-}" ]]; then
+    printf '%s\n' "$VICTORY_BINARY"
+    return 0
+  fi
   if ! command -v cargo >/dev/null 2>&1 && ! find_rustup; then
     echo "Cargo is not on your PATH. Install rustup from https://rustup.rs, then run tools/macos/native-setup.sh." >&2
     return 1

@@ -1256,6 +1256,13 @@ impl<B: GraphicsBackend> Targets<B> {
 /// Target and independent depth/stencil clear values (`None` preserves a plane).
 type DepthClear<T> = (Rc<T>, Option<f32>, Option<u8>);
 
+/// A frame's depth and its motion vectors: the pair a temporal MetalFX upscale reads, or `None`
+/// for a frame that has neither and takes the spatial one.
+pub type DepthMotion<B> = (
+    Rc<<B as victory_backend::resources::ResourceBackend>::Texture>,
+    Rc<<B as victory_backend::resources::ResourceBackend>::Texture>,
+);
+
 pub enum Cmd<B: GraphicsBackend> {
     Dispatch {
         pso: Rc<ComputePso<B>>,
@@ -1315,6 +1322,17 @@ pub enum Cmd<B: GraphicsBackend> {
         len: usize,
         row_pitch: usize,
         slice_pitch: usize,
+    },
+    /// A MetalFX upscale of a frame into another texture, in its place in the list: the scaler
+    /// chosen from whether the frame's depth and motion vectors are here.
+    Metalfx {
+        color: Rc<B::Texture>,
+        depth: Option<Rc<B::Texture>>,
+        motion: Option<Rc<B::Texture>>,
+        out: Rc<B::Texture>,
+        jitter: [f32; 2],
+        motion_scale: [f32; 2],
+        reset: bool,
     },
     Clear {
         color: Option<(Rc<B::Texture>, [f32; 4])>,
@@ -1436,6 +1454,23 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 len: *len,
                 row_pitch: *row_pitch,
                 slice_pitch: *slice_pitch,
+            },
+            Cmd::Metalfx {
+                color,
+                depth,
+                motion,
+                out,
+                jitter,
+                motion_scale,
+                reset,
+            } => Cmd::Metalfx {
+                color: color.clone(),
+                depth: depth.clone(),
+                motion: motion.clone(),
+                out: out.clone(),
+                jitter: *jitter,
+                motion_scale: *motion_scale,
+                reset: *reset,
             },
             Cmd::Clear { color, depth, rects } => Cmd::Clear {
                 color: color.clone(),
@@ -1665,6 +1700,35 @@ impl<B: GraphicsBackend> NativeList<B> {
     /// `Dispatch`. Needs the compute pipeline set.
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) -> Result<(), String> {
         self.dispatch_from([x as usize, y as usize, z as usize], [u32::MAX; 3], None, None)
+    }
+
+    /// Records a MetalFX upscale of the frame `color` into `out`, from `depth` and `motion` when
+    /// the frame has them (a temporal upscale) and without them when it does not (a spatial one):
+    /// `jitter` is where the frame's projection was offset, in pixels of `color`, `motion_scale`
+    /// what its vectors are multiplied by to be pixels, and `reset` whether the accumulated
+    /// history is dropped.
+    pub fn metalfx(
+        &mut self,
+        color: Rc<B::Texture>,
+        frame: Option<DepthMotion<B>>,
+        out: Rc<B::Texture>,
+        jitter: [f32; 2],
+        motion_scale: [f32; 2],
+        reset: bool,
+    ) {
+        let (depth, motion) = match frame {
+            Some((depth, motion)) => (Some(depth), Some(motion)),
+            None => (None, None),
+        };
+        self.cmds.push(Cmd::Metalfx {
+            color,
+            depth,
+            motion,
+            out,
+            jitter,
+            motion_scale,
+            reset,
+        });
     }
 
     /// `DispatchX` with thread counts, of a pipeline translated for them

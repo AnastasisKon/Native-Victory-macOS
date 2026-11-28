@@ -20,6 +20,10 @@ pub mod dstorage;
 mod read_cache;
 #[cfg(windows)]
 pub mod fidelityfx;
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) mod fidelityfx_api;
+#[cfg(target_os = "macos")]
+pub(crate) mod metalfx_ffx;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
@@ -83,6 +87,12 @@ pub(crate) fn all() -> Vec<HleModule> {
     #[cfg(windows)]
     if fidelityfx::serving() {
         all.push(fidelityfx::module());
+    }
+    // The same five functions of the title's upscaler, served by MetalFX on a native host: the two
+    // providers are exclusive, one per host, and both stay out of the registry unless asked for.
+    #[cfg(target_os = "macos")]
+    if metalfx_ffx::serving() {
+        all.push(metalfx_ffx::module());
     }
     all
 }

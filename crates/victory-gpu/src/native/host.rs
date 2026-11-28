@@ -285,6 +285,9 @@ enum Group {
     Blit(usize, usize),
     Render(usize, usize),
     Clear(usize),
+    /// One `Cmd::Metalfx`, which is a pass of its own: the backend ends the command buffer it is
+    /// in, so it cannot be grouped with what neither precedes nor follows it.
+    MetalFx(usize),
 }
 
 type HeapPair<B> = (Option<Rc<NativeHeap<B>>>, Option<Rc<NativeHeap<B>>>);
@@ -2794,7 +2797,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             Cmd::CopyTextureToBuffer { dst, len, .. } => {
                 p.blit.push(self.resolve_or_alias(*dst, *len as u64)?);
             }
-            Cmd::CopyTexture { .. } | Cmd::Clear { .. } => {}
+            Cmd::CopyTexture { .. } | Cmd::Clear { .. } | Cmd::Metalfx { .. } => {}
         }
         Ok(p)
     }
@@ -2986,6 +2989,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 | Cmd::CopyBufferToTexture { .. }
                 | Cmd::CopyTextureToBuffer { .. } => Group::Blit(i, j),
                 Cmd::Draw { .. } => Group::Render(i, j),
+                Cmd::Metalfx { .. } => {
+                    j = i + 1;
+                    Group::MetalFx(i)
+                }
                 Cmd::Clear { .. } => {
                     j = i + 1;
                     Group::Clear(i)
@@ -3061,6 +3068,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 Group::Render(a, _) => self.twin_copies(false, true, &self.twin_uses(&cmds[a..a + 1])),
                 Group::Clear(a) => self.twin_copies(false, false, &self.twin_uses(&cmds[a..a + 1])),
                 Group::Blit(a, b) => self.twin_copies(false, false, &self.twin_uses(&cmds[a..b])),
+                Group::MetalFx(_) => self.twin_copies(false, false, &[]),
             })
             .collect();
         let mut passes: Vec<Pass<'_, B>> = vec![];
@@ -3162,6 +3170,26 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         })
                         .collect(),
                 ),
+                Group::MetalFx(k) => match &cmds[*k] {
+                    Cmd::Metalfx {
+                        color,
+                        depth,
+                        motion,
+                        out,
+                        jitter,
+                        motion_scale,
+                        reset,
+                    } => Pass::MetalFx(MetalFx {
+                        color: &**color,
+                        depth: depth.as_deref(),
+                        motion: motion.as_deref(),
+                        out: &**out,
+                        jitter: *jitter,
+                        motion_scale: *motion_scale,
+                        reset: *reset,
+                    }),
+                    _ => unreachable!(),
+                },
                 Group::Clear(k) => match cmds[*k] {
                     Cmd::Clear {
                         color: Some((target, color)),

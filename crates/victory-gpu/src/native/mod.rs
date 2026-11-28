@@ -53,6 +53,35 @@ pub use glue::{
     shader_stats,
 };
 
+/// Whether the host can serve a title's upscaler with MetalFX at all (`modules::fidelityfx`'s
+/// `VICTORY_METALFX=upscale` asks before it takes the title's imports over).
+#[cfg(target_os = "macos")]
+pub fn metalfx_available() -> bool {
+    glue::metalfx_available()
+}
+
+/// Records one MetalFX upscale on the title's list, from the title's own resources: `color` and
+/// `out`, and `depth` and `motion` when the frame has them (null, both of them, when it does not).
+/// False when any of them is not a texture the host has, or the list is not one of ours.
+///
+/// `jitter` is where the frame's projection was offset, in pixels of `color`; `motion_scale` what
+/// the frame's motion vectors are multiplied by to be pixels; `reset` whether the accumulated
+/// history is dropped, which the first frame of a sequence and a cut want.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn metalfx_upscale(
+    list: *const crate::object::Object,
+    color: *const crate::object::Object,
+    depth: *const crate::object::Object,
+    motion: *const crate::object::Object,
+    out: *const crate::object::Object,
+    jitter: [f32; 2],
+    motion_scale: [f32; 2],
+    reset: bool,
+) -> bool {
+    glue::metalfx(list, color, depth, motion, out, jitter, motion_scale, reset)
+}
+
 /// Reads `out.len()` bytes at `at` from this process, false if they cannot be read (unmapped
 /// memory: the kernel checks, nothing faults).
 pub fn safe_read(at: *const u8, out: &mut [u8]) -> bool {

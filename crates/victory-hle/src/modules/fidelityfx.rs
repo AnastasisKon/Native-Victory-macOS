@@ -29,76 +29,11 @@ use windows::core::Interface;
 
 use crate::{HleModule, hle_export};
 
+use super::fidelityfx_api::*;
+
 /// The PC build's upscaler, which has the five functions itself.
 const DLL: &str = "amd_fidelityfx_upscaler_dx12.dll";
 
-// Return codes.
-const OK: u32 = 0;
-const UNKNOWN_TYPE: u32 = 2;
-const NO_PROVIDER: u32 = 4;
-const PARAMETER: u32 = 6;
-
-// Description types.
-const CREATE_UPSCALE: u64 = 0x1_0000;
-const DISPATCH_UPSCALE: u64 = 0x1_0001;
-const CONSOLE_BACKEND: u64 = 0x100_0002;
-const HOST_BACKEND: u64 = 2;
-const GET_VERSIONS: u64 = 4;
-const GET_PROVIDER_VERSION: u64 = 6;
-const MEMORY_USAGE_WITH_DEVICE: u64 = 0x1_0009;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Header {
-    kind: u64,
-    next: *mut Header,
-}
-
-/// An upscaler context: flags, largest render and output sizes, a message
-/// callback.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CreateUpscale {
-    header: Header,
-    flags: u32,
-    max_render: [u32; 2],
-    max_output: [u32; 2],
-    message: usize,
-}
-
-/// The backend description: a device.
-#[repr(C)]
-struct Backend {
-    header: Header,
-    device: *mut c_void,
-}
-
-/// A resource, its description (type, format, sizes, mips, flags, usage)
-/// and the state it is in.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Resource {
-    resource: *mut c_void,
-    description: [u32; 8],
-    state: u32,
-}
-
-/// One upscaling: the command list, then colour, depth, motion vectors,
-/// exposure, reactive mask, transparency mask and output; then jitter,
-/// motion-vector scale, sizes, sharpening, frame time, pre-exposure, reset,
-/// camera and flags, which pass through.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct DispatchUpscale {
-    header: Header,
-    list: *mut c_void,
-    resources: [Resource; 7],
-    rest: [u32; 18],
-}
-
-const _: () = assert!(size_of::<CreateUpscale>() == 0x30);
-const _: () = assert!(size_of::<Resource>() == 0x30);
-const _: () = assert!(size_of::<DispatchUpscale>() == 0x1b0);
 
 /// The versions a backend offers: count in and out, ids, names.
 #[repr(C)]

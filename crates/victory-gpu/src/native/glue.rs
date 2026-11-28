@@ -1844,6 +1844,49 @@ pub(crate) fn install_test_render_pipeline(
     });
 }
 
+/// Records one MetalFX upscale of the title's frame into one of its own textures: `color` at the
+/// input size, `out` at the output size, and `depth` and `motion` (either both, for a temporal
+/// upscale, or both null, for a spatial one). False when they are not textures the host has, or
+/// the list is not one of ours: the caller then keeps its own path.
+pub(crate) fn metalfx(
+    this: This,
+    color: This,
+    depth: This,
+    motion: This,
+    out: This,
+    jitter: [f32; 2],
+    motion_scale: [f32; 2],
+    reset: bool,
+) -> bool {
+    with_list(this, |t, l| {
+        let (Some(color), Some(out)) = (t.texture_of(color as usize), t.texture_of(out as usize))
+        else {
+            return false;
+        };
+        let frame = match (depth.is_null(), motion.is_null()) {
+            (true, true) => None,
+            (false, false) => match (
+                t.texture_of(depth as usize),
+                t.texture_of(motion as usize),
+            ) {
+                (Some(depth), Some(motion)) => Some((depth, motion)),
+                _ => return false,
+            },
+            // One without the other is not a frame MetalFX can accumulate from.
+            _ => return false,
+        };
+        l.list.metalfx(color, frame, out, jitter, motion_scale, reset);
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// Whether this host has the MetalFX upscaler an upscale would need: the temporal one when a frame
+/// brings depth and motion vectors, the spatial one otherwise.
+pub(crate) fn metalfx_available() -> bool {
+    victory_metal::metalfx::spatial()
+}
+
 pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
     with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
         _ if skipped_dispatch(t, l, &format!("groups [{x}, {y}, {z}]")) => {}

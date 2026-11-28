@@ -158,15 +158,28 @@ fn split_args(args: &str) -> Vec<String> {
 }
 
 /// Runtime areas by number, in the public feature list's order, that we
-/// serve: accessibility (0), app capture (1), async calls and providers
-/// (2, 3), display (4), game (5), invites (6), game saves (7), game UI (8),
-/// launcher (9), networking (10), packages (11), persistent local storage
-/// (12), speech synthesis (13), store (14), system (15), task queues (16),
-/// users (18), error reports (19), game events (20). Not threads (17) or
-/// game streaming (21).
-const AVAILABLE: [u32; 20] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20,
-];
+/// serve: async calls and providers (2, 3), display (4), game (5), invites
+/// (6), game saves (7), game UI (8), launcher (9), networking (10), packages
+/// (11), persistent local storage (12), speech synthesis (13), store (14),
+/// system (15), task queues (16), users (18), error reports (19), game events
+/// (20). Not threads (17) or game streaming (21).
+///
+/// Not accessibility (0) or app capture (1) either, though the consoles have
+/// them: `XAccessibility.h`'s `XClosedCaption*`/`XHighContrast*`/`XSpeechToText*`
+/// and `XAppCapture.h`'s metadata and broadcast entry points have no export
+/// here, and a title that read the area as available would resolve them to
+/// null. An area is claimed only where its entry points exist.
+const AVAILABLE: [u32; 18] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20];
+
+#[cfg(test)]
+#[test]
+fn an_area_is_claimed_only_where_its_entry_points_exist() {
+    // Accessibility and app capture have no exports here (`XClosedCaption*`, `XAppCaptureMetadata*`),
+    // so a title must not be told they are available and resolve them to null.
+    assert!(!AVAILABLE.contains(&0), "accessibility");
+    assert!(!AVAILABLE.contains(&1), "app capture");
+    assert!(AVAILABLE.contains(&19), "error reports: XErrorReport, XErrorSetCallback and -Options");
+}
 
 extern "system" fn is_feature_available(_: This, feature: u32) -> bool {
     AVAILABLE.contains(&feature)

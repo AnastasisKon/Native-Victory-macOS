@@ -157,7 +157,13 @@ pub fn put<T>(out: *mut T, value: T) -> HRESULT {
 /// the bytes used, as the runtime's string getters do.
 pub fn put_string(text: &str, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     let len = text.len() + 1;
+    // The headers type these as `_Out_writes_bytes_to_(size, *used)`: on a short buffer the
+    // required size still goes into `*used`, which is how a title sizes its retry.
     if buffer.is_null() || size < len {
+        if !used.is_null() {
+            // SAFETY: `used` is the title's out pointer, checked non-null.
+            unsafe { used.write(len) };
+        }
         return xasync::E_NOT_SUFFICIENT_BUFFER;
     }
     // SAFETY: the buffer holds `size` bytes, checked above.
@@ -290,6 +296,27 @@ pub extern "system" fn XErrorReport(hr: HRESULT, message: *const c_char) {
     tracing::warn!(hr = format_args!("{:#010x}", hr as u32), %message, "XErrorReport");
 }
 
+/// `XError.h`: the title's callback for reported errors, with its context. We report through
+/// `XErrorReport` (the log), so nothing is stored and the callback is never fired; the export
+/// exists because a title that saw the `XError` feature available calls it before anything else,
+/// and resolving it to null would end the run where the console keeps going.
+pub extern "system" fn XErrorSetCallback(callback: *const c_void, _context: *mut c_void) {
+    tracing::debug!(
+        callback = format_args!("{callback:p}"),
+        "XErrorSetCallback: errors are reported to the log, not to the title"
+    );
+}
+
+/// `XError.h`: how the title wants errors surfaced. Both options are ignored: the run's errors go
+/// to the log, and `DebugBreakOnError` would end it on a report we make ourselves.
+pub extern "system" fn XErrorSetOptions(on_debugger: u32, without_debugger: u32) {
+    tracing::debug!(
+        on_debugger,
+        without_debugger,
+        "XErrorSetOptions: the options are not applied"
+    );
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xgameruntime",
@@ -303,6 +330,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(UninitializeApiImpl),
             hle_export!(QueryApiImpl),
             hle_export!(XErrorReport),
+            hle_export!(XErrorSetCallback),
+            hle_export!(XErrorSetOptions),
         ],
     }
 }

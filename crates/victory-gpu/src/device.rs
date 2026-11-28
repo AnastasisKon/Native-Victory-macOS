@@ -125,6 +125,13 @@ pub(crate) fn device() -> This {
 /// Device creation: `(adapter, parameters, iid, out)`. The parameters start
 /// with the interface version; the rest (ring and scratch sizes, features
 /// to leave out) does not matter to us yet.
+///
+/// The struct is the GDK's `D3D12XBOX_CREATE_DEVICE_PARAMETERS` (`d3d12_x.h`): `UINT Version;
+/// D3D12XBOX_PROCESS_DEBUG_FLAGS ProcessDebugFlags; UINT GraphicsCommandQueueRingSizeBytes;
+/// D3D12_GPU_VIRTUAL_ADDRESS pOffchipTessellationBuffer; UINT GraphicsScratchMemorySizeBytes; UINT
+/// ComputeScratchMemorySizeBytes; BOOL DisableGeometryShaderAllocations; BOOL
+/// DisableTessellationShaderAllocations;` -- 40 bytes on x64, the version at 0 and the ring size at
+/// 8, which is why reading the first dword is the whole of this for now.
 pub extern "system" fn create(
     _adapter: *const c_void,
     parameters: *const u32,
@@ -452,6 +459,37 @@ static FUNCTIONS: Table<160> = {
 
 #[cfg(test)]
 mod tests {
+    /// The vendor's parameter struct, laid out as `d3d12_x.h` declares it, so that a later change
+    /// reads the field it means: `Version` first, then the debug flags and the ring size, an
+    /// 8-byte-aligned tessellation address, the two scratch sizes, and the two `BOOL`s.
+    #[repr(C)]
+    struct CreateDeviceParameters {
+        version: u32,
+        process_debug_flags: u32,
+        ring_size_bytes: u32,
+        /// `pOffchipTessellationBuffer` is a `D3D12_GPU_VIRTUAL_ADDRESS` (8 bytes, 8-aligned).
+        _pad: u32,
+        offchip_tessellation: u64,
+        graphics_scratch_bytes: u32,
+        compute_scratch_bytes: u32,
+        disable_geometry_shader_allocations: i32,
+        disable_tessellation_shader_allocations: i32,
+    }
+
+    /// What a title hands `D3D12XboxCreateDevice`, from the GDK's header: 40 bytes, the version at
+    /// 0 (the one field read today) and the ring size at 8.
+    #[test]
+    fn the_device_parameters_are_the_gdk_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<CreateDeviceParameters>(), 40);
+        assert_eq!(offset_of!(CreateDeviceParameters, version), 0);
+        assert_eq!(offset_of!(CreateDeviceParameters, ring_size_bytes), 8);
+        assert_eq!(offset_of!(CreateDeviceParameters, offchip_tessellation), 16);
+        assert_eq!(offset_of!(CreateDeviceParameters, graphics_scratch_bytes), 24);
+        assert_eq!(offset_of!(CreateDeviceParameters, compute_scratch_bytes), 28);
+        assert_eq!(offset_of!(CreateDeviceParameters, disable_geometry_shader_allocations), 32);
+    }
+
     use super::*;
     use crate::object::slot;
 

@@ -185,7 +185,7 @@ pub struct Object {
 
 #[repr(C)]
 pub struct Device {
-    vtable: &'static Table<21>,
+    vtable: &'static Table<22>,
     hub: *const Hub,
     index: usize,
     info: DeviceInfo,
@@ -225,6 +225,14 @@ fn kind(index: usize) -> u32 {
     }
 }
 
+/// What a title reads out of `GameInputDeviceInfo::deviceFamily` (`GameInput.h`:
+/// `GameInputFamilyVirtual -1`, `Aggregate 0`, `XboxOne 1`, `Xbox360 2`, `Hid 3`,
+/// `I8042 4`). A pad we hand out is a pad, not an aggregate bucket, which is
+/// what a title gating on it expects; the keyboard is a HID one.
+fn family(index: usize) -> i32 {
+    if index == KEYBOARD { 3 } else { 1 }
+}
+
 impl Device {
     fn new(index: usize) -> Device {
         let mut id = [0; 32];
@@ -234,6 +242,7 @@ impl Device {
             size: size_of::<DeviceInfo>() as u32,
             id,
             root_id: id,
+            family: family(index),
             supported_input: kind(index),
             // Low and high frequency.
             rumble_motors: if index < PADS { 0x3 } else { 0 },
@@ -1273,7 +1282,17 @@ extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     E_NOTIMPL
 }
 
-static DEVICE: Table<21> = Table([
+/// A method the header declares as returning `bool`, which the title reads as a
+/// decision: `E_NOTIMPL`'s low byte is 1, so answering it would say yes.
+extern "system" fn returns_false<const SLOT: usize>(_: *const c_void) -> u32 {
+    tracing::warn!(
+        slot = format_args!("{SLOT:#x}"),
+        "input device method not implemented; answering the bool as false"
+    );
+    0
+}
+
+static DEVICE: Table<22> = Table([
     no_interface as *const (),        // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
@@ -1281,7 +1300,7 @@ static DEVICE: Table<21> = Table([
     device_status as *const (),       // 0x20
     unsupported::<0x28> as *const (), // battery
     unsupported::<0x30> as *const (), // force feedback
-    unsupported::<0x38> as *const (), //
+    returns_false::<0x38> as *const (), // IsForceFeedbackMotorPoweredOn
     unsupported::<0x40> as *const (), //
     unsupported::<0x48> as *const (), // haptics
     set_rumble as *const (),          // 0x50
@@ -1294,7 +1313,8 @@ static DEVICE: Table<21> = Table([
     unsupported::<0x88> as *const (), //
     unsupported::<0x90> as *const (), //
     unsupported::<0x98> as *const (), //
-    unsupported::<0xa0> as *const (), //
+    returns_false::<0xa0> as *const (), // AcquireExclusiveRawDeviceAccess
+    unsupported::<0xa8> as *const (), // ReleaseExclusiveRawDeviceAccess
 ]);
 
 fn reading<'a>(this: *const Reading) -> &'a Reading {

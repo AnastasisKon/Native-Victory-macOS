@@ -961,6 +961,11 @@ mod tests {
 
     #[test]
     fn only_loopback_is_reachable() {
+        // The startup count and the ports are the process's: on the native
+        // macOS host this drives that host's Winsock by name, so it takes the
+        // turn the Winsock tests take (see `host_posix::winsock_turn`).
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        let _turn = crate::host_posix::winsock_turn();
         // Also starts Winsock for the raw calls below.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();

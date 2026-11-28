@@ -470,9 +470,39 @@ fn dump_title_memory(stats: &std::collections::HashMap<usize, [u32; 3]>) {
             let bgra = matches!(info.format, 87 | 91);
             let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
             out.extend(px.as_chunks::<4>().0.iter().flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
-            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("m{time}_{n}.ppm")), out);
+            write_dump(&dir, &format!("m{time}_{n}.ppm"), &out);
         }
     });
+}
+
+/// Writes one image of a dump switch (`VICTORY_DUMP_TITLE`, `VICTORY_DUMP_TARGETS`,
+/// `VICTORY_TRACE_PASSES`) into `dir`, making the folder first. The first write that fails is
+/// logged; later failures are not, so a bad folder costs one line, not one per image.
+fn write_dump(dir: &str, name: &str, bytes: &[u8]) -> bool {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let dir = std::path::Path::new(dir);
+    let result = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(dir.join(name), bytes));
+    if let Err(e) = &result {
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(error = %e, "dump image {} not written (later failures are not logged)", dir.join(name).display());
+        }
+    }
+    result.is_ok()
+}
+
+#[cfg(test)]
+#[test]
+fn a_dump_makes_its_folder_and_reports_a_write_it_cannot_make() {
+    let base = std::env::temp_dir().join(format!("victory-dump-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir = base.join("not/made/yet");
+    assert!(write_dump(dir.to_str().unwrap(), "p0.ppm", b"P6\n1 1\n255\n\0\0\0"));
+    assert_eq!(std::fs::read(dir.join("p0.ppm")).unwrap().len(), 14);
+    // A file where the folder should be: the write fails and says so, without a panic.
+    let blocked = base.join("file");
+    std::fs::write(&blocked, b"").unwrap();
+    assert!(!write_dump(blocked.join("sub").to_str().unwrap(), "p1.ppm", b""));
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// `VICTORY_DUMP_TARGETS=<dir>,<seconds>`: once, at the first present after that many seconds,
@@ -520,7 +550,7 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
                 }
                 let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
                 out.extend(rgb.iter().flat_map(|c| c.map(|v| if v.is_finite() && v > 0.0 { ((v / (1.0 + v)).sqrt() * 255.0) as u8 } else { 0 })));
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_{:x}_f{}.ppm", info.memory as usize, info.format)), out);
+                write_dump(&dir, &format!("t{n}_{now}_{:x}_f{}.ppm", info.memory as usize, info.format), &out);
                 tracing::info!(n, key = format!("{key:#x}"), w, h, format = info.format, max, mean = sum / count.max(1) as f64, lit = lit as f64 / (rgb.len() * 3).max(1) as f64, "target dumped");
                 continue;
             }
@@ -533,11 +563,11 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
             let bgra = matches!(info.format, 87 | 91);
             let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
             out.extend(px.as_chunks::<4>().0.iter().flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
-            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_{:x}.ppm", info.memory as usize)), out);
+            write_dump(&dir, &format!("t{n}_{now}_{:x}.ppm", info.memory as usize), &out);
             // The alpha channel as grey.
             let mut alpha = format!("P6\n{w} {h}\n255\n").into_bytes();
             alpha.extend(px.as_chunks::<4>().0.iter().flat_map(|p| [p[3], p[3], p[3]]));
-            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_{:x}_alpha.ppm", info.memory as usize)), alpha);
+            write_dump(&dir, &format!("t{n}_{now}_{:x}_alpha.ppm", info.memory as usize), &alpha);
             tracing::info!(n, key = format!("{key:#x}"), w, h, "target dumped");
         }
     });
@@ -1412,7 +1442,7 @@ fn pass_present(resource: This) {
                     out.extend(raw.chunks_exact(bpp).flat_map(|p| [p[0], p[bpp / 2], p[bpp - 1]]));
                 }
             }
-            let _ = std::fs::write(std::path::Path::new(dir).join(&name), out);
+            write_dump(dir, &name, &out);
             eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} at={:#x} nonzero={nonzero:.4}{slices}{extra} file={name}", info.format, info.memory as usize);
         }
     });

@@ -1857,3 +1857,180 @@ fn zero_count_commands_are_not_recorded_and_still_check_pipeline() {
     l.dispatch_mesh(0, 1, 1).unwrap();
     assert!(l.is_empty());
 }
+
+/// Stage-in vertex buffers, hardware index buffers, and buffer blits/fills that cross 64 KiB
+/// title-page boundaries mapped in descending pool order wrap the title's contiguous virtual
+/// pages (`resolve_span` / `resolve_or_alias`), follow page remaps, tolerate partially mapped
+/// reserved `SizeInBytes`, and ignore stale unmapped index bindings on non-indexed draws (#442).
+#[test]
+fn descending_pool_page_vertex_index_and_blit_spans_render_and_follow_remaps() {
+    let Some(h) = host() else { return };
+    const W: usize = 16;
+    const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    let page = page_size().max(16384);
+    let pool = Alias::new(8 * page).unwrap();
+    let info = PoolInfo {
+        id: 1,
+        base: pool.primary as usize,
+        len: pool.len,
+        memory_entry: None,
+    };
+    h.memory().pool_created(&info);
+    // Title pages 0..2 -> pool pages 2, 1 (descending VB); title pages 2..4 -> pool pages 5, 4
+    // (descending IB), followed by an unmapped gap after title page 3.
+    let title = TitlePages::new(&h, &pool, &info, &[2 * page, page, 5 * page, 4 * page], page);
+
+    // Poison physical pool pages 3 and 6 (immediately after pool pages 2 and 5 in the pool) so a
+    // linear pool read past the first page produces off-screen vertices and out-of-bounds indices.
+    let poison_verts = [vertex(10.0, 10.0, [0.0; 4]); 4];
+    let poison_idx = [99u16; 8];
+    // SAFETY: inside `pool.primary` while the GPU is idle.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            poison_verts.as_ptr(),
+            pool.primary.add(3 * page).cast(),
+            poison_verts.len(),
+        );
+        std::ptr::copy_nonoverlapping(
+            poison_idx.as_ptr(),
+            pool.primary.add(6 * page).cast(),
+            poison_idx.len(),
+        );
+    }
+
+    // Quad vertices straddle title page 0 -> 1 (2 vertices on page 0, 2 vertices on page 1).
+    let vb_off = page - 2 * std::mem::size_of::<Vertex>();
+    title.write(
+        vb_off,
+        &[
+            vertex(-1.0, -1.0, GREEN),
+            vertex(1.0, -1.0, GREEN),
+            vertex(-1.0, 1.0, GREEN),
+            vertex(1.0, 1.0, GREEN),
+        ],
+    );
+    // 6 uint16 indices straddle title page 2 -> 3 (first triangle on page 2, second on page 3).
+    let ib_off = 3 * page - 3 * std::mem::size_of::<u16>();
+    title.write(ib_off, &[0u16, 1, 2, 2, 1, 3]);
+
+    let pso = h
+        .render_pipeline(&RenderPipelineDesc {
+            vs: &fixture("tri_vs"),
+            ps: Some(&fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &[
+                VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
+                VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
+                VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+            ],
+            streams: &[VertexStream {
+                slot: 0,
+                stride: 32,
+                per_instance: false,
+            }],
+            color: &[Format::Rgba8Unorm],
+            depth: None,
+            depth_test: None,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
+    rt.render_target = true;
+    let color = h.texture(&rt).unwrap();
+    let white = h.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap();
+    h.backend.upload_texture(&white, 0, 0, &[255; 4], 4, 0);
+    h.register_texture(0xBEEF, &white);
+
+    let views = vec![0u32; 8 * 4];
+    let smp = vec![0u32; 4 * 4];
+    let (vstart, sstart) = (views.as_ptr() as u64, smp.as_ptr() as u64);
+    let vheap = h.heap(HeapKind::Resource, vstart, 4).unwrap();
+    let sheap = h.heap(HeapKind::Sampler, sstart, 4).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null_mut(), 0xBEEF as _, &srv, vstart);
+    let mut sw = [0u32; 27];
+    (sw[1], sw[2], sw[6], sw[7], sw[8]) = (1, 1, 3, 3, 3);
+    crate::descriptor::create_sampler_x(std::ptr::null_mut(), &sw, sstart);
+    assert!(h.mirror(vstart).unwrap() && h.mirror(sstart).unwrap());
+
+    // Pass a reserved `SizeInBytes` (8 * page) extending past the 4 mapped title pages: `resolve_span`
+    // wraps the mapped prefix rather than dropping the draw or reading only the first pool page.
+    let mut l = NativeList::default();
+    l.set_render_targets(std::slice::from_ref(&color), None);
+    l.clear_render_target(&color, [0.0, 0.0, 1.0, 1.0]);
+    l.set_graphics_pipeline(&pso, Topology::Triangles);
+    l.set_heaps(Some(&vheap), Some(&sheap));
+    l.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
+    l.set_graphics_root_table(1, &vheap, 0);
+    l.set_graphics_root_table(2, &sheap, 0);
+    l.set_vertex_buffer_sized(0, title.va + vb_off as u64, (8 * page) as u32);
+    l.set_index_buffer_sized(title.va + ib_off as u64, 12, false);
+    l.draw_indexed_instanced(6, 1, 0, 0, 0).unwrap();
+    run(&h, &[&l]);
+    assert_eq!(h.unmapped(), 0);
+
+    let mut out = vec![0u8; W * W * 4];
+    h.backend.read_texture(&color, 0, 0, &mut out, W * 4, 0);
+    let px = |o: &[u8], x: usize, y: usize| <[u8; 4]>::try_from(&o[(y * W + x) * 4..][..4]).unwrap();
+    for y in 0..W {
+        for x in 0..W {
+            assert_eq!(px(&out, x, y), [0, 255, 0, 255], "missing quad coverage at ({x}, {y})");
+        }
+    }
+
+    // Remap title page 1 (vertices 2 and 3) to pool page 7 with RED vertices and draw again, plus
+    // leave a stale unmapped index buffer before a non-indexed draw.
+    let red_tail = [vertex(-1.0, 1.0, RED), vertex(1.0, 1.0, RED)];
+    // SAFETY: inside `pool.primary` while the GPU is idle.
+    unsafe {
+        std::ptr::copy_nonoverlapping(red_tail.as_ptr(), pool.primary.add(7 * page).cast(), 2);
+    }
+    title.remap(&h, &info, &pool, 1, 7 * page, page);
+
+    let mut l2 = NativeList::default();
+    l2.set_render_targets(std::slice::from_ref(&color), None);
+    l2.clear_render_target(&color, [0.0, 0.0, 1.0, 1.0]);
+    l2.set_graphics_pipeline(&pso, Topology::Triangles);
+    l2.set_heaps(Some(&vheap), Some(&sheap));
+    l2.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
+    l2.set_graphics_root_table(1, &vheap, 0);
+    l2.set_graphics_root_table(2, &sheap, 0);
+    l2.set_vertex_buffer_sized(0, title.va + vb_off as u64, 128);
+    l2.set_index_buffer_sized(title.va + ib_off as u64, 12, false);
+    l2.draw_indexed_instanced(6, 1, 0, 0, 0).unwrap();
+    // Stale unmapped index buffer does not drop a subsequent non-indexed draw.
+    l2.set_index_buffer_sized(0xDEAD_0000, 64, false);
+    l2.draw_instanced(3, 1, 0, 0).unwrap();
+    run(&h, &[&l2]);
+    assert_eq!(h.unmapped(), 0);
+    h.backend.read_texture(&color, 0, 0, &mut out, W * 4, 0);
+    assert!(
+        (0..W).flat_map(|y| (0..W).map(move |x| (x, y))).any(|(x, y)| px(&out, x, y)[0] > 128),
+        "remapped second vertex page was not picked up"
+    );
+
+    // Multi-page Fill and Copy across descending pool pages execute on the GPU without dropping,
+    // and leave the adjacent physical pool page untouched.
+    let sentinel = 0x77u8;
+    // SAFETY: inside `pool.primary` while the GPU is idle.
+    unsafe {
+        std::ptr::write_bytes(pool.primary.add(3 * page), sentinel, 64);
+    }
+    let copy_src = page - 32;
+    let copy_dst = 3 * page - 32;
+    let mut l3 = NativeList::default();
+    l3.fill(title.va + copy_src as u64, 64, 0x5A);
+    l3.copy_buffer_region(title.va + copy_dst as u64, title.va + copy_src as u64, 64);
+    run(&h, &[&l3]);
+    assert_eq!(h.unmapped(), 0);
+    assert_eq!(title.read::<u8>(copy_dst, 64), vec![0x5Au8; 64]);
+    // SAFETY: reading the untouched sentinel in pool page 3 after GPU wait.
+    let untouched = unsafe { *pool.primary.add(3 * page) };
+    assert_eq!(untouched, sentinel, "fill over descending title pages bled into the next pool page");
+
+    drop((views, smp));
+}

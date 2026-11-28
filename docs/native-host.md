@@ -1301,6 +1301,25 @@ The "native draws so far" line counts the promotions so far as `typed_views`
 resource heaps as `resource_heaps`, to weigh what the typed views and the
 longer heaps cost.
 
+#### Stage-in vertex buffers, index buffers, and blits across non-linear title pages (`#442`)
+
+`IASetVertexBuffers` (`glue::vertex_buffers`) and `IASetIndexBuffer` (`list::state::index_buffer`)
+carry each view's `SizeInBytes` through `NativeList` to `NativeHost::prep`. Instead of resolving
+only byte `0` (`resolve(addr, 1)`), `NativeHost::resolve_span` checks the mapped prefix of
+`[addr, addr + size)` (`PoolTable::resolve_prefix`): spans whose mapped pages follow linearly in one
+pool still bind the pool buffer directly, while spans whose 64 KiB pages are mapped in descending or
+scattered pool order wrap the title's contiguous virtual pages via `NativeHost::title_alias` (even
+when a reserved buffer's `SizeInBytes` extends past its mapped tail), preventing Metal's stage-in
+vertex fetcher and hardware index fetcher from reading past the first 64 KiB page into unrelated
+pool memory. `prep` resolves `index` only for indexed draws and skips both `vertex` and `index` on
+`DrawCall::Mesh`, so stale IA bindings to later-unmapped pages do not drop non-indexed draws or mesh
+dispatches. `Copy`, `Fill`, `CopyBufferToTexture`, `CopyTextureToBuffer`, and `ExecuteIndirect`
+records/counts likewise fall back to `title_alias` (`NativeHost::resolve_or_alias`) over gapless
+non-linear title ranges, and `title_alias` caches `PoolTable::generation()` alongside the mapping
+signature (keeping up to 1024 small `< 16 MiB` wraps and 64 large `>= 16 MiB` wraps). Tested on the
+GPU in `native::tests::descending_pool_page_vertex_index_and_blit_spans_render_and_follow_remaps`
+and `native::memory::tests::resolve_prefix_handles_linear_descending_and_partially_mapped_spans`.
+
 #### A command buffer the GPU fails still pays its signals and value writes
 
 Observed: the GPU failed a command buffer (`kIOGPUCommandBufferCallbackErrorHang`), and the buffers

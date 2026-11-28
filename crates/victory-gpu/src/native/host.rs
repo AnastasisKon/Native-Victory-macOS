@@ -23,8 +23,9 @@ thread_local! {
 }
 
 /// Buffers over ranges of the title's own addresses, by `(start, end)`: the signature of the
-/// mappings they were made over, when they were last used, and the buffer.
-type TitleAliases<Buf> = RefCell<HashMap<(u64, u64), (u64, u64, Rc<Buf>)>>;
+/// mappings they were made over, the pool-table generation last verified against, when they were
+/// last used, and the buffer.
+type TitleAliases<Buf> = RefCell<HashMap<(u64, u64), (u64, u64, u64, Rc<Buf>)>>;
 
 /// Buffers in the host's own memory by `(start, key)`: their end and their wrap once made.
 type OwnBuffers<Buf> = RefCell<std::collections::BTreeMap<(u64, usize), (u64, Option<Rc<Buf>>)>>;
@@ -330,6 +331,43 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
     }
 
+    /// As [`Self::resolve`], falling back to [`Self::title_alias`] when `[addr, addr + len)` is
+    /// mapped without gaps across non-adjacent pool pages or multiple pools.
+    pub fn resolve_or_alias(&self, addr: u64, len: u64) -> Result<(Rc<B::Buffer>, *const u8), String> {
+        self.resolve(addr, len).or_else(|e| {
+            self.title_alias(addr, len)
+                .map(|(b, p, _)| (b, p))
+                .ok_or(e)
+        })
+    }
+
+    /// Resolves the mapped prefix of `[addr, addr + len)` for a hardware vertex or index buffer
+    /// view: uses the pool buffer directly when all mapped pages of the view follow linearly in one
+    /// pool, wraps the title's own virtual pages via [`Self::title_alias`] when the mapped prefix
+    /// spans descending or scattered pool pages (even if a reserved buffer's `SizeInBytes` extends
+    /// past its mapped tail), and falls back to [`Self::own_buffer`] outside every pool.
+    pub fn resolve_span(&self, addr: u64, len: u64) -> Result<(Rc<B::Buffer>, *const u8), String> {
+        let len = len.max(1);
+        crate::native::freed::check(addr, len, "resolve");
+        self.forget_released();
+        match self.memory.resolve_prefix(addr, len) {
+            Some(super::memory::ResolvedPrefix::Linear(pool, ptr)) => {
+                Ok((self.pool_buffer(pool.id, pool.base, pool.len)?, ptr))
+            }
+            Some(super::memory::ResolvedPrefix::Scattered(covered)) => {
+                if let Some((buf, ptr, _)) = self.title_alias(addr, covered) {
+                    Ok((buf, ptr))
+                } else {
+                    self.resolve(addr, 1)
+                }
+            }
+            None => self
+                .own_buffer(addr, len)
+                .or_else(|| self.own_buffer(addr, 1))
+                .ok_or_else(|| format!("title address {addr:#x}+{len:#x} {NOT_MAPPED}")),
+        }
+    }
+
     /// The wrap of the host-memory buffer ([`Self::register_own_buffer`]) holding all of
     /// `[addr, addr + len)`, made at first use and dropped when the buffer is released. It is kept
     /// out of the pool table, so the page table, the view pairs, the pool generation and the
@@ -362,7 +400,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
         // mirrors make new ones. The others stay, so a heap entry mirrored again reuses its wrap
         // (dropping them all made a new 174 MB wrap at each release, while the old ones stayed
         // alive in the heap entries and in-flight work: Metal's count rose by gigabytes).
-        self.aliases.borrow_mut().retain(|&(base, end), (sig, _, _)| self.memory.signature(base, end - base) == Some(*sig));
+        let generation = self.memory.generation();
+        self.aliases.borrow_mut().retain(|&(base, end), (sig, g, _, _)| {
+            let ok = self.memory.signature(base, end - base) == Some(*sig);
+            if ok {
+                *g = generation;
+            }
+            ok
+        });
         let mut buffers = self.buffers.borrow_mut();
         let mut c = self.contract.borrow_mut();
         for &id in &gone {
@@ -386,7 +431,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// their instances through a heap view of 174 MB whose pages the title mapped from scattered
     /// pool pages (#258); the null view gave them zeros. A wrap is reused while the mappings under
     /// it are the same ([`PoolTable::signature`]), made again when they change; every wrap a heap
-    /// entry shows is kept and 64 others at most, and those over a released pool's pages are
+    /// entry shows is kept, plus up to 1024 small wraps (`< 16 MiB`, e.g. multi-page vertex/index
+    /// buffers) and 64 large wraps (`>= 16 MiB`), and those over a released pool's pages are
     /// dropped. A range with a gap stays the null view. A wrap keeps
     /// the physical pages it was made over, so the heap entries that show one are mirrored again
     /// when the title's mappings under them change ([`Self::follow_title_pages`]).
@@ -395,9 +441,22 @@ impl<B: GraphicsBackend> NativeHost<B> {
     // its own with zero pages in the holes if a title reads a view it maps sparsely.
     fn title_alias(&self, addr: u64, len: u64) -> Option<(Rc<B::Buffer>, *const u8, u64)> {
         // Wraps kept for reuse: the heap entries that show one keep it alive themselves.
-        const KEPT: usize = 64;
+        const KEPT_SMALL: usize = 1024;
+        const KEPT_LARGE: usize = 64;
+        const LARGE_BYTES: u64 = 16 << 20;
         static USE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let (base, end) = Self::alias_range(addr, len)?;
+        let generation = self.memory.generation();
+        let now = USE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut aliases = self.aliases.borrow_mut();
+            if let Some((sig, g, used, b)) = aliases.get_mut(&(base, end))
+                && *g == generation
+            {
+                *used = now;
+                return Some((b.clone(), addr as *const u8, *sig));
+            }
+        }
         let Some(sig) = self.memory.signature(base, end - base) else {
             // A real gap: the title maps nothing at part of the view. It stays the null view.
             static GAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -406,13 +465,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
             return None;
         };
-        let now = USE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut aliases = self.aliases.borrow_mut();
-        if let Some((s, used, b)) = aliases.get_mut(&(base, end))
-            && *s == sig
         {
-            *used = now;
-            return Some((b.clone(), addr as *const u8, sig));
+            let mut aliases = self.aliases.borrow_mut();
+            if let Some((s, g, used, b)) = aliases.get_mut(&(base, end))
+                && *s == sig
+            {
+                *g = generation;
+                *used = now;
+                return Some((b.clone(), addr as *const u8, sig));
+            }
         }
         // What a large wrap costs (#267 review): the process footprint and Metal's own count.
         #[cfg(target_os = "macos")]
@@ -420,7 +481,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         #[cfg(not(target_os = "macos"))]
         let footprint = || 0usize;
         let measure = || (footprint(), self.backend.allocated_bytes());
-        let before = (len >= 16 << 20).then(measure);
+        let before = (len >= LARGE_BYTES).then(measure);
         let buf = Rc::new(self.backend.wrap_title_memory(base as *mut u8, (end - base) as usize).ok()?);
         if let Some(before) = before {
             static BIG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -429,7 +490,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 tracing::info!(addr = format!("{addr:#x}"), len, signature = format!("{sig:#x}"), footprint_before = before.0, footprint_after = after.0, metal_before = before.1, metal_after = after.1, "a large buffer view wraps the title's own pages");
             }
         }
-        if aliases.len() >= KEPT {
+        let large = end - base >= LARGE_BYTES;
+        let mut aliases = self.aliases.borrow_mut();
+        let over = if large {
+            aliases.keys().filter(|&&(b, e)| e - b >= LARGE_BYTES).count() >= KEPT_LARGE
+        } else {
+            aliases.len() >= KEPT_SMALL
+        };
+        if over {
             // Only a wrap no heap entry shows goes: one that is shown would be made again, and the
             // entry's copy would stay alive beside it.
             let shown: std::collections::HashSet<(u64, u64, u64)> = self
@@ -447,14 +515,16 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 .collect();
             if let Some(&oldest) = aliases
                 .iter()
-                .filter(|&(&(b, e), &(s, _, _))| !shown.contains(&(b, e, s)))
-                .min_by_key(|(_, (_, used, _))| *used)
+                .filter(|&(&(b, e), &(s, _, _, _))| {
+                    (e - b >= LARGE_BYTES) == large && !shown.contains(&(b, e, s))
+                })
+                .min_by_key(|(_, (_, _, used, _))| *used)
                 .map(|(k, _)| k)
             {
                 aliases.remove(&oldest);
             }
         }
-        aliases.insert((base, end), (sig, now, buf.clone()));
+        aliases.insert((base, end), (sig, generation, now, buf.clone()));
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::info!(addr = format!("{addr:#x}"), len, "a buffer view not linear in its pool reads the title's own mapping (first time)");
@@ -2294,7 +2364,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// that is non-zero, and (8-bit colour textures) the title memory detiled and the host
     /// texture, written as `<dir>/c<n>_<entry>_{title,host}.ppm`.
     #[inline(never)]
-    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[(usize, u64)], call: &victory_backend::resources::DrawCall, binding: Option<&Binding>, targets: &Targets<B>) {
+    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[(usize, u64, u32)], call: &victory_backend::resources::DrawCall, binding: Option<&Binding>, targets: &Targets<B>) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
@@ -2364,7 +2434,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 None => "unset".into(),
             })
             .collect();
-        let head = vertex.first().map(|&(_, a)| {
+        let head = vertex.first().map(|&(_, a, _)| {
             let mut b = [0u8; 32];
             super::safe_read(a as *const u8, &mut b);
             b
@@ -2454,7 +2524,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         (1..*n)
             .map(|i| {
                 let mut q = p.clone();
-                q.indirect = Some(self.resolve(first + u64::from(i) * u64::from(*stride), indirect_size(cmd))?);
+                q.indirect = Some(self.resolve_or_alias(first + u64::from(i) * u64::from(*stride), indirect_size(cmd))?);
                 if let (Some((b, at, _)), Some((_, index))) = (&p.count, count) {
                     q.count = Some((b.clone(), *at, index + i));
                 }
@@ -2488,10 +2558,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 ..
             } => {
                 if let Some(a) = indirect {
-                    p.indirect = Some(self.resolve(*a, 12)?);
+                    p.indirect = Some(self.resolve_or_alias(*a, 12)?);
                 }
                 if let Some((a, index)) = count {
-                    let (b, at) = self.resolve(*a, 4)?;
+                    let (b, at) = self.resolve_or_alias(*a, 4)?;
                     p.count = Some((b, at, *index));
                 }
                 tracing::debug!(?groups, "dispatch");
@@ -2532,10 +2602,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 ..
             } => {
                 if let Some(a) = indirect {
-                    p.indirect = Some(self.resolve(*a, indirect_size(cmd))?);
+                    p.indirect = Some(self.resolve_or_alias(*a, indirect_size(cmd))?);
                 }
                 if let Some((a, index)) = count {
-                    let (b, at) = self.resolve(*a, 4)?;
+                    let (b, at) = self.resolve_or_alias(*a, 4)?;
                     p.count = Some((b, at, *index));
                 }
                 if !vertex.is_empty() {
@@ -2573,24 +2643,28 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     None => self.root_args(root, &mut p)?,
                 }
-                for &(slot, address) in vertex {
-                    let (buffer, ptr) = self.resolve(address, 1)?;
-                    p.vertex.push((slot, buffer, ptr));
-                }
-                if let Some((a, _)) = index {
-                    p.index = Some(self.resolve(*a, 1)?);
+                if !matches!(call, DrawCall::Mesh { .. }) {
+                    for &(slot, address, size) in vertex {
+                        let (buffer, ptr) = self.resolve_span(address, u64::from(size))?;
+                        p.vertex.push((slot, buffer, ptr));
+                    }
+                    if matches!(call, DrawCall::Indexed { .. })
+                        && let Some((a, size, _)) = index
+                    {
+                        p.index = Some(self.resolve_span(*a, u64::from(*size))?);
+                    }
                 }
             }
             Cmd::Copy { dst, src, len } => {
-                p.blit.push(self.resolve(*src, *len as u64)?);
-                p.blit.push(self.resolve(*dst, *len as u64)?);
+                p.blit.push(self.resolve_or_alias(*src, *len as u64)?);
+                p.blit.push(self.resolve_or_alias(*dst, *len as u64)?);
             }
-            Cmd::Fill { dst, len, .. } => p.blit.push(self.resolve(*dst, *len as u64)?),
+            Cmd::Fill { dst, len, .. } => p.blit.push(self.resolve_or_alias(*dst, *len as u64)?),
             Cmd::CopyBufferToTexture { src, len, .. } => {
-                p.blit.push(self.resolve(*src, *len as u64)?);
+                p.blit.push(self.resolve_or_alias(*src, *len as u64)?);
             }
             Cmd::CopyTextureToBuffer { dst, len, .. } => {
-                p.blit.push(self.resolve(*dst, *len as u64)?);
+                p.blit.push(self.resolve_or_alias(*dst, *len as u64)?);
             }
             Cmd::CopyTexture { .. } | Cmd::Clear { .. } => {}
         }

@@ -71,12 +71,22 @@ pub fn switch_delta(jobs: Option<usize>) -> anyhow::Result<()> {
         strict_vccz_branch: true,
         ..base
     };
+    let paired_only = victory_shader::emit::Options {
+        paired_waves: true,
+        ..base
+    };
+    let strict_only = victory_shader::emit::Options {
+        strict_vccz_branch: true,
+        ..base
+    };
     let counts = [const { AtomicUsize::new(0) }; 4];
     // The containers a switch changes, with what the translation that refused them said.
     let changed = std::sync::Mutex::new(Vec::new());
     // What the containers refused both ways were refused for, as a run sees it today: the
     // histogram that says which refusal the next translation fix should take (top 40 kept).
     let refused_why = std::sync::Mutex::new(Vec::new());
+    // Which switch a change is down to, by [`attribution`]: paired, strict, or both together.
+    let caused_by = [const { AtomicUsize::new(0) }; 3];
     let next = AtomicUsize::new(0);
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -104,6 +114,14 @@ pub fn switch_delta(jobs: Option<usize>) -> anyhow::Result<()> {
                             }
                         }
                         if k == LOST || k == RECOVERED {
+                            // Which switch did it: each one alone, so the report names the risk an
+                            // operator carries by flipping one rather than the pair.
+                            let paired_ok =
+                                victory_shader::emit::translate_with(&container, paired_only).is_ok();
+                            let strict_ok =
+                                victory_shader::emit::translate_with(&container, strict_only).is_ok();
+                            let who = attribution(k == RECOVERED, paired_ok, strict_ok);
+                            caused_by[who].fetch_add(1, Ordering::Relaxed);
                             let name = file
                                 .file_name()
                                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
@@ -137,6 +155,13 @@ pub fn switch_delta(jobs: Option<usize>) -> anyhow::Result<()> {
     println!("  recovered by switches  {recovered} (refused today, translated with them)");
     println!("  lost by switches       {lost} (translated today, refused with them)");
     println!("  refused both ways      {refused}");
+    let [by_paired, by_strict, by_both] = caused_by.map(|c| c.load(Ordering::Relaxed));
+    if by_paired + by_strict + by_both != 0 {
+        println!("changes by switch:");
+        println!("  the paired form alone  {by_paired}");
+        println!("  the strict vccz alone  {by_strict}");
+        println!("  neither switch alone   {by_both}");
+    }
     println!("switches     paired_waves and strict_vccz_branch (VICTORY_PAIRED_WAVES, VICTORY_STRICT_VCCZ_BRANCH)");
     // Named, not only counted: a lost container is the risk a default flip carries, and the reason
     // says which refusal to look at. The first 40 of the run, as `warn_drop_pipe` does for drops.
@@ -188,6 +213,17 @@ fn reason_key(why: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Which switch a change is down to, from the two switches tried alone: 0 the paired form gives on
+/// its own what the pair gives, 1 the strict `vccz` refusal does, 2 neither does alone (each does,
+/// or only the two together do).
+fn attribution(pair_ok: bool, paired_only_ok: bool, strict_only_ok: bool) -> usize {
+    match (paired_only_ok == pair_ok, strict_only_ok == pair_ok) {
+        (true, false) => 0,
+        (false, true) => 1,
+        _ => 2,
+    }
 }
 
 /// Counted outcomes of [`switch_delta`]: translated both ways, lost, recovered, refused both ways.
@@ -268,6 +304,21 @@ mod tests {
         assert_eq!(outcome(true, false), LOST, "the switch refuses what translates today");
         assert_eq!(outcome(false, true), RECOVERED, "the switch translates what is refused today");
         assert_eq!(outcome(false, false), 3, "neither translates");
+    }
+
+    /// A change is put down to the switch that gives it alone, and to neither when only the pair
+    /// does: the report must not credit one switch with the other's work.
+    #[test]
+    fn a_change_names_the_switch_that_gives_it_alone() {
+        // A loss: the defaults translate, the pair refuses. Only the paired form refusing gives 0.
+        assert_eq!(attribution(false, false, true), 0);
+        assert_eq!(attribution(false, true, false), 1);
+        // Neither refuses alone, or each does: only the pair (or both) account for the loss.
+        assert_eq!(attribution(false, true, true), 2);
+        // A recovery: the defaults refuse, the pair translates, mirrored.
+        assert_eq!(attribution(true, true, false), 0);
+        assert_eq!(attribution(true, false, true), 1);
+        assert_eq!(attribution(true, false, false), 2);
     }
 
     /// A container a run kept is, after the warm-up, where the run looks for

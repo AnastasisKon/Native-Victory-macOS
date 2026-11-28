@@ -447,11 +447,24 @@ pub fn write_trap(c: &Context, r: &super::seh::context::ExceptionRecord) -> bool
     let Some((page, watched)) = groups.iter().find(|(page, _)| *page == at & !0xfff) else {
         return false;
     };
-    if watched.contains(&(at & !7)) {
-        let base = unwind::image_base_of(c.rip as usize).unwrap_or(0);
-        let chain = super::seh::backtrace(*c, None);
-        let chain: Vec<usize> = chain.iter().map(|&pc| pc.wrapping_sub(base)).collect();
-        tracing::warn!("write to {at:#x} from image+ {:x?}", chain);
+    // A watched address always names its writer; a group with no addresses hunts for one, so every
+    // write to the page is named — throttled, since a page the title writes in a loop would
+    // otherwise fill the log with the one writer.
+    if watched.is_empty() || watched.contains(&(at & !7)) {
+        if watched.contains(&(at & !7)) {
+            let base = unwind::image_base_of(c.rip as usize).unwrap_or(0);
+            let chain = super::seh::backtrace(*c, None);
+            let chain: Vec<usize> = chain.iter().map(|&pc| pc.wrapping_sub(base)).collect();
+            tracing::warn!("write to {at:#x} from image+ {:x?}", chain);
+        } else if note_unwatched(unwatched_key(at)) {
+            let base = unwind::image_base_of(c.rip as usize).unwrap_or(0);
+            let chain = super::seh::backtrace(*c, None);
+            let chain: Vec<usize> = chain.iter().map(|&pc| pc.wrapping_sub(base)).collect();
+            tracing::warn!(
+                "write to {at:#x} (no address named for this page) from image+ {:x?}",
+                chain
+            );
+        }
     }
     unsafe extern "C" {
         fn mprotect(addr: *mut std::ffi::c_void, len: usize, prot: i32) -> i32;
@@ -461,7 +474,32 @@ pub fn write_trap(c: &Context, r: &super::seh::context::ExceptionRecord) -> bool
     true
 }
 
-/// The trapped pages and the addresses whose writes are logged, from `VICTORY_TRAP_WRITES`.
+/// The word a write to a trapped page with no watched addresses is counted under: the address
+/// itself, so one log line per place the title writes, not one per write.
+fn unwatched_key(at: usize) -> usize {
+    at & !7
+}
+
+/// Whether this place should be logged: the first few writes there, then every five-hundredth, so a
+/// hunt over a page the title writes constantly still names every writer it has.
+fn note_unwatched(key: usize) -> bool {
+    const NAMED: u64 = 4;
+    const BETWEEN: u64 = 512;
+    static SEEN: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    match seen.iter_mut().find(|(of, _)| *of == key) {
+        Some((_, n)) => {
+            *n += 1;
+            *n <= NAMED || n.is_multiple_of(BETWEEN)
+        }
+        None => {
+            seen.push((key, 1));
+            true
+        }
+    }
+}
+
+/// The trapped pages and the addresses whose writes are logged, from `VICTORY_TRAP_WRITES`./// The trapped pages and the addresses whose writes are logged, from `VICTORY_TRAP_WRITES`.
 fn trap_spec() -> Option<&'static Vec<(usize, Vec<usize>)>> {
     use std::sync::OnceLock;
     static SPEC: OnceLock<Option<Vec<(usize, Vec<usize>)>>> = OnceLock::new();
@@ -496,13 +534,50 @@ pub fn start_write_trap() {
     unsafe extern "C" {
         fn mprotect(addr: *mut std::ffi::c_void, len: usize, prot: i32) -> i32;
     }
+    // Armed here, before the title's first thread exists: a page written once early was missed
+    // while the arming waited for this thread to be scheduled, which read as "nothing writes it".
+    let mut late: Vec<usize> = Vec::new();
+    for page in &pages {
+        // SAFETY: the page the spec named, which the caller is watching.
+        if unsafe { mprotect(*page as *mut _, 0x1000, 1) } == 0 {
+            tracing::info!(
+                page = format_args!("{page:#x}"),
+                watched = groups
+                    .iter()
+                    .find(|(p, _)| p == page)
+                    .map_or(0, |(_, w)| w.len()),
+                "write trap: page armed read-only (VICTORY_TRAP_WRITES)"
+            );
+        } else {
+            tracing::warn!(
+                page = format_args!("{page:#x}"),
+                "write trap: the page is not mapped yet; the thread arms it when it is"
+            );
+            late.push(*page);
+        }
+    }
+    // While a page is still unarmed the thread asks again every twenty microseconds: an object
+    // created by one block copy writes all its fields in that copy, and a page armed a third of a
+    // millisecond after it appears misses exactly that — which reads as "nothing fills the field".
     std::thread::spawn(move || {
         loop {
             for page in &pages {
-                // SAFETY: the image's own data page.
-                unsafe { mprotect(*page as *mut _, 0x1000, 1) };
+                // SAFETY: the page the spec named, which the caller is watching.
+                let ok = unsafe { mprotect(*page as *mut _, 0x1000, 1) } == 0;
+                if ok && late.contains(page) {
+                    tracing::info!(
+                        page = format_args!("{page:#x}"),
+                        "write trap: page armed read-only, late (VICTORY_TRAP_WRITES)"
+                    );
+                }
             }
-            std::thread::sleep(Duration::from_micros(300));
+            late.retain(|page| {
+                // SAFETY: as above; the check only asks the mapping to become read-only again.
+                let refused = unsafe { mprotect(*page as *mut _, 0x1000, 1) } != 0;
+                refused
+            });
+            let wait = if late.is_empty() { 300 } else { 20 };
+            std::thread::sleep(Duration::from_micros(wait));
         }
     });
 }
@@ -513,6 +588,17 @@ mod tests {
     use std::sync::mpsc::channel;
 
     use super::*;
+
+    /// A page hunted without a named address logs each place a few times and then rarely, so a hot
+    /// page still names every writer without filling the log with one of them.
+    #[test]
+    fn an_unwatched_page_names_each_place_it_is_written() {
+        let key = 0xdead_0000; // this test's own, so the shared counter is not disturbed
+        let logged: Vec<u64> = (1..=6).map(|_| u64::from(note_unwatched(key))).collect();
+        assert_eq!(logged, vec![1, 1, 1, 1, 0, 0]);
+        // Another place on the same page is counted on its own.
+        assert!(note_unwatched(key + 8));
+    }
 
     /// The write trap takes one group of a page and its addresses, or several separated by `;`,
     /// and keeps the form it had before groups existed (`<page>,<addr>,...`).

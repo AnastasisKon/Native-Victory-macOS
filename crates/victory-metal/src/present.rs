@@ -83,19 +83,21 @@ pub struct Surface {
     frames: std::cell::Cell<u64>,
     /// `VICTORY_COUNT_GREEN` state: pixel probes of frames the GPU has not finished, and pacing.
     green: RefCell<GreenCount>,
-    /// The MetalFX spatial scaler of the last sizes and formats seen, with the texture it scales
-    /// into (`VICTORY_METALFX=spatial`).
+    /// The MetalFX spatial scaler of the last sizes and formats seen (`VICTORY_METALFX=spatial`),
+    /// and the texture it scales into when a frame has a plane to composite over the first.
     metalfx: RefCell<Option<Scaled>>,
 }
 
-/// A MetalFX spatial scaler and the texture it writes: one per input and output size and format.
+/// One MetalFX spatial scaler for an input and output size and format, and the texture it scales
+/// into: only a frame with more than one plane needs that one, since a single plane is scaled
+/// straight into the drawable.
 struct Scaled {
     input: (usize, usize),
     output: (usize, usize),
     color: MTLPixelFormat,
     out: MTLPixelFormat,
     scaler: crate::metalfx::Spatial,
-    target: Retained<ProtocolObject<dyn MTLTexture>>,
+    target: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
 }
 
 /// `VICTORY_METALFX=spatial`: the title's plane is scaled up by MetalFX instead of being sampled
@@ -121,21 +123,26 @@ fn metalfx_spatial() -> bool {
 
 #[cfg(test)]
 static TEST_METALFX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Full-screen triangles drawn, which is how a test sees that MetalFX filled a single-plane frame
+/// itself and the pass was skipped.
+#[cfg(test)]
+static TRIANGLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(test)]
 fn set_metalfx_for_test(on: bool) {
     TEST_METALFX.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The texture the present pass should sample: `src` scaled up by MetalFX when the switch is on
-/// and the sizes differ, else `None` (the caller samples `src` itself). A format MetalFX or the
-/// present triangle cannot take falls back, once, with a line saying why.
-fn metalfx_up(
+/// The scaler for `src`'s size and format into `target`'s, made if the cache holds another one.
+/// `None` when the switch is off, the sizes already match, or a format is one MetalFX or the
+/// present triangle cannot take: the triangle draws the plane, and the first such format says why
+/// once. The cache is lent out so the caller can encode with it.
+fn metalfx_scaler<'a>(
     m: &Metal,
-    surface: &Surface,
-    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    surface: &'a Surface,
     src: &ProtocolObject<dyn MTLTexture>,
     target: &ProtocolObject<dyn MTLTexture>,
-) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+) -> Option<std::cell::RefMut<'a, Option<Scaled>>> {
     if !metalfx_spatial() {
         return None;
     }
@@ -157,9 +164,9 @@ fn metalfx_up(
         return None;
     }
     let mut cache = surface.metalfx.borrow_mut();
-    let stale = cache.as_ref().is_none_or(|c| {
-        c.input != input || c.output != output || c.color != color || c.out != out
-    });
+    let stale = cache
+        .as_ref()
+        .is_none_or(|c| c.input != input || c.output != output || c.color != color || c.out != out);
     if stale {
         let scaler = match crate::metalfx::Spatial::new(&m.dev, input, output, color, out) {
             Ok(Some(scaler)) => scaler,
@@ -172,26 +179,66 @@ fn metalfx_up(
                 return None;
             }
         };
-        // SAFETY: a fresh descriptor; Metal validates the sizes at creation.
-        let d = unsafe {
-            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                out,
-                output.0,
-                output.1,
-                false,
-            )
-        };
-        d.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
-        d.setStorageMode(MTLStorageMode::Private);
-        let Some(texture) = m.dev.newTextureWithDescriptor(&d) else {
-            warn_fallback("no texture for the scaled frame".into());
-            return None;
-        };
-        *cache = Some(Scaled { input, output, color, out, scaler, target: texture });
+        *cache = Some(Scaled { input, output, color, out, scaler, target: None });
     }
-    let scaled = cache.as_ref()?;
-    scaled.scaler.encode(cb, src, &scaled.target);
-    Some(scaled.target.clone())
+    Some(cache)
+}
+
+/// Scales `src` straight into `target` on `cb`, which is the drawable of a frame with a single
+/// plane: nothing is left to draw over it, so the present triangle is skipped and a frame costs one
+/// full-screen write instead of a write into an intermediate plus a sampled read of it. False when
+/// MetalFX cannot take the frame, and the caller draws it as it did before.
+fn metalfx_into(
+    m: &Metal,
+    surface: &Surface,
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    target: &ProtocolObject<dyn MTLTexture>,
+) -> bool {
+    let Some(cache) = metalfx_scaler(m, surface, src, target) else {
+        return false;
+    };
+    let Some(scaled) = cache.as_ref() else {
+        return false;
+    };
+    scaled.scaler.encode(cb, src, target);
+    true
+}
+
+/// The texture the present pass should sample: `src` scaled up by MetalFX when the switch is on
+/// and the sizes differ, else `None` (the caller samples `src` itself). For a frame with a plane to
+/// composite over the first, which cannot be scaled straight into the drawable.
+fn metalfx_up(
+    m: &Metal,
+    surface: &Surface,
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    target: &ProtocolObject<dyn MTLTexture>,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    let mut cache = metalfx_scaler(m, surface, src, target)?;
+    let scaled = cache.as_mut()?;
+    let (output, out) = (scaled.output, scaled.out);
+    let written = match scaled.target.clone() {
+        Some(texture) => texture,
+        None => {
+            // SAFETY: a fresh descriptor; Metal validates the sizes at creation.
+            let d = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                    out, output.0, output.1, false,
+                )
+            };
+            d.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
+            d.setStorageMode(MTLStorageMode::Private);
+            let Some(texture) = m.dev.newTextureWithDescriptor(&d) else {
+                warn_fallback("no texture for the scaled frame".into());
+                return None;
+            };
+            scaled.target = Some(texture.clone());
+            texture
+        }
+    };
+    scaled.scaler.encode(cb, src, &written);
+    Some(written)
 }
 
 /// One line the first time MetalFX cannot be used, then silence: a per-frame warning would bury
@@ -469,33 +516,45 @@ impl PresentBackend for Metal {
             // swap chain holds display values).
             let src = first.view_without_srgb(self);
             let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
+            // MetalFX with one plane: it fills the drawable itself, so the triangle below has
+            // nothing left to do and is skipped (a frame with a second plane cannot: that one is
+            // composited over the first by the triangle, which samples the scaled plane instead).
+            let direct = sources.len() == 1 && metalfx_into(self, surface, &cb, &src, &target);
             // The plane scaled up by MetalFX, when it is asked for: the triangle then samples that
             // instead of taking the plane with its bilinear fetch.
-            let src = match metalfx_up(self, surface, &cb, &src, &target) {
-                Some(scaled) => scaled,
-                None => src,
+            let src = if direct {
+                src
+            } else {
+                match metalfx_up(self, surface, &cb, &src, &target) {
+                    Some(scaled) => scaled,
+                    None => src,
+                }
             };
-            let pass = MTLRenderPassDescriptor::new();
-            // SAFETY: colour attachment 0 always exists.
-            let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
-            a.setTexture(Some(&target));
-            a.setLoadAction(MTLLoadAction::DontCare);
-            a.setStoreAction(MTLStoreAction::Store);
-            let e = cb
-                .renderCommandEncoderWithDescriptor(&pass)
-                .ok_or("no render encoder")?;
-            for (i, source) in sources.iter().enumerate() {
-                let view = if i == 0 { src.clone() } else { source.view_without_srgb(self) };
-                let state = pipeline(self, surface, target.pixelFormat(), i > 0)?;
-                e.setRenderPipelineState(&state);
-                // SAFETY: slot 0 of the fragment stage takes the source texture.
-                unsafe { e.setFragmentTexture_atIndex(Some(&view), 0) };
-                // SAFETY: three vertices, no buffers.
-                unsafe {
-                    e.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3)
-                };
+            if !direct {
+                #[cfg(test)]
+                TRIANGLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let pass = MTLRenderPassDescriptor::new();
+                // SAFETY: colour attachment 0 always exists.
+                let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+                a.setTexture(Some(&target));
+                a.setLoadAction(MTLLoadAction::DontCare);
+                a.setStoreAction(MTLStoreAction::Store);
+                let e = cb
+                    .renderCommandEncoderWithDescriptor(&pass)
+                    .ok_or("no render encoder")?;
+                for (i, source) in sources.iter().enumerate() {
+                    let view = if i == 0 { src.clone() } else { source.view_without_srgb(self) };
+                    let state = pipeline(self, surface, target.pixelFormat(), i > 0)?;
+                    e.setRenderPipelineState(&state);
+                    // SAFETY: slot 0 of the fragment stage takes the source texture.
+                    unsafe { e.setFragmentTexture_atIndex(Some(&view), 0) };
+                    // SAFETY: three vertices, no buffers.
+                    unsafe {
+                        e.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3)
+                    };
+                }
+                e.endEncoding();
             }
-            e.endEncoding();
             let probe = if counting_green() { probe_pixels(self, &cb, &src) } else { None };
             cb.presentDrawable(ProtocolObject::from_ref(&*drawable));
             cb.commit();
@@ -626,12 +685,96 @@ mod tests {
         assert!(metal.wait(&fence, 1, 5000));
         let (w, h, bgra) = surface.read_last().unwrap();
         assert_eq!((w, h), (8, 8));
-        for (x, y) in [(2, 2), (5, 2), (2, 5), (5, 5)] {
+        // The corners too: MetalFX writes every pixel it is handed, so nothing of an earlier frame
+        // shows through.
+        for (x, y) in [(0, 0), (7, 0), (0, 7), (7, 7), (2, 2), (5, 2), (2, 5), (5, 5)] {
             let at = (y * w + x) * 4;
             let px = &bgra[at..at + 4];
             assert!(
                 px[2] > 200 && px[0] < 60 && px[1] < 60,
                 "the plane at ({x}, {y}) is red: {px:?}"
+            );
+        }
+    }
+
+    /// A single-plane frame goes straight into the drawable: MetalFX fills it and no full-screen
+    /// triangle is drawn, where the same frame without the switch draws one (so the count below is
+    /// reading the pass and not a constant).
+    #[test]
+    fn metalfx_fills_a_single_plane_frame_without_the_triangle() {
+        use crate::backend::Submission;
+        let _turn = PRESENTING.lock().unwrap_or_else(|e| e.into_inner());
+        if !crate::metalfx::spatial() {
+            return;
+        }
+        let Ok(metal) = Metal::new() else { return };
+        let layer = metal.create_layer(8, 8);
+        let surface = metal.create_surface(layer.as_ptr()).unwrap();
+        let queue = metal.create_queue().unwrap();
+        let picture = metal.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        metal.upload_texture(&picture, 0, 0, &[255, 0, 0, 255].repeat(4), 8, 16);
+        let fence = metal.create_fence(0).unwrap();
+        let one = || {
+            metal
+                .submit(
+                    &queue,
+                    &Submission { waits: &[], dispatches: &[], signals: &[(&fence, 1)] },
+                )
+                .unwrap();
+            assert!(metal.wait(&fence, 1, 5000));
+            super::TRIANGLES.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let before = one();
+        set_metalfx_for_test(true);
+        metal.present(&queue, &surface, &[&picture]).unwrap();
+        let after_metalfx = one();
+        set_metalfx_for_test(false);
+        assert_eq!(after_metalfx, before, "MetalFX filled the drawable, no triangle was drawn");
+        // The switch off: the triangle draws the plane, which is what the count has to see.
+        metal.present(&queue, &surface, &[&picture]).unwrap();
+        assert_eq!(one(), before + 1, "the triangle draws the plane when MetalFX is off");
+    }
+
+    /// With a second plane there is something to composite over the scaled first one, so the
+    /// triangle stays and samples MetalFX's scaled frame (through the texture it scales into).
+    #[test]
+    fn metalfx_scales_the_plane_under_a_second_one() {
+        use crate::backend::Submission;
+        let _turn = PRESENTING.lock().unwrap_or_else(|e| e.into_inner());
+        if !crate::metalfx::spatial() {
+            return;
+        }
+        let Ok(metal) = Metal::new() else { return };
+        let layer = metal.create_layer(8, 8);
+        let surface = metal.create_surface(layer.as_ptr()).unwrap();
+        let queue = metal.create_queue().unwrap();
+        let picture = metal.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        metal.upload_texture(&picture, 0, 0, &[255, 0, 0, 255].repeat(4), 8, 16);
+        // Opaque blue on the right half of a 4x4 plane, transparent on the left.
+        let overlay = metal.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 4, 4)).unwrap();
+        let row: Vec<u8> = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 255, 255], [0, 0, 255, 255]].concat();
+        metal.upload_texture(&overlay, 0, 0, &row.repeat(4), 16, 64);
+        set_metalfx_for_test(true);
+        let presented = metal.present(&queue, &surface, &[&picture, &overlay]);
+        set_metalfx_for_test(false);
+        presented.unwrap();
+        let fence = metal.create_fence(0).unwrap();
+        metal
+            .submit(&queue, &Submission { waits: &[], dispatches: &[], signals: &[(&fence, 1)] })
+            .unwrap();
+        assert!(metal.wait(&fence, 1, 5000));
+        let (w, _h, bgra) = surface.read_last().unwrap();
+        let px = |x: usize, y: usize| {
+            let at = (y * w + x) * 4;
+            bgra[at..at + 4].to_vec()
+        };
+        for y in [1, 6] {
+            let red = px(1, y);
+            assert!(red[2] > 200 && red[0] < 60, "the scaled plane at (1, {y}): {red:?}");
+            let blue = px(6, y);
+            assert!(
+                blue[0] > 200 && blue[2] < 60,
+                "the overlay over it at (6, {y}): {blue:?}"
             );
         }
     }

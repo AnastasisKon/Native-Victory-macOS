@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use crate::structure::Map;
 
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
 

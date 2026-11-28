@@ -275,7 +275,16 @@ pub fn build_bounded(
         });
     }
     split_irreducible(&mut blocks)?;
+    Ok(rename(blocks, wave64, vgprs))
+}
 
+/// The SSA form of `blocks`, linked and reducible, whose instructions'
+/// reads and writes name their registers (their values are made here; any
+/// values and phis they had are replaced).
+fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
+    for block in &mut blocks {
+        block.phis.clear();
+    }
     let order = reverse_postorder(&blocks);
     let (live_in, live_out) = liveness(&blocks, &order);
     let mut values = 0u32;
@@ -334,13 +343,13 @@ pub fn build_bounded(
         }
     }
     remove_trivial_phis(&mut blocks, values);
-    Ok(Program {
+    Program {
         wave64,
         vgprs,
         blocks,
         inputs,
         thread_counts: false,
-    })
+    }
 }
 
 /// Placeholder before renaming.

@@ -683,7 +683,7 @@ The Windows/Wine path and its D3D12 backend read these; the native host does not
 
 The first-chance log (`seh::dispatch`) shows a breakpoint's `rip` as the `int3` itself, as Windows x64 does.
 
-Instructions Rosetta does not run are skipped or emulated by the SIGILL path in `seh::signal`: `clwb`/`clflushopt` (skipped; a whole `clwb [p]; add p, 0x40; cmp p, limit; jbe/jb` flush loop is skipped in one signal, since the title flushes buffers of many megabytes a line at a time), `clzero` (zeroes the line, or the whole clearing loop), `monitorx`/`mwaitx` (skipped, the latter yields), `rdpid` (TSC_AUX into the register, as 0: nothing here pins a thread to a core, so one processor number is the truth and it is the same for the thread's whole life), and the SSE4a `insertq`/`extrq` (run on the saved XMM registers; the title uses `insertq` once its world loads).
+Instructions Rosetta does not run are skipped or emulated by the SIGILL path in `seh::signal`: `clwb`/`clflushopt` (skipped; a whole `clwb [p]; add p, 0x40; cmp p, limit; jbe/jb` flush loop is skipped in one signal, since the title flushes buffers of many megabytes a line at a time), `clzero` (zeroes the line, or the whole clearing loop), `monitorx`/`mwaitx` (skipped, the latter yields), `rdpid` (TSC_AUX into the register, as 0: nothing here pins a thread to a core, so one processor number is the truth and it is the same for the thread's whole life), `rdpru` (MPERF or APERF into `edx:eax`, as the time-stamp counter for both — a core that never changes frequency — and 0 for a counter it does not know), and the SSE4a `insertq`/`extrq` (run on the saved XMM registers; the title uses `insertq` once its world loads).
 
 ## Sweeping a shader corpus
 

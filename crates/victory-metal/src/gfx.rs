@@ -39,6 +39,19 @@ fn render_stages(bits: u8) -> MTLRenderStages {
     s
 }
 
+/// What a MetalFX upscale is made for, in the cache of them: the two sizes, the formats and
+/// whether it accumulates. A frame with other sizes or formats gets its own scaler.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct MetalFxKey {
+    pub(crate) input: (usize, usize),
+    pub(crate) output: (usize, usize),
+    pub(crate) color: usize,
+    pub(crate) depth: usize,
+    pub(crate) motion: usize,
+    pub(crate) out: usize,
+    pub(crate) temporal: bool,
+}
+
 /// A fence chaining the encoders of one command buffer, and whether one has run: what a pass waits
 /// for and updates when the queue's buffers are made resident by a set instead of named.
 struct Order {
@@ -1601,6 +1614,7 @@ fn ops_in(passes: &[Pass<'_, Metal>]) -> usize {
             Pass::Render(rp) => rp.draws.len(),
             Pass::Blit(ops) => ops.len(),
             Pass::ClearColorRects { .. } => 0,
+            Pass::MetalFx(_) => 0,
         })
         .sum()
 }
@@ -1721,7 +1735,12 @@ impl GraphicsBackend for Metal {
         // event. A piece the GPU fails pays its own share on the CPU, once ([`Owed`]), so the
         // later pieces still run and nothing is paid twice.
         let per = self.passes_per_buffer;
-        let pieces = if per > 0 && work.passes.len() > per {
+        // A MetalFX encode takes the whole command buffer (`encodeToCommandBuffer`), so it can
+        // neither wait on nor update the fence the other encoders order through: it ends the
+        // command buffer it is in, and the piece event orders what follows it. That is what makes
+        // it safe in a residency-set submission, where the encoders do not name what they reach.
+        let metalfx = work.passes.iter().any(|p| matches!(p, Pass::MetalFx(_)));
+        let pieces = if (per > 0 && work.passes.len() > per) || metalfx {
             Some(track_event(self.dev.newSharedEvent().ok_or_else(|| SubmitFailure::uncommitted("newSharedEvent failed"))?))
         } else {
             None
@@ -1740,6 +1759,7 @@ impl GraphicsBackend for Metal {
                 Pass::ClearColorRects { target, color, rects } => {
                     self.encode_color_clear_rects(&cb, target, *color, rects, set_on_queue, order, &mut attached_heaps, timing.as_mut())
                 }
+                Pass::MetalFx(upscale) => self.encode_metalfx(&cb, upscale, order, timing.as_mut()),
             };
             if let Err(e) = encoded {
                 // A pass that cannot be encoded (a render target with no attachments, a piece
@@ -1754,11 +1774,13 @@ impl GraphicsBackend for Metal {
                     first_error = Some(e);
                 }
             }
+            let ends = per > 0 && (n + 1) % per == 0;
+            let after_metalfx = matches!(pass, Pass::MetalFx(_));
             if let Some(event) = &pieces
-                && (n + 1) % per == 0
+                && (ends || after_metalfx)
                 && n + 1 < work.passes.len()
             {
-                let piece = ((n + 1) / per) as u64;
+                let piece = u64::try_from(n + 1).unwrap_or(u64::MAX);
                 // This piece's refused fills first, then its piece event (#80, GPU order).
                 if !refused_fills.is_empty() {
                     let _ = self.encode_blit(&cb, &refused_fills, order, timing.as_mut());
@@ -3335,6 +3357,95 @@ impl Metal {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Encodes one MetalFX upscale into `cb`. The scaler is made for the sizes, formats and mode
+    /// the pass names and kept for the frames after it.
+    ///
+    /// There is no fence to wait on or update around a MetalFX encode (`encodeToCommandBuffer`
+    /// takes the whole command buffer), so `submit_passes` ends the command buffer it is in and
+    /// orders the next one by the piece event.
+    fn encode_metalfx(
+        &self,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        upscale: &MetalFx<'_, Metal>,
+        _order: Ordering<'_>,
+        _timing: Option<&mut PassTiming>,
+    ) -> Result<(), String> {
+        let (color, out) = (upscale.color, upscale.out);
+        let temporal = match (upscale.depth, upscale.motion) {
+            (Some(depth), Some(motion)) => Some((depth, motion)),
+            (None, None) => None,
+            _ => return Err("a MetalFX upscale takes both depth and motion vectors, or neither".into()),
+        };
+        // What MetalFX will read and write, named as Metal needs it: the inputs sampled, the
+        // output written.
+        for (texture, what) in [(color, "color"), (out, "output")] {
+            if texture.tex.sampleCount() != 1
+                || texture.tex.textureType() != MTLTextureType::Type2D
+            {
+                return Err(format!("a MetalFX upscale needs single-sampled 2D textures ({what})"));
+            }
+        }
+        if !color.tex.usage().contains(MTLTextureUsage::ShaderRead)
+            || !out.tex.usage().contains(MTLTextureUsage::RenderTarget)
+        {
+            return Err(
+                "a MetalFX upscale needs its color sampled and its output a render target".into(),
+            );
+        }
+        let key = MetalFxKey {
+            input: (color.tex.width(), color.tex.height()),
+            output: (out.tex.width(), out.tex.height()),
+            color: color.tex.pixelFormat().0,
+            depth: temporal.map_or(0, |(d, _)| d.tex.pixelFormat().0),
+            motion: temporal.map_or(0, |(_, m)| m.tex.pixelFormat().0),
+            out: out.tex.pixelFormat().0,
+            temporal: temporal.is_some(),
+        };
+        if self.metalfx.borrow().get(&key).is_none() {
+            let formats = match temporal {
+                Some((depth, motion)) => crate::metalfx::Formats {
+                    color: color.tex.pixelFormat(),
+                    depth: depth.tex.pixelFormat(),
+                    motion: motion.tex.pixelFormat(),
+                    out: out.tex.pixelFormat(),
+                },
+                None => crate::metalfx::Formats::spatial(
+                    color.tex.pixelFormat(),
+                    out.tex.pixelFormat(),
+                ),
+            };
+            let asked = if temporal.is_some() {
+                crate::metalfx::Mode::Temporal
+            } else {
+                crate::metalfx::Mode::Spatial
+            };
+            match crate::metalfx::Upscale::new(&self.dev, asked, key.input, key.output, formats)? {
+                Some(made) => {
+                    self.metalfx.borrow_mut().insert(key, made);
+                }
+                None => return Err("this system has no MetalFX upscaler".into()),
+            }
+        }
+        let cache = self.metalfx.borrow();
+        let scaler = cache.get(&key).ok_or("the MetalFX upscale went missing")?;
+        let view = crate::metalfx::View {
+            jitter: upscale.jitter,
+            motion_scale: upscale.motion_scale,
+            reset: upscale.reset,
+        };
+        let inputs = match temporal {
+            Some((depth, motion)) => crate::metalfx::Inputs::ColorDepthMotion {
+                depth: depth.mtl(),
+                motion: motion.mtl(),
+            },
+            None => crate::metalfx::Inputs::ColorOnly,
+        };
+        if !scaler.encode(cb, color.mtl(), inputs, out.mtl(), view) {
+            return Err("the MetalFX upscale would not take this frame".into());
+        }
+        Ok(())
+    }
+
     fn encode_color_clear_rects(
         &self,
         cb: &ProtocolObject<dyn MTLCommandBuffer>,

@@ -38,6 +38,11 @@ pub struct Metal {
     /// The most passes of a submission in one command buffer (`VICTORY_PASSES_PER_BUFFER`;
     /// default 0: no limit).
     pub(crate) passes_per_buffer: usize,
+    /// The MetalFX upscales made for `Pass::MetalFx` so far, by sizes, formats and mode: a scaler
+    /// is made for a pair of sizes and formats and reused for every frame after.
+    pub(crate) metalfx: std::cell::RefCell<
+        std::collections::HashMap<crate::gfx::MetalFxKey, crate::metalfx::Upscale>,
+    >,
     /// `VICTORY_METAL_REQUEST_RESIDENCY=1`: each heap's set asks to stay resident between the
     /// command buffers that use it (`requestResidency` after each commit), instead of being made
     /// resident again for each one.
@@ -468,6 +473,7 @@ impl Metal {
             trace_args: Default::default(),
             gate: Default::default(),
             samplers: Default::default(),
+            metalfx: Default::default(),
         })
     }
 

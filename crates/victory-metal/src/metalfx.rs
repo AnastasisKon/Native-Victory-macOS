@@ -164,6 +164,31 @@ impl Formats {
     }
 }
 
+/// What a scaler is told about one frame besides its textures: where the frame's projection was
+/// jittered, how its motion vectors are scaled, and whether the history must be dropped. A
+/// temporal upscale accumulates across frames, so these are what keep it from smearing; a spatial
+/// one reads none of them.
+#[derive(Clone, Copy)]
+pub struct View {
+    /// In pixels of the input, the offset the frame was rendered with.
+    pub jitter: [f32; 2],
+    /// Multiplied with the motion vectors before they are used. The title's FidelityFX dispatch
+    /// carries a scale of its own, and MetalFX takes the vectors in pixels of the render target.
+    pub motion_scale: [f32; 2],
+    /// Drop the history: the first frame, and after a cut or a teleport.
+    pub reset: bool,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self {
+            jitter: [0.0; 2],
+            motion_scale: [1.0; 2],
+            reset: true,
+        }
+    }
+}
+
 /// What one frame hands an [`Upscale`]: its colour, and, in [`Mode::Temporal`], its depth and its
 /// motion vectors.
 pub enum Inputs<'a> {
@@ -258,7 +283,7 @@ impl Upscale {
         color: &ProtocolObject<dyn MTLTexture>,
         inputs: Inputs<'_>,
         out: &ProtocolObject<dyn MTLTexture>,
-        reset: bool,
+        view: View,
     ) -> bool {
         match (&self.which, inputs) {
             (Which::Spatial(s), _) => {
@@ -266,7 +291,7 @@ impl Upscale {
                 true
             }
             (Which::Temporal(t), Inputs::ColorDepthMotion { depth, motion }) => {
-                t.encode(cb, color, depth, motion, out, reset);
+                t.encode(cb, color, depth, motion, out, view);
                 true
             }
             (Which::Temporal(_), Inputs::ColorOnly) => false,
@@ -325,12 +350,8 @@ impl Temporal {
         Ok(Some(Self { object }))
     }
 
-    /// Scales `color` into `out` on `cb`, from this frame's `depth` and `motion` vectors. `reset`
-    /// goes on the first frame and after a cut: history from before one would smear across it.
-    ///
-    /// The jitter offset is left at zero, and the motion vectors are taken to be in pixels. A
-    /// caller whose vectors are in another unit, or that jitters its projection, sets
-    /// `motionVectorScaleX`/`Y` and `jitterOffsetX`/`Y` itself; this is the plain per-frame path.
+    /// Scales `color` into `out` on `cb`, from this frame's `depth` and `motion` vectors, with
+    /// `view`'s jitter, motion-vector scale and reset.
     pub fn encode(
         &self,
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
@@ -338,7 +359,7 @@ impl Temporal {
         depth: &ProtocolObject<dyn MTLTexture>,
         motion: &ProtocolObject<dyn MTLTexture>,
         out: &ProtocolObject<dyn MTLTexture>,
-        reset: bool,
+        view: View,
     ) {
         // SAFETY: the scaler's own messages, with textures of the sizes and formats it was made
         // for; the command buffer is the caller's.
@@ -347,11 +368,11 @@ impl Temporal {
             let _: () = msg_send![&*self.object, setDepthTexture: depth];
             let _: () = msg_send![&*self.object, setMotionTexture: motion];
             let _: () = msg_send![&*self.object, setOutputTexture: out];
-            let _: () = msg_send![&*self.object, setReset: Bool::new(reset)];
-            let _: () = msg_send![&*self.object, setMotionVectorScaleX: 1.0f32];
-            let _: () = msg_send![&*self.object, setMotionVectorScaleY: 1.0f32];
-            let _: () = msg_send![&*self.object, setJitterOffsetX: 0.0f32];
-            let _: () = msg_send![&*self.object, setJitterOffsetY: 0.0f32];
+            let _: () = msg_send![&*self.object, setReset: Bool::new(view.reset)];
+            let _: () = msg_send![&*self.object, setMotionVectorScaleX: view.motion_scale[0]];
+            let _: () = msg_send![&*self.object, setMotionVectorScaleY: view.motion_scale[1]];
+            let _: () = msg_send![&*self.object, setJitterOffsetX: view.jitter[0]];
+            let _: () = msg_send![&*self.object, setJitterOffsetY: view.jitter[1]];
             let _: () = msg_send![&*self.object, encodeToCommandBuffer: cb];
         }
     }
@@ -559,7 +580,7 @@ mod tests {
         };
         let q = m.dev.newCommandQueue().unwrap();
         let cb = q.commandBuffer().unwrap();
-        scaler.encode(&cb, &src, &src_depth, &src_motion, &dst, true);
+        scaler.encode(&cb, &src, &src_depth, &src_motion, &dst, super::View::default());
         cb.commit();
         cb.waitUntilCompleted();
         assert_eq!(
@@ -681,7 +702,7 @@ mod tests {
         let q = m.dev.newCommandQueue().unwrap();
         let cb = q.commandBuffer().unwrap();
         assert!(
-            !up.encode(&cb, &color, super::Inputs::ColorOnly, &out, true),
+            !up.encode(&cb, &color, super::Inputs::ColorOnly, &out, super::View::default()),
             "it encoded a frame it cannot accumulate from"
         );
         cb.commit();
@@ -710,7 +731,7 @@ mod tests {
         .unwrap()
         .expect("a spatial upscale where MetalFX exists");
         let cb = q.commandBuffer().unwrap();
-        assert!(spatial_only.encode(&cb, &color, super::Inputs::ColorOnly, &out, true));
+        assert!(spatial_only.encode(&cb, &color, super::Inputs::ColorOnly, &out, super::View::default()));
         cb.commit();
         cb.waitUntilCompleted();
         assert_eq!(
@@ -735,7 +756,7 @@ mod tests {
             motion: &mv,
         };
         assert!(both.takes(&inputs));
-        assert!(both.encode(&cb, &color, inputs, &out, true));
+        assert!(both.encode(&cb, &color, inputs, &out, super::View::default()));
         cb.commit();
         cb.waitUntilCompleted();
         assert_eq!(

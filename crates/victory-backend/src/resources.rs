@@ -749,6 +749,28 @@ pub enum Pass<'a, B: GraphicsBackend + ?Sized> {
         color: [f32; 4],
         rects: &'a [ClearRect],
     },
+    /// One MetalFX upscale, run in its place in the submission's order. A backend without MetalFX
+    /// refuses it like any other pass it cannot encode.
+    MetalFx(MetalFx<'a, B>),
+}
+
+/// One MetalFX upscale of a frame into another texture: the temporal scaler when the frame's depth
+/// and motion vectors are given, the spatial one otherwise. The sizes are the textures' own.
+pub struct MetalFx<'a, B: GraphicsBackend + ?Sized> {
+    /// The frame, at the input size.
+    pub color: &'a B::Texture,
+    /// Its depth and its motion vectors, in pixels of the input: `Some` together, for a temporal
+    /// upscale, and `None` for a spatial one.
+    pub depth: Option<&'a B::Texture>,
+    pub motion: Option<&'a B::Texture>,
+    /// Where it is scaled to, at the output size.
+    pub out: &'a B::Texture,
+    /// The jitter the frame was rendered with, in pixels of the input.
+    pub jitter: [f32; 2],
+    /// What the motion vectors are multiplied by to be pixels of the input.
+    pub motion_scale: [f32; 2],
+    /// Drop the accumulated history: the first frame of a sequence, and after a cut.
+    pub reset: bool,
 }
 
 /// Like `Submission`, with render passes among the dispatches, run in order.

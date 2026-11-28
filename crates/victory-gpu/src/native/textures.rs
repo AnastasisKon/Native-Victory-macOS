@@ -684,36 +684,52 @@ fn watch_in<R>(watched: &Watched, f: impl FnOnce(&mut Watch) -> R) -> R {
     f(watched.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
 }
 
-/// One round of the scanner: hashes the memory of each texture `watched` lists, without holding
-/// it, and marks those that changed since they were last read whole.
-fn scan_round(watched: &Watched, buf: &mut [u8]) {
-    let list: Vec<(usize, (usize, usize, bool, u64))> = watch_in(watched, |w| {
-        let Watch { entries, pools, seen, partial, epoch, stashed, stashed_bytes, .. } = w;
-        pools.retain(|k, _| entries.contains_key(k));
-        seen.retain(|k, _| entries.contains_key(k));
-        partial.retain(|k| entries.contains_key(k));
-        epoch.retain(|k, _| entries.contains_key(k));
-        stashed.retain(|k, _| entries.contains_key(k));
-        *stashed_bytes = stashed.values().map(|s| s.bytes.len()).sum();
-        entries.iter().map(|(&k, &v)| (k, v)).collect()
-    });
-    for &(key, entry) in &list {
-        let (at, size, target, _) = entry;
-        // What it is compared with; `None` (skipped) if it was released since the list.
-        let known = |w: &Watch| {
-            (w.entries.get(&key) == Some(&entry))
-                .then(|| (w.seen.get(&key).copied(), w.epoch.get(&key).copied().unwrap_or(0)))
-        };
-        let Some((state @ (before, _), was_partial, pool)) = watch_in(watched, |w| {
-            known(w).map(|s| (s, w.partial.contains(&key), w.pools.get(&key).cloned()))
-        }) else {
-            continue;
-        };
+/// What one scanned texture produced: its hash, and the state it was compared with.
+struct Scanned {
+    key: usize,
+    entry: (usize, usize, bool, u64),
+    hash: blake3::Hash,
+    unreadable: bool,
+    target: bool,
+    state: (Option<blake3::Hash>, u64),
+    /// Whether the bytes are worth handing to the submission (small enough to stash).
+    keep: bool,
+    /// The bytes read, when the texture is big or `keep`.
+    bytes: Vec<u8>,
+}
+
+// Scratch for a scan task: the rayon pool's threads are reused, so each keeps its buffer.
+thread_local! {
+    static SCAN_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Reads and hashes one watched texture, without holding `watched` while it reads.
+fn scan_one(
+    watched: &Watched,
+    key: usize,
+    entry: (usize, usize, bool, u64),
+    buf_len: usize,
+) -> Option<Scanned> {
+    let (at, size, target, _) = entry;
+    // What it is compared with; `None` (skipped) if it was released since the list.
+    let known = |w: &Watch| {
+        (w.entries.get(&key) == Some(&entry))
+            .then(|| (w.seen.get(&key).copied(), w.epoch.get(&key).copied().unwrap_or(0)))
+    };
+    let (state, was_partial, pool) = watch_in(watched, |w| {
+        known(w).map(|s| (s, w.partial.contains(&key), w.pools.get(&key).cloned()))
+    })?;
+    SCAN_BUF.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        if scratch.len() < buf_len {
+            scratch.resize(buf_len, 0);
+        }
+        let buf = &mut scratch[..buf_len];
         // A big texture is read whole in one call (`read_into` is chunk-parallel inside) and
         // hashed whole on the rayon pool; a small one streams through `buf`, chunk by chunk.
         let big = size >= buf.len() && size > (1 << 20);
-        // Keep the bytes when the texture is small enough to hand to the submission, so it
-        // detiles them without reading the memory again (the whole read is the sync's main cost).
+        // The bytes are kept too when the texture is small enough to hand to the submission, so
+        // it detiles them without reading the memory again (the whole read is the sync's cost).
         let keep = size > 0 && size <= stash_max_texture();
         let mut whole: Vec<u8> = Vec::new();
         if big || keep {
@@ -735,39 +751,66 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
             }
             unreadable
         };
-        let h = if big { hash_of(&whole) } else { h.finalize() };
-        watch_in(watched, |w| {
-            // Released, or begun/applied by a submission while it was hashed here: this reading is
+        let hash = if big { hash_of(&whole) } else { h.finalize() };
+        Some(Scanned { key, entry, hash, unreadable, target, state, keep, bytes: whole })
+    })
+}
+
+/// One round of the scanner: hashes the memory of each texture `watched` lists, without holding
+/// it, and marks those that changed since they were last read whole. The entries are scanned on
+/// the rayon pool — each reads and hashes its own texture — and the results applied under the
+/// lock in one go, so a round over many watched textures does not serialize on this thread.
+fn scan_round(watched: &Watched, buf: &mut [u8]) {
+    let list: Vec<(usize, (usize, usize, bool, u64))> = watch_in(watched, |w| {
+        let Watch { entries, pools, seen, partial, epoch, stashed, stashed_bytes, .. } = w;
+        pools.retain(|k, _| entries.contains_key(k));
+        seen.retain(|k, _| entries.contains_key(k));
+        partial.retain(|k| entries.contains_key(k));
+        epoch.retain(|k, _| entries.contains_key(k));
+        stashed.retain(|k, _| entries.contains_key(k));
+        *stashed_bytes = stashed.values().map(|s| s.bytes.len()).sum();
+        entries.iter().map(|(&k, &v)| (k, v)).collect()
+    });
+    let scanned: Vec<Option<Scanned>> = list
+        .par_iter()
+        .map(|&(key, entry)| scan_one(watched, key, entry, buf.len()))
+        .collect();
+    watch_in(watched, |w| {
+        for s in scanned.into_iter().flatten() {
+            // Released, or begun/applied by a submission while it was hashed: this reading is
             // the older one, and the next round compares with the submission's.
-            if known(w) != Some(state) {
-                return;
+            let known = (w.entries.get(&s.key) == Some(&s.entry))
+                .then(|| (w.seen.get(&s.key).copied(), w.epoch.get(&s.key).copied().unwrap_or(0)));
+            if known != Some(s.state) {
+                continue;
             }
-            if unreadable {
-                w.partial.insert(key);
+            if s.unreadable {
+                w.partial.insert(s.key);
             } else {
-                w.partial.remove(&key);
+                w.partial.remove(&s.key);
             }
-            w.seen.insert(key, h);
-            if before != Some(h) && !(target && before.is_none()) {
-                w.dirty.insert(key);
-                if keep {
+            w.seen.insert(s.key, s.hash);
+            let (before, _) = s.state;
+            if before != Some(s.hash) && !(s.target && before.is_none()) {
+                w.dirty.insert(s.key);
+                if s.keep {
                     // shortcut: these bytes may be torn (the title wrote while the scanner read);
                     // the next round's hash then differs again and the submission reads whole.
-                    if let Some(old) = w.stashed.remove(&key) {
+                    if let Some(old) = w.stashed.remove(&s.key) {
                         w.stashed_bytes -= old.bytes.len();
                     }
-                    while w.stashed_bytes + size > stash_max_total() && !w.stashed.is_empty() {
+                    while w.stashed_bytes + s.bytes.len() > stash_max_total() && !w.stashed.is_empty() {
                         let victim = *w.stashed.keys().next().expect("non-empty");
                         if let Some(old) = w.stashed.remove(&victim) {
                             w.stashed_bytes -= old.bytes.len();
                         }
                     }
-                    w.stashed_bytes += size;
-                    w.stashed.insert(key, Stashed { bytes: whole, hash: h, unreadable });
+                    w.stashed_bytes += s.bytes.len();
+                    w.stashed.insert(s.key, Stashed { bytes: s.bytes, hash: s.hash, unreadable: s.unreadable });
                 }
             }
-        });
-    }
+        }
+    });
 }
 
 fn start_scanner() {

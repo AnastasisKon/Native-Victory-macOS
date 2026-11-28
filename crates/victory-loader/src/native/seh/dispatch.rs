@@ -405,11 +405,41 @@ fn step_over_assert(ctx: &mut Context, rec: &ExceptionRecord) -> bool {
         if !list.contains(&rva) {
             return false;
         }
-        // Logged every time, so a log never hides a patched run.
-        tracing::warn!(
-            rva = format_args!("{rva:#x}"),
-            "stepped over a title int3 (VICTORY_SKIP_TITLE_INT3)"
-        );
+        // Logged, so a log never hides a patched run, but not once per hit: one of the title's
+        // asserts sits in a retry loop that runs about twenty thousand times a second, so a
+        // warning each wrote 494,416 lines (90 MB) in 25 s of a run, on the fault path, while the
+        // loop it documents kept spinning. The first few hits are named, then every ten
+        // thousandth with the count so far, and the rest go to `debug`: `RUST_LOG=debug` still
+        // shows every one.
+        const NAMED: u64 = 8;
+        const BETWEEN: u64 = 10_000;
+        static HITS: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
+        let hits = {
+            let mut seen = HITS.lock().unwrap_or_else(|e| e.into_inner());
+            match seen.iter_mut().find(|(of, _)| *of == rva) {
+                Some((_, n)) => {
+                    *n += 1;
+                    *n
+                }
+                None => {
+                    seen.push((rva, 1));
+                    1
+                }
+            }
+        };
+        if hits <= NAMED || hits % BETWEEN == 0 {
+            tracing::warn!(
+                rva = format_args!("{rva:#x}"),
+                hits,
+                "stepped over a title int3 (VICTORY_SKIP_TITLE_INT3)"
+            );
+        } else {
+            tracing::debug!(
+                rva = format_args!("{rva:#x}"),
+                hits,
+                "stepped over a title int3 (VICTORY_SKIP_TITLE_INT3)"
+            );
+        }
         // The first skip of an assert also names the callers that reached it: the title's assert
         // sites carry no message string (an inlined `__debugbreak`-style `int3`, then a jump), so
         // the chain is what identifies one. Once per RVA, since a skip can run a million times.

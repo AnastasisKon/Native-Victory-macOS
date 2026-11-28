@@ -6,7 +6,7 @@
 
 use super::container::SigElement;
 use super::lower::{self, Lowered, Parts};
-use super::{Options, graphics, translate_with};
+use super::{Options, ROOT_SRV_VIEW, ROOT_VIEW_OFFSET, graphics, translate_with};
 use crate::dxbc::{Container, FourCC};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, PsInput, ResourceType, RootParam, RootType, StageIo, Usage,
@@ -3297,4 +3297,101 @@ fn cvt_f32_f64_lowers_in_pixel_shader() {
         lower_ps(&code, false, vec![], vec![], 0, 0, vec![], wave32_host)
             .unwrap_or_else(|e| panic!("v_cvt_f32_f64, wave32_host={wave32_host}: {e}"));
     }
+}
+
+/// A raw root descriptor — a `RootType::Descriptor` root parameter — whose
+/// user data has no `UsedResource` entry is read through the host's own view
+/// of the buffer it addresses, and in a program that reads title memory at the
+/// root address (`Lower::raw_view`). The arm that took only a `Some` kind
+/// dropped the load as a `Val::Missing`, which reads 0.
+#[test]
+fn a_raw_root_descriptor_without_a_used_resource_is_read_through_its_view() {
+    let read = |stage: HwStage, zero_copy_memory: bool| {
+        let mut code = vec![
+            0x8801_FF0B,
+            0x0010_0000, // s_or_b32 s1, s11, 0x100000
+            0xBE80_030A, // s_mov_b32 s0, s10
+            0xBE82_03C1, // s_mov_b32 s2, -1
+            0xBE83_03FF,
+            0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
+            0xE030_0000,
+            0x8000_0000, // buffer_load_dword v0, off, s[0:3], 0
+        ];
+        if stage == HwStage::Ps {
+            code.extend([0xF800_180F, 0x0000_0000]); // exp mrt0 v0, v0, v0, v0 done vm
+        }
+        code.push(0xBF81_0000); // s_endpgm
+        let io = match stage {
+            HwStage::Ps => StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            _ => StageIo::Cs(ComputeIo { rsrc2: 1 << 1, threads: [1, 1, 1] }),
+        };
+        // The descriptor the title builds around the root's user data
+        // (`resource::tests::root_descriptors_are_built_in_code`), with no
+        // used-resource entry naming what it addresses.
+        let native = NativeProgram {
+            stage,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 10,
+                slot: 2,
+            }],
+            used: vec![],
+            io,
+            code: bytes_of(&code),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower::lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
+            wave32_host: false,
+            zero_copy_memory,
+            rect_list: false,
+            copy_params: [0; 32],
+            view_marks: false,
+        })
+        .expect("a raw root descriptor with no used-resource entry should lower")
+    };
+    let read_dwords = |l: &Lowered| -> Vec<(u32, u32)> {
+        l.user_data.iter().map(|u| (u.index, u.dword)).collect()
+    };
+    // No title memory: the host view of the buffer the root addresses, whose
+    // index and byte offset the host passes in the root's user data.
+    let l = read(HwStage::Cs, false);
+    assert!(
+        l.root_srvs.is_empty() && !l.memory,
+        "a root view is a heap view, not a raw root binding"
+    );
+    assert_eq!(
+        read_dwords(&l),
+        [(10, ROOT_SRV_VIEW), (11, ROOT_VIEW_OFFSET)],
+        "the view's index and the root address's offset in it"
+    );
+    // A program that reads title memory: the same descriptor read at the root
+    // address, its two user-data dwords being the address itself.
+    let l = read(HwStage::Ps, true);
+    assert!(l.memory, "the root address, through the page table");
+    assert_eq!(read_dwords(&l), [(10, 0), (11, 1)]);
 }

@@ -448,6 +448,26 @@ impl Provider {
     }
 }
 
+/// The folder `XGameSaveFilesGetFolderWithUiAsync` hands the title: the provider's own folder for
+/// this title, user and `config`, made if it is not there yet, so a file the title writes into it
+/// is a save every other call sees. The path is the host's, so it is what the title opens.
+pub(crate) fn files_folder(config: Option<&str>) -> Result<PathBuf, HRESULT> {
+    let saves = runtime::title().saves();
+    // A saves folder at the root of a volume has no room for the user's folder under it.
+    if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        return Err(NO_ACCESS);
+    }
+    Provider::open(&saves, config).map(|p| p.root)
+}
+
+/// `XGameSaveFilesGetRemainingQuota`: what is left of the provider's quota, in bytes. Taken with
+/// the saves lock, as an update's check is, so a write in flight is counted.
+pub(crate) fn files_remaining(config: Option<&str>) -> Result<i64, HRESULT> {
+    let root = files_folder(config)?;
+    let _saves = saves_lock();
+    Ok(remaining(&root) as i64)
+}
+
 /// Quota left under a provider's root, or less if the host disk is fuller.
 fn remaining(root: &Path) -> u64 {
     QUOTA

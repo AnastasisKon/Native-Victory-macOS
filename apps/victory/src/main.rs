@@ -195,6 +195,101 @@ fn stop_gpu_on_signals() {
     }
 }
 
+/// A fatal signal (SIGSEGV, SIGBUS, SIGILL, SIGFPE) is logged to stderr before the process dies
+/// by it: nothing else says anything when native code faults, so a run that ends in a segfault
+/// leaves the log without a line naming the fault (#392: a 122 s run died at `Segmentation fault:
+/// 11` with no crash line, after GPU errors). The handler writes one line, with the signal, its
+/// code and the faulting address, through async-signal-safe calls only — no allocation, no
+/// tracing — then re-raises: `SA_RESETHAND` restored the default action, so the process dies by
+/// the signal as before, with the same exit code and the same crash report.
+#[cfg(unix)]
+fn log_fatal_signals() {
+    unsafe extern "C" fn fatal(sig: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+        /// `n` hex digits of `v` at `at`, async-signal-safe.
+        fn hex(line: &mut [u8], at: usize, v: usize, n: usize) {
+            for k in 0..n {
+                line[at + k] = b"0123456789abcdef"[(v >> (4 * (n - 1 - k))) & 15];
+            }
+        }
+        /// Two decimal digits of `v` at `at`, async-signal-safe.
+        fn dec(line: &mut [u8], at: usize, v: usize) {
+            line[at] = b'0' + (v / 10 % 10) as u8;
+            line[at + 1] = b'0' + (v % 10) as u8;
+        }
+        const LINE: &[u8; 65] =
+            b"victory: fatal signal 00 (code 00) at address 0x0000000000000000\n";
+        let sig_at = LINE.windows(7).position(|w| w == b"signal ").unwrap() + 7;
+        let code_at = LINE.windows(6).position(|w| w == b"(code ").unwrap() + 6;
+        let addr_at = LINE.windows(2).position(|w| w == b"0x").unwrap() + 2;
+        // SAFETY: the kernel passed a valid siginfo for this fault.
+        let (addr, code) = unsafe { ((*info).si_addr() as usize, (*info).si_code as usize) };
+        let mut line = *LINE;
+        dec(&mut line, sig_at, sig.unsigned_abs() as usize);
+        hex(&mut line, code_at, code, 2);
+        hex(&mut line, addr_at, addr, 16);
+        // SAFETY: a fixed line on the stack; write is async-signal-safe.
+        unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+        // SAFETY: SA_RESETHAND made SIG_DFL the disposition again; raise terminates.
+        unsafe { libc::raise(sig) };
+    }
+    // SAFETY: sa_mask left empty (an empty set); a zeroed struct on every unix libc models.
+    let act = libc::sigaction {
+        sa_sigaction: fatal as *const () as libc::sighandler_t,
+        sa_flags: libc::SA_SIGINFO | libc::SA_RESETHAND,
+        ..unsafe { std::mem::zeroed() }
+    };
+    for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
+        // SAFETY: act outlives the calls; the old actions are not wanted.
+        unsafe { libc::sigaction(sig, &act, std::ptr::null_mut()) };
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fatal_signal_tests {
+    use super::log_fatal_signals;
+    use std::os::fd::FromRawFd;
+
+    /// A child that installs the logger and faults: the line naming the fault comes out on
+    /// stderr, and the child still dies by the signal, with the same status a run without the
+    /// logger leaves (#392).
+    #[test]
+    fn a_fatal_signal_is_logged_before_the_process_dies_by_it() {
+        let mut pipe = [0; 2];
+        // SAFETY: a two-word buffer for two fds.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        // SAFETY: the test's own process; the child takes the calls below.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            // SAFETY: the child only takes async-signal-safe calls until it faults.
+            unsafe {
+                libc::close(pipe[0]);
+                libc::dup2(pipe[1], 2);
+            }
+            log_fatal_signals();
+            // SAFETY: the handler logs this fault and re-raises it.
+            unsafe { libc::raise(libc::SIGSEGV) };
+            // SAFETY: unreachable; the fault kills the child.
+            unsafe { libc::_exit(0) };
+        }
+        // SAFETY: the write end is the child's now.
+        unsafe { libc::close(pipe[1]) };
+        // SAFETY: the read end is ours alone; the File closes it.
+        let read = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let mut line = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::BufReader::new(read), &mut line).unwrap();
+        let mut status = 0;
+        // SAFETY: a one-word status for this child.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSEGV);
+        assert!(
+            line.starts_with(b"victory: fatal signal 11 (code "),
+            "{:?}",
+            String::from_utf8_lossy(&line)
+        );
+    }
+}
+
 /// Diagnostics: the heap bytes Rust code holds, for the statistics.
 #[cfg(all(windows, feature = "diagnostics"))]
 #[global_allocator]
@@ -204,6 +299,8 @@ fn main() -> Result<()> {
     victory_core::logging::init("info");
     #[cfg(target_os = "macos")]
     stop_gpu_on_signals();
+    #[cfg(unix)]
+    log_fatal_signals();
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {

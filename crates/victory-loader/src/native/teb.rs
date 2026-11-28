@@ -84,9 +84,34 @@ core::arch::global_asm!(
     "mov dword ptr gs:[{last_error}], 87",
     "xor eax, eax",
     "ret",
+    // GetCurrentThreadId() / GetCurrentProcessId(): the ids the TEB was made with
+    // (gs:[OFF_THREAD_ID] / gs:[OFF_PROCESS_ID]), so no swap needed either.
+    ".p2align 4",
+    ".globl _victory_GetCurrentThreadId",
+    "_victory_GetCurrentThreadId:",
+    "mov eax, gs:[{thread_id}]",
+    "ret",
+    ".p2align 4",
+    ".globl _victory_GetCurrentProcessId",
+    "_victory_GetCurrentProcessId:",
+    "mov eax, gs:[{process_id}]",
+    "ret",
+    // GetCurrentProcess() / GetCurrentThread(): the constant pseudo-handles -1 and -2.
+    ".p2align 4",
+    ".globl _victory_GetCurrentProcess",
+    "_victory_GetCurrentProcess:",
+    "mov rax, -1",
+    "ret",
+    ".p2align 4",
+    ".globl _victory_GetCurrentThread",
+    "_victory_GetCurrentThread:",
+    "mov rax, -2",
+    "ret",
     last_error = const OFF_LAST_ERROR,
     tls_slots = const OFF_TLS_SLOTS,
     slots = const TLS_SLOT_COUNT,
+    thread_id = const OFF_THREAD_ID,
+    process_id = const OFF_PROCESS_ID,
 );
 
 unsafe extern "win64" {
@@ -94,6 +119,10 @@ unsafe extern "win64" {
     fn victory_SetLastError(code: u32);
     fn victory_TlsGetValue(index: u32) -> usize;
     fn victory_TlsSetValue(index: u32, value: usize) -> u32;
+    fn victory_GetCurrentThreadId() -> u32;
+    fn victory_GetCurrentProcessId() -> u32;
+    fn victory_GetCurrentProcess() -> isize;
+    fn victory_GetCurrentThread() -> isize;
 }
 
 /// The address title code calls for `GetLastError` with no bridge: reads `gs:[OFF_LAST_ERROR]`
@@ -118,6 +147,26 @@ pub fn direct_tls_get_value_address() -> usize {
 /// above, or fails with `LastError` 87 when `index >= TLS_SLOT_COUNT`.
 pub fn direct_tls_set_value_address() -> usize {
     victory_TlsSetValue as *const () as usize
+}
+
+/// The address title code calls for `GetCurrentThreadId` with no bridge: `gs:[OFF_THREAD_ID]`.
+pub fn direct_get_current_thread_id_address() -> usize {
+    victory_GetCurrentThreadId as *const () as usize
+}
+
+/// The address title code calls for `GetCurrentProcessId` with no bridge: `gs:[OFF_PROCESS_ID]`.
+pub fn direct_get_current_process_id_address() -> usize {
+    victory_GetCurrentProcessId as *const () as usize
+}
+
+/// The address title code calls for `GetCurrentProcess` with no bridge: always the pseudo-handle -1.
+pub fn direct_get_current_process_address() -> usize {
+    victory_GetCurrentProcess as *const () as usize
+}
+
+/// The address title code calls for `GetCurrentThread` with no bridge: always the pseudo-handle -2.
+pub fn direct_get_current_thread_address() -> usize {
+    victory_GetCurrentThread as *const () as usize
 }
 const PEB_SIZE: usize = 0x800;
 const OFF_PEB_IMAGE_BASE: usize = 0x10;
@@ -428,9 +477,11 @@ mod tests {
         let _restore = Restore(host_gs);
         // A value in TLS slot 3, to read back through gs:.
         fake[OFF_TLS_SLOTS + 3 * 8..OFF_TLS_SLOTS + 4 * 8].copy_from_slice(&0xABCDusize.to_le_bytes());
+        fake[OFF_THREAD_ID..OFF_THREAD_ID + 4].copy_from_slice(&0x7EADu32.to_le_bytes());
+        fake[OFF_PROCESS_ID..OFF_PROCESS_ID + 4].copy_from_slice(&0xC0DEu32.to_le_bytes());
         let got;
         let wrote;
-        let (tls_ok, tls_bad, tls_wrote, tls_err);
+        let (tls_ok, tls_bad, tls_wrote, tls_err, tid, pid, hproc, hthread);
         // SAFETY: GS points at `fake`, which outlives the calls, and is restored before any
         // host code (TLS access) runs again.
         unsafe {
@@ -442,6 +493,10 @@ mod tests {
             tls_wrote = victory_TlsSetValue(4, 0x5678);
             tls_bad = victory_TlsGetValue(TLS_SLOT_COUNT as u32);
             tls_err = u32::from_le_bytes(fake[OFF_LAST_ERROR..OFF_LAST_ERROR + 4].try_into().unwrap());
+            tid = victory_GetCurrentThreadId();
+            pid = victory_GetCurrentProcessId();
+            hproc = victory_GetCurrentProcess();
+            hthread = victory_GetCurrentThread();
             set_gs(host_gs);
         }
         assert_eq!(got, 0xBEEF);
@@ -454,6 +509,10 @@ mod tests {
         );
         assert_eq!(tls_bad, 0, "an out-of-range index returns null");
         assert_eq!(tls_err, 87, "and sets ERROR_INVALID_PARAMETER");
+        assert_eq!(tid, 0x7EAD);
+        assert_eq!(pid, 0xC0DE);
+        assert_eq!(hproc, -1);
+        assert_eq!(hthread, -2);
     }
 
     #[test]

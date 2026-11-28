@@ -27,22 +27,34 @@ const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F;
 /// Pool offset of `dst`, at `VA_A + 0x4_0000`.
 const DST: usize = 0x6_0000;
 
+/// The native host's options with both translation switches off, whatever the environment says:
+/// these tests measure the default path, and a run with `VICTORY_PAIRED_WAVES=1` or
+/// `VICTORY_STRICT_VCCZ_BRANCH=1` set then changes what the host does without changing what they
+/// pin. Switch-on behaviour is measured with [`several_waves`] (the paired form) or explicit options.
+fn defaults() -> victory_shader::emit::Options {
+    victory_shader::emit::Options {
+        paired_waves: false,
+        strict_vccz_branch: false,
+        ..shaders::options()
+    }
+}
+
 /// What the fast path refuses `words` for (five user SGPRs, two wave64 waves a group, which
 /// lockstep does not take).
 fn refusal(words: &[u32]) -> Option<String> {
-    try_translate_wave(words, 5, 0, 128, true, shaders::options()).err().map(|e| e.to_string())
+    try_translate_wave(words, 5, 0, 128, true, defaults()).err().map(|e| e.to_string())
 }
 
 /// [`refusal`] of a program of 32-lane waves, one a group.
 fn refusal32(words: &[u32]) -> Option<String> {
-    try_translate_wave(words, 5, 0, 32, false, shaders::options()).err().map(|e| e.to_string())
+    try_translate_wave(words, 5, 0, 32, false, defaults()).err().map(|e| e.to_string())
 }
 
 /// [`run`] of a program of 32-lane waves, one a group.
 fn run32(words: &[u32], flag: u32) -> Vec<u32> {
     let Some(mut t) = title() else { return Vec::new() };
     let f = Fixture::new(&t);
-    let cs = translate_wave(words, 5, 0, 32, false, shaders::options());
+    let cs = translate_wave(words, 5, 0, 32, false, defaults());
     let [c, d] = halves(VA_A + 0x4_0000);
     dispatch(&mut t, &cs, &[0, 0, c, d, flag], false);
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
@@ -57,7 +69,7 @@ fn run(words: &[u32], lds: u32, flag: u32) -> Vec<u32> {
 fn run_io(words: &[u32], rsrc2: u32, threads: u32, flag: u32) -> Vec<u32> {
     let Some(mut t) = title() else { return Vec::new() };
     let f = Fixture::new(&t);
-    let cs = translate_io(words, 5, rsrc2, threads, shaders::options());
+    let cs = translate_io(words, 5, rsrc2, threads, defaults());
     let [c, d] = halves(VA_A + 0x4_0000);
     dispatch(&mut t, &cs, &[0, 0, c, d, flag], false);
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
@@ -209,7 +221,7 @@ fn ldexp_scales_by_an_integer_power_of_two() {
         ];
         w.extend(GLOBAL_STORE_V2_AT_V1);
         w.push(S_ENDPGM);
-        let cs = translate_io(&w, 5, 0, 64, shaders::options());
+        let cs = translate_io(&w, 5, 0, 64, defaults());
         let [c, d] = halves(VA_A + 0x4_0000);
         dispatch(&mut t, &cs, &[a.to_bits(), e as u32, c, d, 0], false);
         assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
@@ -395,7 +407,7 @@ fn a_whole_wave_product_multiplies_both_halves() {
 fn run_threads(words: &[u32], wave64: bool, per: u32, count: u32, slots: usize) -> Vec<u32> {
     let Some(mut t) = title() else { return Vec::new() };
     let f = Fixture::new(&t);
-    let options = victory_shader::emit::Options { thread_counts: true, ..shaders::options() };
+    let options = victory_shader::emit::Options { thread_counts: true, ..defaults() };
     let cs = translate_wave(words, 5, 1 << 7, per, wave64, options);
     let Pipe::Compute(pso) = t.compute_pipe(&cs, "threads") else {
         panic!("not made: {:?}", t.shaders)
@@ -922,7 +934,7 @@ fn a_lane_mask_join_read_as_data_answers_per_wave_in_the_paired_form() {
     ];
     w.push(S_ENDPGM);
     // The fast path refuses it for the join, which is what #524 is about.
-    let why = default_refusal(&w).expect("the fast path takes it, so this is not the shape");
+    let why = refusal(&w).expect("the fast path takes it, so this is not the shape");
     assert!(why.contains("a lane-mask join"), "{why}");
     let got = run_group(&w, 0, 128, 128);
     assert_eq!(got.len(), 128);
@@ -1017,7 +1029,7 @@ fn a_select_of_an_address_by_scc_is_not_taken_as_a_mask() {
 fn run_lockstep(words: &[u32], lds: u32, dwords: usize) -> Vec<u32> {
     let Some(mut t) = title() else { return Vec::new() };
     let f = Fixture::new(&t);
-    let cs = translate_io(words, 5, lds << 15, 64, shaders::options());
+    let cs = translate_io(words, 5, lds << 15, 64, defaults());
     let [c, d] = halves(VA_A + 0x4_0000);
     dispatch(&mut t, &cs, &[0, 0, c, d, 0], false);
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
@@ -1434,7 +1446,7 @@ fn mask_number_bfm_brev_bitset_wqm_saveexec_and_wrexec_run_on_the_gpu() {
     ];
     let Some(mut t) = title() else { return };
     let f = Fixture::new(&t);
-    let cs_bfm = translate_io(&bfm, 5, 0, 64, shaders::options());
+    let cs_bfm = translate_io(&bfm, 5, 0, 64, defaults());
     let [c, d] = halves(VA_A + 0x4_0000);
     dispatch(&mut t, &cs_bfm, &[0, 0, c, d, 0], false);
     let got_bfm = f.get(DST, 66);
@@ -1458,7 +1470,7 @@ fn mask_number_bfm_brev_bitset_wqm_saveexec_and_wrexec_run_on_the_gpu() {
         0xBEFE_0406, // s_mov_b64 exec, s[6:7]
         S_ENDPGM,
     ];
-    let cs_brev = translate_io(&brev, 5, 0, 64, shaders::options());
+    let cs_brev = translate_io(&brev, 5, 0, 64, defaults());
     dispatch(&mut t, &cs_brev, &[0, 0, c, d, 0], false);
     assert_eq!(f.get(DST, 2), [0x0000_0000, 0xF800_0000], "s_brev_b64 words");
 
@@ -1479,7 +1491,7 @@ fn mask_number_bfm_brev_bitset_wqm_saveexec_and_wrexec_run_on_the_gpu() {
         0xBEFE_0406, // s_mov_b64 exec, s[6:7]
         S_ENDPGM,
     ];
-    let cs_bitset = translate_io(&bitset, 5, 0, 64, shaders::options());
+    let cs_bitset = translate_io(&bitset, 5, 0, 64, defaults());
     dispatch(&mut t, &cs_bitset, &[0, 0, c, d, 0], false);
     assert_eq!(f.get(DST, 2), [0x0000_0005, 0x0000_0008], "s_bitset0/1_b64 words");
 
@@ -1498,7 +1510,7 @@ fn mask_number_bfm_brev_bitset_wqm_saveexec_and_wrexec_run_on_the_gpu() {
         0xBEFE_0406, // s_mov_b64 exec, s[6:7]
         S_ENDPGM,
     ];
-    let cs_wqm = translate_io(&wqm, 5, 0, 64, shaders::options());
+    let cs_wqm = translate_io(&wqm, 5, 0, 64, defaults());
     dispatch(&mut t, &cs_wqm, &[0, 0, c, d, 0], false);
     assert_eq!(f.get(DST, 2), [0x0000_0000, 0x0000_00F0], "s_wqm_b64 quad 9 words");
 
@@ -1531,7 +1543,7 @@ fn mask_number_bfm_brev_bitset_wqm_saveexec_and_wrexec_run_on_the_gpu() {
         S_ENDPGM,
     ];
     f.put(DST, &[CANARY; 68]);
-    let cs_sw = translate_io(&save_wrexec, 5, 0, 64, shaders::options());
+    let cs_sw = translate_io(&save_wrexec, 5, 0, 64, defaults());
     dispatch(&mut t, &cs_sw, &[0, 0, c, d, 0], false);
     let got_sw = f.get(DST, 68);
     for (i, &v) in got_sw[..64].iter().enumerate() {
@@ -1891,7 +1903,7 @@ fn a_lane_holding_half_a_wave_maximum_is_refused() {
 #[test]
 fn a_wave_maximum_read_at_lane_0_answers_the_wave_in_the_paired_form() {
     let w = max_read_at_lane(0);
-    let why = default_refusal(&w).expect("the fast path takes it, so this is not the shape");
+    let why = refusal(&w).expect("the fast path takes it, so this is not the shape");
     assert!(why.contains("no reduction or prefix"), "{why}");
     let got = run_group(&w, 0, 128, 128);
     assert_eq!(got.len(), 128);
@@ -2131,7 +2143,7 @@ fn run_group(words: &[u32], lds: u32, threads: u32, dwords: usize) -> Vec<u32> {
 
 /// The native host's options with lockstep's paired form for groups of several console waves.
 fn several_waves() -> victory_shader::emit::Options {
-    victory_shader::emit::Options { paired_waves: true, ..shaders::options() }
+    victory_shader::emit::Options { paired_waves: true, ..defaults() }
 }
 
 /// Each wave of a group of two reads its own lane 35 behind `s_cbranch_execz`, with a different
@@ -2225,21 +2237,9 @@ fn a_lane_read_in_a_group_of_four_waves_reads_each_waves_own_lane() {
     assert_eq!(got[200..], [CANARY; 56]);
 }
 
-/// What the default translation - both switches off, whatever the environment says - refuses `words`
-/// for in a wave64 group of 128 threads. A test that goes on to translate with a switch on names its
-/// precondition this way, so it still holds when the run sets the switch.
-fn default_refusal(words: &[u32]) -> Option<String> {
-    let options = victory_shader::emit::Options {
-        paired_waves: false,
-        strict_vccz_branch: false,
-        ..shaders::options()
-    };
-    try_translate_wave(words, 5, 0, 128, true, options).err().map(|e| e.to_string())
-}
-
 /// What the fast path refuses `words` for in a wave64 group of `threads`.
 fn refusal_of(words: &[u32], threads: u32) -> Option<String> {
-    try_translate_wave(words, 5, 0, threads, true, shaders::options()).err().map(|e| e.to_string())
+    try_translate_wave(words, 5, 0, threads, true, defaults()).err().map(|e| e.to_string())
 }
 
 #[test]
@@ -2371,7 +2371,7 @@ fn a_title_barrier_in_a_loop_the_waves_of_a_group_run_differently_is_refused() {
         0x0002_0501, // global_store_dword v1, v5, s[2:3]
         S_ENDPGM,
     ];
-    let fast = try_translate_wave(&w, 5, 1 << 15, 128, true, shaders::options()).err();
+    let fast = try_translate_wave(&w, 5, 1 << 15, 128, true, defaults()).err();
     assert!(fast.is_some(), "refused on the fast path");
     let why = try_translate_wave(&w, 5, 1 << 15, 128, true, several_waves())
         .err()
@@ -2596,7 +2596,7 @@ fn a_vote_used_as_a_branch_follows_each_console_wave_in_the_paired_form() {
     w.extend(GLOBAL_STORE_V2_AT_V1);
     w.push(S_ENDPGM);
     // The fast path refuses it (`DIVERGENT_EXCHANGE`): that is what #527 is about.
-    assert!(default_refusal(&w).is_some(), "the fast path takes it, so this is not the shape");
+    assert!(refusal(&w).is_some(), "the fast path takes it, so this is not the shape");
     let got = run_group(&w, 0, 128, 128);
     assert_eq!(got.len(), 128);
     // `s_bcnt1` leaves SCC set when the count is zero: wave 0's is 64, so SCC is clear, its

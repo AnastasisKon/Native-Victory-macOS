@@ -79,10 +79,12 @@ pub fn format(dxgi: u32) -> Option<Format> {
         87 => Format::Bgra8Unorm,
         91 => Format::Bgra8UnormSrgb,
         10 => Format::Rgba16Float,
-        41 => Format::R32Float,
+        // R32_FLOAT (41), plus the depth-plane shader views R32_FLOAT_X8X24_TYPELESS (21, and
+        // console 119 via `pc_format`) and R24_UNORM_X8_TYPELESS (46).
+        41 | 21 | 46 => Format::R32Float,
         40 => Format::D32Float,
-        // D32_FLOAT_S8X24_UINT (19), its shader views (20) and the console's variant (45).
-        19 | 20 | 45 => Format::D32FloatS8,
+        // D32_FLOAT_S8X24_UINT (19, 20) and the console's variant (44, 45).
+        19 | 20 | 44 | 45 => Format::D32FloatS8,
         71 => Format::Bc1,
         74 => Format::Bc2,
         77 => Format::Bc3,
@@ -490,6 +492,15 @@ mod tests {
         use victory_backend::resources::Format;
         assert_eq!(super::format(91), Some(Format::Bgra8UnormSrgb));
         assert!(!super::format(91).unwrap().is_integer());
+    }
+
+    #[test]
+    fn depth_stencil_shader_view_formats_decode_to_float_depth_plane() {
+        use victory_backend::resources::Format;
+        for dxgi in [21, 46, 119] {
+            assert_eq!(super::format(dxgi), Some(Format::R32Float), "DXGI {dxgi}");
+        }
+        assert_eq!(super::format(44), Some(Format::D32FloatS8));
     }
 
     #[test]

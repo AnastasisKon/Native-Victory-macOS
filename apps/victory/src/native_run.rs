@@ -242,6 +242,17 @@ pub fn run(
         image.base(),
         image.info().image_base
     );
+    // The output size, render scale and upscaler the switches ask for, patched into the title's
+    // code before it runs: the image is writable until `bind` finalizes it, and nothing has run.
+    if execute {
+        // SAFETY: before bind/finalize, TLS callbacks, DllMain and the title entry point.
+        unsafe {
+            victory_loader::resolution::apply_asked(
+                image.base(),
+                image.info().size_of_image as usize,
+            );
+        }
+    }
     if let Some(tls) = image.tls() {
         teb::register_tls(tls);
     }

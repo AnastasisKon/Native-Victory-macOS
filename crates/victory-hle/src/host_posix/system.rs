@@ -2437,6 +2437,13 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             }
         };
     }
+    // The registry lives in `advapi32.dll` below, but a DLL built against the
+    // API sets imports it from `api-ms-win-core-registry-*`, which the generic
+    // set table does not carry: stubbed, `RegOpenKeyExW` returns 0, which the
+    // caller reads as success with a null key in hand.
+    if dll.starts_with("api-ms-win-core-registry-") {
+        return table!(RegOpenKeyExW, RegOpenKeyW, RegQueryValueExW, RegCloseKey);
+    }
     let kernel = dll == "kernel32.dll"
         || dll == "kernelbase.dll"
         || dll.starts_with("api-ms-win-core-")
@@ -3201,5 +3208,28 @@ mod console_mode_tests {
         );
         assert_eq!((got, kind, size), (0, 4, 4));
         assert_eq!(value, crate::modules::xsystem::console_mode(victory_gpu::console::current()));
+    }
+
+    #[test]
+    fn the_api_set_that_names_the_registry_answers_as_advapi32_does() {
+        // A DLL built against the API sets — `XCurl.dll` is one — imports the
+        // registry from `api-ms-win-core-registry-*`, not from `advapi32.dll`.
+        // Stubbed, `RegOpenKeyExW` returns 0, which the caller reads as success
+        // with a null key in hand.
+        for dll in [
+            "api-ms-win-core-registry-l1-1-0.dll",
+            "api-ms-win-core-registry-l2-1-0.dll",
+        ] {
+            for name in [
+                "RegOpenKeyExW",
+                "RegOpenKeyW",
+                "RegQueryValueExW",
+                "RegCloseKey",
+            ] {
+                let found = super::lookup(dll, name);
+                assert!(found.is_some(), "{dll}!{name} is not answered");
+                assert_eq!(found, super::lookup("advapi32.dll", name), "{dll}!{name}");
+            }
+        }
     }
 }

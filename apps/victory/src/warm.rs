@@ -74,6 +74,9 @@ pub fn switch_delta(jobs: Option<usize>) -> anyhow::Result<()> {
     let counts = [const { AtomicUsize::new(0) }; 4];
     // The containers a switch changes, with what the translation that refused them said.
     let changed = std::sync::Mutex::new(Vec::new());
+    // What the containers refused both ways were refused for, as a run sees it today: the
+    // histogram that says which refusal the next translation fix should take (top 40 kept).
+    let refused_why = std::sync::Mutex::new(Vec::new());
     let next = AtomicUsize::new(0);
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -87,17 +90,26 @@ pub fn switch_delta(jobs: Option<usize>) -> anyhow::Result<()> {
                         let one = victory_shader::emit::translate_with(&container, base);
                         let two = victory_shader::emit::translate_with(&container, switched);
                         let k = outcome(one.is_ok(), two.is_ok());
+                        // As a run sees it today, for the histogram of what is still refused.
+                        let default_why = one.err().map_or_else(String::new, |e| e.to_string());
+                        let switched_why = two.err().map_or_else(String::new, |e| e.to_string());
+                        if k == 3 {
+                            let why = reason_key(&default_why);
+                            let mut hist = refused_why.lock().unwrap_or_else(|e| e.into_inner());
+                            let at = hist.iter().position(|(w, _)| *w == why);
+                            match at {
+                                Some(i) => hist[i].1 += 1,
+                                None if hist.len() < 40 => hist.push((why, 1)),
+                                None => {}
+                            }
+                        }
                         if k == LOST || k == RECOVERED {
                             let name = file
                                 .file_name()
                                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                             // The refusal of the mode that refused it: the switch's own for a lost
                             // container, the defaults' for a recovered one.
-                            let why = match k {
-                                LOST => two.err(),
-                                _ => one.err(),
-                            };
-                            let why = why.map_or_else(String::new, |e| e.to_string());
+                            let why = if k == LOST { switched_why } else { default_why };
                             tracing::info!(container = %name, lost = k == LOST, %why, "a switch changes this container");
                             let mut changed = changed.lock().unwrap_or_else(|e| e.into_inner());
                             if changed.len() < 40 {
@@ -128,6 +140,17 @@ pub fn switch_delta(jobs: Option<usize>) -> anyhow::Result<()> {
     println!("switches     paired_waves and strict_vccz_branch (VICTORY_PAIRED_WAVES, VICTORY_STRICT_VCCZ_BRANCH)");
     // Named, not only counted: a lost container is the risk a default flip carries, and the reason
     // says which refusal to look at. The first 40 of the run, as `warn_drop_pipe` does for drops.
+    let mut hist = refused_why.into_inner().unwrap_or_else(|e| e.into_inner());
+    hist.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if !hist.is_empty() {
+        println!("refused both ways, by reason:");
+        for (why, n) in hist.iter().take(10) {
+            println!("  {n:6}  {why}");
+        }
+        if hist.len() > 10 {
+            println!("  ... {} more reasons", hist.len() - 10);
+        }
+    }
     let changed = changed.into_inner().unwrap_or_else(|e| e.into_inner());
     for (k, label) in [(LOST, "lost"), (RECOVERED, "recovered")] {
         let named: Vec<_> = changed.iter().filter(|(o, ..)| *o == k).collect();
@@ -143,6 +166,28 @@ pub fn switch_delta(jobs: Option<usize>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A refusal with its offsets blanked, so one reason counts as one line: "GFX10 code at 0x120:
+/// a lane-mask join ..." and "at 0x4f8: ..." are the same defect.
+fn reason_key(why: &str) -> String {
+    let mut out = String::with_capacity(why.len());
+    let mut rest = why;
+    while let Some(at) = rest.find("0x") {
+        let (before, after) = rest.split_at(at);
+        out.push_str(before);
+        let tail = &after[2..];
+        let len = tail.chars().take_while(|c| c.is_ascii_hexdigit()).count();
+        if len == 0 {
+            out.push_str("0x");
+            rest = tail;
+        } else {
+            out.push_str("0xH");
+            rest = &tail[len..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Counted outcomes of [`switch_delta`]: translated both ways, lost, recovered, refused both ways.
@@ -199,6 +244,22 @@ fn translate(files: &[PathBuf], threads: usize, progress: bool) -> [usize; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One refusal reason, whatever offsets the program happened to be at.
+    #[test]
+    fn a_refusal_reason_is_counted_without_its_offsets() {
+        assert_eq!(
+            reason_key("GFX10 code at 0x120: a lane-mask join is not supported"),
+            reason_key("GFX10 code at 0x4f8: a lane-mask join is not supported")
+        );
+        assert_eq!(
+            reason_key("GFX10 code at 0x120: a thing"),
+            "GFX10 code at 0xH: a thing"
+        );
+        // An `0x` with no hex digits after it is left alone, and a reason without one is unchanged.
+        assert_eq!(reason_key("0x and 0xZZ"), "0x and 0xZZ");
+        assert_eq!(reason_key("no numbers here"), "no numbers here");
+    }
 
     /// The four outcomes a switch can have for one container, and the counts they add up to.
     #[test]

@@ -132,6 +132,7 @@ function field(line, key,   re, s) { # value of `key=...` (optionally quoted) in
   # Lines only the --compare table reads (run-native.sh writes the "# " ones).
   if (line ~ /^# commit /) commit = $3
   if (line ~ /^# .*console=/ && console == "") { console = line; sub(/.*console=/, "", console) }
+  if (line ~ /^# switches / && switches == "") { switches = line; sub(/^# switches +/, "", switches) }
   if (line ~ /^console  /) { console = line; sub(/^console +/, "", console) }
   if (line ~ /^# exit code /) exitcode = $4
   if (line ~ /^# stopped by --seconds/) timedout = 1
@@ -179,6 +180,7 @@ function emit(kind, key, value) { gsub(/\t/, " ", key); printf "%s\t%s\t%s\n", k
 function metrics(   i, k, w, nw, v, r, u, kd, d, end) { # the --compare rows, one per line
   emit("row", "commit", commit == "" ? "-" : commit)
   emit("row", "console", console == "" ? "-" : console)
+  emit("row", "translation switches", switches == "" ? "-" : switches)
   emit("row", "run length (s)", sprintf("%.1f", tlast - t0))
   emit("row", "last frame", curframe + 0)
   # fps of each 64-frame window: consecutive frame counters, as the summary reads them.
@@ -229,7 +231,9 @@ END {
   if (mode == "kv") { metrics(); exit }
 
   printf "== %s\n", file
-  printf "lines %d, log span %.1fs, last frame %d\n\n", nlines, tlast - t0, curframe
+  printf "lines %d, log span %.1fs, last frame %d\n", nlines, tlast - t0, curframe
+  if (switches != "") printf "translation switches: %s\n", switches
+  print ""
 
   print "-- frame rate (per frame block)"
   if (n < 2) print "  (fewer than two frame counters)"
@@ -403,6 +407,7 @@ self_test() {
   esc=$(printf '\033')
   sed "s/@ESC@/${esc}/g" > "$f" <<'LOG'
 # fake header
+# switches VICTORY_PAIRED_WAVES=1
 @ESC@[2m2026-01-01T00:00:00.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::glue: native draws so far frame=64 recorded=1
 @ESC@[2m2026-01-01T00:00:02.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::glue: native draws so far frame=128 recorded=1
 @ESC@[2m2026-01-01T00:00:03.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::pipeline: first bind pipeline=0x1 frame=100 stage="pixel" size=1 hash=abc took=12.5ms
@@ -438,6 +443,7 @@ LOG
   chk 'mixer seconds: 1, spatial stream activations: 1, DSP connects: 0, DSP streams: 0'
   chk 'submit timing (VICTORY_SUBMIT_TIMING): 2 submissions, total 4.8 ms (prep 4.0 ms, encode+commit 0.8 ms), slowest 3.0 ms'
   chk 'unmapped mip levels (VICTORY_TRACE_UNMAPPED_LEVELS): 1 lines, last: victory_gpu::native::textures: unmapped levels: 12.0MB in 3 levels of 2 textures'
+  chk 'translation switches: VICTORY_PAIRED_WAVES=1'
   chk '1 named (the first 64 of the run; each line once)'
   chk 'vs H.*ps H.*into DrawTargets'
   chk 'victory: fatal signal 11 (code 1) at address 0x7ff8deadbeef'

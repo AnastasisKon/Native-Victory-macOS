@@ -1549,13 +1549,20 @@ fn first_of_pipeline(seen: &mut Vec<String>, key: &str, limit: usize) -> bool {
     true
 }
 
+/// Whether `key` is the first of its pipeline dropped for want of a host pipeline, keeping it while
+/// there is room ([`DROP_PIPE_KEYS`]). Split from the log so a caller can add what only the first
+/// line is worth computing (a refused dispatch's unordered-access textures, say).
+fn first_drop_pipe(key: &str) -> bool {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    first_of_pipeline(&mut seen, key, DROP_PIPE_KEYS)
+}
+
 /// Logs a draw or execution dropped for want of a host pipeline, with its shaders and targets, the
 /// first time for each. The reason alone ("refused or not translated") does not say which pipeline
 /// went, so a run's log could not name the drops nothing else had explained (#531).
 fn warn_drop_pipe(key: &str) {
-    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if first_of_pipeline(&mut seen, key, DROP_PIPE_KEYS) {
+    if first_drop_pipe(key) {
         tracing::warn!(
             pipeline = key,
             "a draw or execution dropped for want of a host pipeline (first of this pipeline)"
@@ -1864,8 +1871,10 @@ fn dropped_dispatch(t: &MetalTitle, l: &mut MetalList, how: &str) {
     }
     trace_record_dispatch(t, l, "dropped");
     let pipe = format!("{:?} {how}", stage_hashes(l.pipeline));
-    warn_drop_pipe(&pipe);
-    if tracing_targets() {
+    // The first time, name the unordered-access textures the dispatch would have written: they keep
+    // what they held, and a later CPU read of one is what a refused shader leaves behind (#15, #531).
+    let first = first_drop_pipe(&pipe);
+    if first || tracing_targets() {
         let uavs: Vec<String> = t
             .host
             .table_uav_textures(l.list.compute_args())
@@ -1876,7 +1885,18 @@ fn dropped_dispatch(t: &MetalTitle, l: &mut MetalList, how: &str) {
                 format!("{r:#x} fmt {f} {w}x{h}")
             })
             .collect();
-        trace_drop_pipe(format!("{pipe} uavs {uavs:?}"));
+        // Only the first of its pipeline warns; with the frame trace on every drop is counted, and
+        // a line each would be the spam this is here to avoid.
+        if first {
+            tracing::warn!(
+                pipeline = %pipe,
+                uavs = ?uavs,
+                "a draw or execution dropped for want of a host pipeline (first of this pipeline), and the textures it would have written"
+            );
+        }
+        if tracing_targets() {
+            trace_drop_pipe(format!("{pipe} uavs {uavs:?}"));
+        }
     }
 }
 

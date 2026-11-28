@@ -85,6 +85,14 @@ log="$run_dir/victory.log"
 {
   echo "# $(sw_vers -productName) $(sw_vers -productVersion), $(sysctl -n machdep.cpu.brand_string), ${ram_gb} GB, console=${console}"
   echo "# commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  # The switches that change translations, so two logs of the same commit can be told apart
+  # (`run-summary.sh` reads this line; the cache names them too, once it builds a key).
+  switches=()
+  for name in VICTORY_PAIRED_WAVES VICTORY_STRICT_VCCZ_BRANCH VICTORY_NO_LOCKSTEP; do
+    value=${!name:-}
+    [[ -n "$value" ]] && switches+=("$name=$value")
+  done
+  echo "# switches ${switches[*]:-none}"
 } > "$log"
 
 export VICTORY_GUESS_GRAPHICS="${VICTORY_GUESS_GRAPHICS:-1}"

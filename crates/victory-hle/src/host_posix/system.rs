@@ -13,6 +13,7 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1550,6 +1551,126 @@ pub extern "system" fn GetCurrentThread() -> isize {
     -2
 }
 
+// The thread calls a crash reporter asks for: a thread's name, which thread
+// belongs to whom, and how a pool should size itself. The name is kept for the
+// thread and given back as Windows gives it out.
+
+#[derive(Clone, Default)]
+struct ThreadSettings {
+    /// The thread's description, as a crash reporter prints it.
+    name: Option<String>,
+}
+
+/// The calling thread has no handle of its own, so its settings live here.
+thread_local! {
+    static CURRENT_THREAD_SETTINGS: std::cell::RefCell<ThreadSettings> =
+        const { std::cell::RefCell::new(ThreadSettings { name: None }) };
+}
+
+/// Every other thread, by the handle the title holds.
+static THREAD_SETTINGS: LazyLock<Mutex<HashMap<usize, ThreadSettings>>> =
+    LazyLock::new(Default::default);
+
+/// The settings of `thread`, which the call has already checked is this process's
+/// thread.
+fn thread_settings(thread: *mut c_void, change: impl FnOnce(&mut ThreadSettings)) {
+    if thread as isize == GetCurrentThread() {
+        CURRENT_THREAD_SETTINGS.with(|settings| change(&mut settings.borrow_mut()));
+        return;
+    }
+    let mut all = super::lock(&THREAD_SETTINGS);
+    change(all.entry(thread as usize).or_default());
+}
+
+fn settings_of(thread: *mut c_void) -> ThreadSettings {
+    if thread as isize == GetCurrentThread() {
+        return CURRENT_THREAD_SETTINGS.with(|settings| settings.borrow().clone());
+    }
+    super::lock(&THREAD_SETTINGS)
+        .get(&(thread as usize))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Whether `thread` is a thread of this process: the pseudo handle of the calling
+/// thread, or a thread in the handle table.
+fn is_thread(thread: *mut c_void) -> bool {
+    if thread as isize == GetCurrentThread() {
+        return true;
+    }
+    matches!(
+        super::lock(&super::HANDLES).get(&(thread as usize)),
+        Some(Object::Thread(_))
+    )
+}
+
+pub extern "system" fn GetMaximumProcessorCount(group: u16) -> u32 {
+    GetActiveProcessorCount(group)
+}
+
+/// One group holds every processor.
+pub extern "system" fn GetActiveProcessorGroupCount() -> u16 {
+    1
+}
+
+pub extern "system" fn GetProcessIdOfThread(thread: *mut c_void) -> u32 {
+    if !is_thread(thread) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    // Every thread in this host is this process's.
+    super::GetCurrentProcessId()
+}
+
+/// The name is kept for the thread, which is what a crash reporter prints; it is
+/// not given to the host's own tooling, which has no way to name a thread.
+pub extern "system" fn SetThreadDescription(thread: *mut c_void, description: usize) -> i32 {
+    if !is_thread(thread) {
+        return 0x8007_0006u32 as i32; // HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)
+    }
+    let name = if description == 0 {
+        None
+    } else {
+        // SAFETY: the caller's `HSTRING`.
+        Some(unsafe {
+            let mut len = 0u32;
+            let data = super::winrt::WindowsGetStringRawBuffer(description as *mut u8, &mut len);
+            String::from_utf16_lossy(std::slice::from_raw_parts(data, len as usize))
+        })
+    };
+    thread_settings(thread, |settings| settings.name = name);
+    0
+}
+
+/// The name comes back as a `LocalAlloc`ed string, as Windows hands it out, and a
+/// thread with no name answers success with no string rather than an error.
+pub extern "system" fn GetThreadDescription(thread: *mut c_void, out: *mut usize) -> i32 {
+    if out.is_null() {
+        return 0x8000_4003u32 as i32; // E_POINTER
+    }
+    if !is_thread(thread) {
+        return 0x8007_0006u32 as i32; // HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)
+    }
+    let name = settings_of(thread).name;
+    let copy = match name {
+        Some(name) => {
+            let units: Vec<u16> = name.encode_utf16().chain([0]).collect();
+            let block = LocalAlloc(0, units.len() * size_of::<u16>()).cast::<u16>();
+            if block.is_null() {
+                return 0x8007_000Eu32 as i32; // E_OUTOFMEMORY
+            }
+            // SAFETY: the block `LocalAlloc` just gave us, of `units.len()`
+            // characters.
+            unsafe { std::ptr::copy_nonoverlapping(units.as_ptr(), block, units.len()) };
+            block as usize
+        }
+        None => 0,
+    };
+    // SAFETY: the caller's out string.
+    unsafe { out.write_unaligned(copy) };
+    0
+}
+
 pub extern "system" fn GetProcessId(_process: isize) -> u32 {
     std::process::id()
 }
@@ -1563,6 +1684,57 @@ pub extern "system" fn SetThreadPriority(_thread: *mut c_void, _priority: i32) -
 }
 
 pub extern "system" fn SetProcessPriorityBoost(_process: isize, _disable: i32) -> i32 {
+    1
+}
+
+/// `ALL_PROCESSOR_GROUPS`: the group number that asks for every processor.
+const ALL_PROCESSOR_GROUPS: u16 = 0xFFFF;
+/// Windows puts at most 64 processors in a group.
+const GROUP_SIZE: u32 = 64;
+
+/// `GetActiveProcessorCount`: how many processors a title picks up here. A title
+/// that sizes its worker pool by this answers `cpus()`, where the stub answered 0.
+pub extern "system" fn GetActiveProcessorCount(group: u16) -> u32 {
+    let n = cpus();
+    let groups = n.div_ceil(GROUP_SIZE);
+    if group == ALL_PROCESSOR_GROUPS {
+        return n;
+    }
+    let group = u32::from(group);
+    if group >= groups {
+        return 0;
+    }
+    n.saturating_sub(group * GROUP_SIZE).min(GROUP_SIZE)
+}
+
+/// `GetCurrentProcessorNumber`: a hint on Windows, and a hint here too, from the
+/// calling thread's id (the host gives no cheaper way to ask which CPU is running).
+pub extern "system" fn GetCurrentProcessorNumber() -> u32 {
+    thread::current_id() % cpus()
+}
+
+// shortcut: the boost setting is remembered, not applied; this host has no per-thread
+// priority boost to turn off, and a title only reads back what it set.
+static NO_BOOST: AtomicU32 = AtomicU32::new(0);
+
+pub extern "system" fn GetThreadPriorityBoost(_thread: *mut c_void, disable: *mut i32) -> i32 {
+    // SAFETY: the title's out word.
+    unsafe { disable.write(NO_BOOST.load(Ordering::Relaxed) as i32) };
+    1
+}
+
+pub extern "system" fn SetThreadPriorityBoost(_thread: *mut c_void, disable: i32) -> i32 {
+    NO_BOOST.store(u32::from(disable != 0), Ordering::Relaxed);
+    1
+}
+
+/// `SetThreadStackGuarantee`: the title's stack is a fixed reservation here, so the
+/// guarantee is accepted and left as the caller set it.
+pub extern "system" fn SetThreadStackGuarantee(guarantee: *mut u32) -> i32 {
+    if guarantee.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     1
 }
 
@@ -3868,6 +4040,11 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             LCMapStringEx,
             GetUserDefaultLocaleName,
             GetUserDefaultGeoName,
+            GetMaximumProcessorCount,
+            GetActiveProcessorGroupCount,
+            GetProcessIdOfThread,
+            SetThreadDescription,
+            GetThreadDescription,
             GetUserDefaultUILanguage,
             GetSystemTimeAdjustment,
             GetLogicalProcessorInformationEx,
@@ -3916,6 +4093,11 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             GetProcessId,
             GetThreadPriority,
             SetThreadPriority,
+            GetThreadPriorityBoost,
+            SetThreadPriorityBoost,
+            SetThreadStackGuarantee,
+            GetActiveProcessorCount,
+            GetCurrentProcessorNumber,
             SetProcessPriorityBoost,
             SetThreadIdealProcessorEx,
             GetThreadGroupAffinity,
@@ -5949,6 +6131,158 @@ mod apartment_and_winrt_tests {
             ("api-ms-win-core-winrt-error-l1-1-0.dll", "RoTransformError"),
             ("api-ms-win-core-winrt-error-l1-1-0.dll", "GetRestrictedErrorInfo"),
             ("api-ms-win-core-winrt-error-l1-1-0.dll", "SetRestrictedErrorInfo"),
+        ] {
+            assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
+        }
+    }
+}
+
+#[cfg(test)]
+mod processor_tests {
+    use super::*;
+
+    /// A title that sizes a worker pool by the processor count gets the host's
+    /// processors, in groups of 64 as Windows lays them out, and not the 0 a stub
+    /// would answer.
+    #[test]
+    fn the_processor_count_is_the_hosts_and_the_groups_add_up() {
+        let n = cpus();
+        assert_eq!(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS), n);
+        assert_eq!(GetActiveProcessorCount(0), n.min(GROUP_SIZE));
+        let groups = n.div_ceil(GROUP_SIZE);
+        let mut total = 0;
+        for group in 0..groups {
+            let in_group = GetActiveProcessorCount(group as u16);
+            assert!(in_group > 0 && in_group <= GROUP_SIZE, "group {group}");
+            total += in_group;
+        }
+        assert_eq!(total, n, "the groups do not add up to the count");
+        assert_eq!(GetActiveProcessorCount(groups as u16), 0, "a group that is not there");
+
+        let number = GetCurrentProcessorNumber();
+        assert!(number < n, "{number} is not one of {n} processors");
+    }
+
+    /// The boost setting is remembered rather than applied, and the stack
+    /// guarantee is accepted as the title wrote it.
+    #[test]
+    fn the_priority_boost_round_trips_and_the_stack_guarantee_is_left_alone() {
+        assert_eq!(SetThreadPriorityBoost(std::ptr::null_mut(), 1), 1);
+        let mut disable = -1;
+        assert_eq!(GetThreadPriorityBoost(std::ptr::null_mut(), &mut disable), 1);
+        assert_eq!(disable, 1);
+        assert_eq!(SetThreadPriorityBoost(std::ptr::null_mut(), 0), 1);
+        assert_eq!(GetThreadPriorityBoost(std::ptr::null_mut(), &mut disable), 1);
+        assert_eq!(disable, 0);
+
+        let mut guarantee = 0x1_0000u32;
+        assert_eq!(SetThreadStackGuarantee(&mut guarantee), 1);
+        assert_eq!(guarantee, 0x1_0000);
+        assert_eq!(SetThreadStackGuarantee(std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        for dll in ["kernel32.dll", "api-ms-win-core-processthreads-l1-1-0.dll"] {
+            for name in [
+                "GetActiveProcessorCount",
+                "GetCurrentProcessorNumber",
+                "GetThreadPriorityBoost",
+                "SetThreadPriorityBoost",
+                "SetThreadStackGuarantee",
+            ] {
+                assert!(super::super::lookup(dll, name).is_some(), "{dll}!{name}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod thread_and_processor_tests {
+    use super::*;
+
+    /// The largest count and the group count are this machine's numbers, not the
+    /// stub's zero.
+    #[test]
+    fn the_counts_agree_with_the_machine() {
+        let n = cpus();
+        assert_eq!(GetMaximumProcessorCount(0), n);
+        assert_eq!(GetMaximumProcessorCount(0xFFFF), n);
+        assert_eq!(GetMaximumProcessorCount(1), 0, "a group that is not here");
+        assert_eq!(GetActiveProcessorGroupCount(), 1);
+    }
+
+    /// A thread of this process has its process's id, and a handle that is not a
+    /// thread is refused.
+    #[test]
+    fn a_thread_belongs_to_this_process() {
+        let me = GetCurrentThread() as usize as *mut c_void;
+        assert_eq!(GetProcessIdOfThread(me), super::super::GetCurrentProcessId());
+        assert_eq!(GetProcessIdOfThread(std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
+    }
+
+    /// A thread's name is kept and handed back as a `LocalAlloc`ed string, and a
+    /// thread with no name answers success with no string.
+    #[test]
+    fn a_thread_can_be_named() {
+        let me = GetCurrentThread() as usize as *mut c_void;
+        let mut name = usize::MAX;
+        assert_eq!(GetThreadDescription(me, &mut name), 0);
+        assert_eq!(name, 0, "a thread starts with no name");
+
+        let text: Vec<u16> = "worker 3".encode_utf16().collect();
+        let mut description = std::ptr::null_mut();
+        assert_eq!(
+            super::super::winrt::WindowsCreateString(
+                text.as_ptr(),
+                text.len() as u32,
+                &mut description
+            ),
+            0
+        );
+        assert_eq!(SetThreadDescription(me, description as usize), 0);
+        assert_eq!(GetThreadDescription(me, &mut name), 0);
+        assert_ne!(name, 0);
+        // SAFETY: the string this call just allocated: eight characters and a
+        // terminator.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(name as *const u16, 8), &text[..]);
+            assert_eq!(*(name as *const u16).add(8), 0);
+        }
+        super::LocalFree(name as *mut c_void);
+        super::super::winrt::WindowsDeleteString(description);
+
+        // A name belongs to its thread: another thread does not have this one's.
+        std::thread::spawn(|| {
+            let me = GetCurrentThread() as usize as *mut c_void;
+            let mut theirs = usize::MAX;
+            assert_eq!(GetThreadDescription(me, &mut theirs), 0);
+            assert_eq!(theirs, 0);
+        })
+        .join()
+        .unwrap();
+
+        // Clearing a name, and the refusals.
+        assert_eq!(SetThreadDescription(me, 0), 0);
+        assert_eq!(GetThreadDescription(me, &mut name), 0);
+        assert_eq!(name, 0);
+        assert_eq!(
+            GetThreadDescription(me, std::ptr::null_mut()),
+            0x8000_4003u32 as i32
+        );
+        assert_eq!(
+            SetThreadDescription(std::ptr::null_mut(), 0),
+            0x8007_0006u32 as i32
+        );
+    }
+
+    #[test]
+    fn the_five_calls_are_answered_rather_than_stubbed() {
+        for (dll, name) in [
+            ("api-ms-win-core-sysinfo-l1-1-0.dll", "GetMaximumProcessorCount"),
+            ("api-ms-win-core-sysinfo-l1-1-0.dll", "GetActiveProcessorGroupCount"),
+            ("api-ms-win-core-processthreads-l1-1-0.dll", "GetProcessIdOfThread"),
+            ("api-ms-win-core-processthreads-l1-2-0.dll", "SetThreadDescription"),
+            ("api-ms-win-core-processthreads-l1-2-0.dll", "GetThreadDescription"),
         ] {
             assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
         }

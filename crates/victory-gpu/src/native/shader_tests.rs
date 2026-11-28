@@ -207,3 +207,33 @@ fn render_pipelines_come_from_the_translated_shaders_and_the_streams_state() {
     assert!(t.shaders.refused.iter().any(|(why, _)| why.starts_with("args") && why.contains("root signature")));
     assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("layout lacks")));
 }
+
+/// The pipeline tables are bounded: a title that makes thousands of variants a minute drops the
+/// least recently used ones past the cap instead of keeping every one for the run.
+#[test]
+fn the_pipeline_tables_keep_their_most_recently_used_entries() {
+    // The count: `VICTORY_PIPELINE_CACHE`, else the default, and 0 keeps nothing.
+    assert_eq!(shaders::pipeline_cache(None), shaders::PIPELINE_CACHE);
+    assert_eq!(shaders::pipeline_cache(Some(" 64 ")), 64);
+    assert_eq!(shaders::pipeline_cache(Some("0")), 0);
+    assert_eq!(shaders::pipeline_cache(Some("not a number")), shaders::PIPELINE_CACHE);
+
+    // Four entries, the last used most recently, past a limit of three: the oldest goes and the
+    // three kept are the ones used last.
+    let mut map: std::collections::HashMap<u8, (&str, u64)> = [
+        (1, ("first", 1)),
+        (2, ("second", 4)),
+        (3, ("third", 3)),
+        (4, ("fourth", 2)),
+    ]
+    .into_iter()
+    .collect();
+    shaders::trim(&mut map, 3);
+    assert_eq!(map.len(), 2, "trimmed to the median: the two oldest went");
+    assert!(map.contains_key(&2) && map.contains_key(&3), "the recently used stay");
+
+    // A map inside its cap is left alone, and one exactly at it too.
+    let mut small: std::collections::HashMap<u8, (u8, u64)> = (0..3).map(|k| (k, (k, k as u64))).collect();
+    shaders::trim(&mut small, 3);
+    assert_eq!(small.len(), 3);
+}

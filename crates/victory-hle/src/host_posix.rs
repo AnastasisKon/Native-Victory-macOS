@@ -28,6 +28,7 @@ use victory_platform::thread;
 mod coreaudio;
 pub(crate) mod fake_dll;
 pub(crate) mod files;
+mod heap;
 mod mf;
 mod mixer;
 mod sync;
@@ -979,7 +980,10 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     if let Some(address) = exceptions(name) {
         return Some(address);
     }
-    if let Some(address) = sync::lookup(name).or_else(|| files::lookup(name)) {
+    if let Some(address) = sync::lookup(name)
+        .or_else(|| files::lookup(name))
+        .or_else(|| heap::lookup(name))
+    {
         return Some(address);
     }
     table!(

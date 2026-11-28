@@ -486,6 +486,13 @@ thread_local! {
     static THREAD_EXIT_FRAME: Cell<usize> = const { Cell::new(0) };
 }
 
+/// Whether the calling thread is inside a title thread entry point, so
+/// [`exit_title_thread`] can end it. A thread the host started itself (a
+/// thread-pool worker running a title callback) is not.
+pub fn in_title_thread() -> bool {
+    THREAD_EXIT_FRAME.with(|frame| frame.get() != 0)
+}
+
 /// Calls a thread entry point, which can return or exit through
 /// [`exit_title_thread`]. Nested `call_win64` calls leave this frame in place.
 ///

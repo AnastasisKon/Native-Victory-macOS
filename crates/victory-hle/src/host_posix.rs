@@ -35,6 +35,7 @@ mod sync;
 mod system;
 pub(crate) mod ucrt;
 mod winhttp;
+pub(crate) mod winrt;
 mod winsock;
 mod wasapi;
 mod xaudio2;
@@ -1024,6 +1025,7 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         .or_else(|| winhttp::lookup(&dll, name))
         .or_else(|| mf::lookup(&dll, name))
         .or_else(|| xaudio2::lookup(&dll, name))
+        .or_else(|| winrt::lookup(&dll, name))
     {
         return Some(address);
     }

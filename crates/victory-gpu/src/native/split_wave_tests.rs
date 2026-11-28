@@ -2521,3 +2521,33 @@ fn a_vote_used_as_a_branch_follows_each_console_wave_in_the_paired_form() {
     let want: Vec<u32> = (0..128).map(|i| if i < 64 { 1 } else { 2 }).collect();
     assert_eq!(got, want, "each console wave follows its own vote");
 }
+
+/// #527's second shape where the lanes of one console wave disagree: `s_and vcc, exec, mask` then
+/// `s_cbranch_vccz`. `v_cmp_lt_u32 vcc, 32, v0` is on for lanes 33 and up, so `exec & vcc` is not
+/// zero for either wave and on the console both waves run the guarded body with EXEC as it was:
+/// every lane stores 7.
+///
+/// The fast path does not give that answer today. It lowers the branch as a test of the lane's own
+/// vcc bit, so on the GPU lanes 0..32 (the ones the vote did not name) skip the body and store 0
+/// while 33..127 store 7 - a per-lane answer where the console's is per wave. Ignored until the
+/// lowering is fixed: the paired form (`Options::paired_waves`) is the route that makes it per wave
+/// (`a_vote_used_as_a_branch_follows_each_console_wave_in_the_paired_form`), and until these
+/// programs take it, translating this shape silently draws the wrong lighting rather than refusing.
+#[test]
+#[ignore = "the fast path lowers s_cbranch_vccz per lane instead of per console wave (#527)"]
+fn a_vccz_branch_where_the_lanes_disagree_answers_for_the_wave() {
+    let mut w = vec![
+        V_LSHLREV_V1_2_V0,
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D82_00A0, // v_cmp_lt_u32 vcc, 32, v0 (32 < lane: on from lane 33 up)
+        0x87EA_6A7E, // s_and_b64 vcc, exec, vcc
+        0xBF86_0001, // s_cbranch_vccz 1
+        0x7E04_0287, // v_mov_b32 v2, 7 (the body)
+    ];
+    w.extend(GLOBAL_STORE_V2_AT_V1);
+    w.push(S_ENDPGM);
+    let got = run_io(&w, 0, 128, 0);
+    assert_eq!(got.len(), 128);
+    let want: Vec<u32> = vec![7; 128];
+    assert_eq!(got, want, "the console takes the branch for the wave as a whole");
+}

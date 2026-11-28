@@ -16,9 +16,14 @@
 //!
 //! The title's depth and motion-vector passes are not identified by this backend: nothing here
 //! knows which of its textures holds either, so [`Temporal`] and [`Interpolator`] have no caller
-//! yet. Both are wrapped and both have a test that runs one on this machine's GPU and waits for it:
-//! what is missing for them is the title's depth and motion vectors, not the MetalFX side. Once a
-//! pass does identify those textures, it sets them on one of these and encodes.
+//! yet. Both are wrapped and both have a test that runs one on this machine's GPU and waits for it.
+//! What they need is the frame's depth and motion vectors, which the title already names in its
+//! FidelityFX dispatch (`victory_hle::modules::fidelityfx`), so no pass has to be identified first:
+//! a caller hands them over through [`Upscale`], which is made in the mode its inputs allow.
+//!
+//! [`Upscale`] is that seam: the temporal scaler where the caller has depth and motion vectors and
+//! the system has it, the spatial one everywhere else, so a caller does not have to know which
+//! exists. `gfx::Texture::mtl` is what lets a caller outside this crate give it a title texture.
 
 use objc2::msg_send;
 use objc2::rc::Retained;
@@ -123,6 +128,148 @@ impl Spatial {
             let _: () = msg_send![&*self.object, setColorTexture: color];
             let _: () = msg_send![&*self.object, setOutputTexture: out];
             let _: () = msg_send![&*self.object, encodeToCommandBuffer: cb];
+        }
+    }
+}
+
+/// Which of MetalFX's two upscalers a caller has the inputs for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// Colour only: every frame is scaled on its own.
+    Spatial,
+    /// Colour, depth and motion vectors: frames accumulate, which is what keeps a scaled image
+    /// still in the parts of it that do not move.
+    Temporal,
+}
+
+/// The formats of the textures an upscale reads and writes. One in [`Mode::Spatial`] has no depth
+/// or motion texture, which [`Formats::spatial`] leaves at a value nothing reads.
+#[derive(Clone, Copy)]
+pub struct Formats {
+    pub color: MTLPixelFormat,
+    pub depth: MTLPixelFormat,
+    pub motion: MTLPixelFormat,
+    pub out: MTLPixelFormat,
+}
+
+impl Formats {
+    /// The formats of a caller with colour only.
+    pub fn spatial(color: MTLPixelFormat, out: MTLPixelFormat) -> Self {
+        Self {
+            color,
+            depth: MTLPixelFormat::Invalid,
+            motion: MTLPixelFormat::Invalid,
+            out,
+        }
+    }
+}
+
+/// What one frame hands an [`Upscale`]: its colour, and, in [`Mode::Temporal`], its depth and its
+/// motion vectors.
+pub enum Inputs<'a> {
+    ColorOnly,
+    ColorDepthMotion {
+        depth: &'a ProtocolObject<dyn MTLTexture>,
+        motion: &'a ProtocolObject<dyn MTLTexture>,
+    },
+}
+
+/// One MetalFX upscale of an input size into an output size: the spatial scaler, or the temporal
+/// one when the caller has depth and motion vectors and the system has it. Unlike [`Spatial`] and
+/// [`Temporal`], a caller does not have to know which of them it can use.
+pub struct Upscale {
+    which: Which,
+    mode: Mode,
+    input: (usize, usize),
+    output: (usize, usize),
+}
+
+enum Which {
+    Spatial(Spatial),
+    Temporal(Temporal),
+}
+
+impl Upscale {
+    /// An upscale in `asked`'s mode, or in [`Mode::Spatial`] where the system has no temporal
+    /// scaler; `None` where it has no MetalFX at all. `Err` is the system's own reason (an
+    /// unsupported format, say).
+    pub fn new(
+        device: &ProtocolObject<dyn MTLDevice>,
+        asked: Mode,
+        input: (usize, usize),
+        output: (usize, usize),
+        formats: Formats,
+    ) -> Result<Option<Self>, String> {
+        let temporal = asked == Mode::Temporal && temporal();
+        let (which, mode) = if temporal {
+            match Temporal::new(
+                device,
+                input,
+                output,
+                formats.color,
+                formats.depth,
+                formats.motion,
+                formats.out,
+            )? {
+                Some(t) => (Which::Temporal(t), Mode::Temporal),
+                None => return Ok(None),
+            }
+        } else {
+            match Spatial::new(device, input, output, formats.color, formats.out)? {
+                Some(s) => (Which::Spatial(s), Mode::Spatial),
+                None => return Ok(None),
+            }
+        };
+        Ok(Some(Self {
+            which,
+            mode,
+            input,
+            output,
+        }))
+    }
+
+    /// The mode it ended up in: the one asked for, or [`Mode::Spatial`] where the system had no
+    /// temporal scaler.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// The input and output sizes it was made for.
+    pub fn sizes(&self) -> ((usize, usize), (usize, usize)) {
+        (self.input, self.output)
+    }
+
+    /// Whether [`Self::encode`] would encode `inputs`: a temporal upscale needs the frame's depth
+    /// and motion vectors, which is what makes it one.
+    pub fn takes(&self, inputs: &Inputs<'_>) -> bool {
+        match (self.mode, inputs) {
+            (Mode::Spatial, _) | (Mode::Temporal, Inputs::ColorDepthMotion { .. }) => true,
+            (Mode::Temporal, Inputs::ColorOnly) => false,
+        }
+    }
+
+    /// Scales `color` into `out` on `cb`, from `inputs` and, in [`Mode::Temporal`], `reset` on the
+    /// first frame and after a cut. False, having encoded nothing, when the mode is temporal and
+    /// `inputs` has no depth and motion vectors: a caller keeps its own path rather than scale a
+    /// frame the scaler cannot accumulate from.
+    pub fn encode(
+        &self,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        color: &ProtocolObject<dyn MTLTexture>,
+        inputs: Inputs<'_>,
+        out: &ProtocolObject<dyn MTLTexture>,
+        reset: bool,
+    ) -> bool {
+        match (&self.which, inputs) {
+            (Which::Spatial(s), _) => {
+                s.encode(cb, color, out);
+                true
+            }
+            (Which::Temporal(t), Inputs::ColorDepthMotion { depth, motion }) => {
+                t.encode(cb, color, depth, motion, out, reset);
+                true
+            }
+            (Which::Temporal(_), Inputs::ColorOnly) => false,
         }
     }
 }
@@ -293,7 +440,7 @@ impl Interpolator {
 
 #[cfg(test)]
 mod tests {
-    use super::{Interpolator, Spatial, Temporal, interpolator, spatial, temporal};
+    use super::{Interpolator, Spatial, Temporal, Upscale, interpolator, spatial, temporal};
     use crate::metal::Metal;
     use objc2::runtime::ProtocolObject;
     use objc2_metal::{
@@ -455,6 +602,146 @@ mod tests {
             cb.status(),
             MTLCommandBufferStatus::Completed,
             "the generated frame did not complete"
+        );
+    }
+    /// The formats an upscale of 64x64 colour, depth and motion vectors into 128x128 takes.
+    fn formats_temporal() -> super::Formats {
+        super::Formats {
+            color: MTLPixelFormat::BGRA8Unorm,
+            depth: MTLPixelFormat::Depth32Float,
+            motion: MTLPixelFormat::RGBA16Float,
+            out: MTLPixelFormat::BGRA8Unorm,
+        }
+    }
+
+    /// A caller that has depth and motion vectors gets the temporal scaler where the system has
+    /// one, and the spatial one everywhere else: it never has to ask which exists.
+    #[test]
+    fn an_upscale_takes_the_mode_its_inputs_allow() {
+        if !spatial() {
+            return;
+        }
+        let m = Metal::new().unwrap();
+        let asked = Upscale::new(
+            &m.dev,
+            super::Mode::Temporal,
+            (64, 64),
+            (128, 128),
+            formats_temporal(),
+        )
+        .unwrap();
+        let Some(asked) = asked else {
+            println!("MetalFX: no upscale on this system");
+            return;
+        };
+        let expected = if temporal() {
+            super::Mode::Temporal
+        } else {
+            super::Mode::Spatial
+        };
+        assert_eq!(asked.mode(), expected, "the mode the inputs allow");
+        assert_eq!(asked.sizes(), ((64, 64), (128, 128)));
+
+        let spatial_only = Upscale::new(
+            &m.dev,
+            super::Mode::Spatial,
+            (64, 64),
+            (128, 128),
+            super::Formats::spatial(MTLPixelFormat::BGRA8Unorm, MTLPixelFormat::BGRA8Unorm),
+        )
+        .unwrap()
+        .expect("a spatial upscale where MetalFX exists");
+        assert_eq!(spatial_only.mode(), super::Mode::Spatial);
+    }
+
+    /// A temporal upscale refuses a frame with colour only, and says so instead of encoding: the
+    /// caller keeps its own path rather than scale a frame the scaler cannot accumulate from.
+    #[test]
+    fn a_temporal_upscale_will_not_take_colour_only() {
+        if !temporal() {
+            return;
+        }
+        let m = Metal::new().unwrap();
+        let Some(up) = Upscale::new(
+            &m.dev,
+            super::Mode::Temporal,
+            (64, 64),
+            (128, 128),
+            formats_temporal(),
+        )
+        .unwrap() else {
+            return;
+        };
+        assert_eq!(up.mode(), super::Mode::Temporal);
+        assert!(
+            !up.takes(&super::Inputs::ColorOnly),
+            "it would take colour only"
+        );
+        let (color, out) = (texture(&m, 64, 64), texture(&m, 128, 128));
+        let q = m.dev.newCommandQueue().unwrap();
+        let cb = q.commandBuffer().unwrap();
+        assert!(
+            !up.encode(&cb, &color, super::Inputs::ColorOnly, &out, true),
+            "it encoded a frame it cannot accumulate from"
+        );
+        cb.commit();
+        cb.waitUntilCompleted();
+    }
+
+    /// Both modes run on the GPU through one type: 64x64 into 128x128, and the command buffer
+    /// does not fail. Skipped where the system has no MetalFX.
+    #[test]
+    fn an_upscale_runs_in_both_modes() {
+        if !spatial() {
+            return;
+        }
+        let m = Metal::new().unwrap();
+        let q = m.dev.newCommandQueue().unwrap();
+        let (color, out) = (texture(&m, 64, 64), texture(&m, 128, 128));
+        let (d, mv) = (depth(&m, 64, 64), motion(&m, 64, 64));
+
+        let spatial_only = Upscale::new(
+            &m.dev,
+            super::Mode::Spatial,
+            (64, 64),
+            (128, 128),
+            super::Formats::spatial(MTLPixelFormat::BGRA8Unorm, MTLPixelFormat::BGRA8Unorm),
+        )
+        .unwrap()
+        .expect("a spatial upscale where MetalFX exists");
+        let cb = q.commandBuffer().unwrap();
+        assert!(spatial_only.encode(&cb, &color, super::Inputs::ColorOnly, &out, true));
+        cb.commit();
+        cb.waitUntilCompleted();
+        assert_eq!(
+            cb.status(),
+            MTLCommandBufferStatus::Completed,
+            "the spatial upscale did not complete"
+        );
+
+        let Some(both) = Upscale::new(
+            &m.dev,
+            super::Mode::Temporal,
+            (64, 64),
+            (128, 128),
+            formats_temporal(),
+        )
+        .unwrap() else {
+            return;
+        };
+        let cb = q.commandBuffer().unwrap();
+        let inputs = super::Inputs::ColorDepthMotion {
+            depth: &d,
+            motion: &mv,
+        };
+        assert!(both.takes(&inputs));
+        assert!(both.encode(&cb, &color, inputs, &out, true));
+        cb.commit();
+        cb.waitUntilCompleted();
+        assert_eq!(
+            cb.status(),
+            MTLCommandBufferStatus::Completed,
+            "the temporal upscale did not complete"
         );
     }
 }

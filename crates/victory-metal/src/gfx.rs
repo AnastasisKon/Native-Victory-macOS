@@ -168,6 +168,14 @@ impl Texture {
             .newTextureViewWithPixelFormat(plain)
             .unwrap_or_else(|| self.tex.clone())
     }
+
+    /// The texture itself, for a caller that hands it to something other than this backend's
+    /// passes: MetalFX's scalers take a colour, a depth and a motion-vector texture directly
+    /// ([`crate::metalfx::Upscale`]), and the FidelityFX seam of `victory-gpu` is what gives them
+    /// the title's.
+    pub fn mtl(&self) -> &ProtocolObject<dyn MTLTexture> {
+        &self.tex
+    }
 }
 
 pub struct Sampler(Retained<ProtocolObject<dyn MTLSamplerState>>);

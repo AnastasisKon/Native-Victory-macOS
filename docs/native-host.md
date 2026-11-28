@@ -1971,8 +1971,9 @@ entry pointing away from its view's memory more than 1,000 times (a 1,872-byte v
 had gone from one pool address to another, for one), and 3 times with the views followed (an
 unordered view of 793,296 bytes whose own address had changed under the same record: not this, and
 not explained). Buffers that held foreign data were how it showed: the records of indirect
-dispatches read as millions of groups (`ExecuteIndirect on the native host`); none past the limits
-in three runs with the views followed, 0 to 43 a run in seven without. Cost: the title's tables
+dispatches read as millions of groups (`ExecuteIndirect on the native host`). Following the views
+does not stop those records: headless, none was past the limits in three runs with the views
+followed (0 to 43 a run in seven without), but a windowed run of the same build had 15. Cost: the title's tables
 advance through its heap and the entries behind them stay followed, 572,863 views after 300 s, and
 a look walks the pool table once for each distinct range: 4.7 ms a look on average over 1,000
 looks (1.6 % of the run; frames in 300 s 2,331 and 2,441, against 2,304 to 2,368 before).

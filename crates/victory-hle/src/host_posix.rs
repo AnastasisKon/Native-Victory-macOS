@@ -776,6 +776,25 @@ pub extern "system" fn CloseHandle(handle: *mut c_void) -> i32 {
     1
 }
 
+/// `CreateRemoteThreadEx`: this process's thread, with the attributes it was
+/// given applied to nothing. A thread elsewhere is not this process's to start.
+pub extern "system" fn CreateRemoteThreadEx(
+    process: *mut c_void,
+    attributes: *const c_void,
+    stack_size: usize,
+    start: usize,
+    param: *mut c_void,
+    flags: u32,
+    _list: *const c_void,
+    thread_id: *mut u32,
+) -> *mut c_void {
+    if process != system::GetCurrentProcess() as usize as *mut c_void {
+        set_error(ERROR_INVALID_HANDLE);
+        return std::ptr::null_mut();
+    }
+    CreateThread(attributes, stack_size, start, param, flags, thread_id)
+}
+
 /// `DuplicateHandle` within this process: a second handle to the same object,
 /// which shares its state as it does on Windows (a file's position, a thread's
 /// end, an event's signal). A handle of another process is not in this table and
@@ -1042,6 +1061,7 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         GetLastError,
         SetLastError,
         DuplicateHandle,
+        CreateRemoteThreadEx,
         GetCurrentThreadId,
         GetCurrentProcessId,
         QueryPerformanceFrequency,

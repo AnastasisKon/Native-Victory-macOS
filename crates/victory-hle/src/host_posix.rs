@@ -481,6 +481,15 @@ pub(crate) struct ThreadObject {
     param: usize,
     /// Its OS id, which a thread knows only once it is running.
     id: AtomicU32,
+    /// The name `SetThreadDescription` gave it, with its NUL.
+    description: Mutex<Option<Vec<u16>>>,
+}
+
+thread_local! {
+    /// The calling thread's own name: it has no `ThreadObject` until `OpenThread`
+    /// makes one, and `SetThreadDescription` on `GetCurrentThread` must still stick.
+    static CURRENT_DESCRIPTION: std::cell::RefCell<Option<Vec<u16>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 struct ThreadState {
@@ -862,6 +871,7 @@ pub extern "system" fn CreateThread(
         start,
         param: param as usize,
         id: AtomicU32::new(0),
+        description: Mutex::new(None),
     });
     let (me, finished) = (object.clone(), object.clone());
     // SAFETY: `start` is the title's own thread routine.
@@ -1057,6 +1067,80 @@ pub extern "system" fn OpenThread(_access: u32, _inherit: i32, id: u32) -> *mut 
     new_handle(Object::Thread(t))
 }
 
+/// `GetProcessIdOfThread`: every thread this host can name is in this process.
+pub extern "system" fn GetProcessIdOfThread(handle: *mut c_void) -> u32 {
+    if handle as isize == system::GetCurrentThread() || thread_of(handle).is_some() {
+        return std::process::id();
+    }
+    set_error(ERROR_INVALID_HANDLE);
+    0
+}
+
+/// `SetThreadDescription`: the name a crash report prints beside the thread.
+/// `GetCurrentThread`'s -2 is kept thread-locally, since the calling thread has
+/// no object of its own in the table.
+pub extern "system" fn SetThreadDescription(handle: *mut c_void, description: *const u16) -> i32 {
+    if description.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: the title's NUL-terminated wide string, read up to 32 KiB of units
+    // so a missing terminator cannot walk off the mapping.
+    let mut name = Vec::new();
+    unsafe {
+        for i in 0..(32 << 10) {
+            let unit = *description.add(i);
+            if unit == 0 {
+                break;
+            }
+            name.push(unit);
+        }
+    }
+    name.push(0);
+    if handle as isize == system::GetCurrentThread() {
+        CURRENT_DESCRIPTION.with(|current| *current.borrow_mut() = Some(name));
+        return 1;
+    }
+    let Some(t) = thread_of(handle) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    *lock(&t.description) = Some(name);
+    1
+}
+
+/// `GetThreadDescription`: a copy of the name, in a `LocalAlloc` block the title
+/// frees with `LocalFree` (which leaks here, as `LocalAlloc`'s own blocks do).
+pub extern "system" fn GetThreadDescription(
+    handle: *mut c_void,
+    out: *mut *mut u16,
+) -> i32 {
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let name = if handle as isize == system::GetCurrentThread() {
+        CURRENT_DESCRIPTION.with(|current| current.borrow().clone())
+    } else {
+        let Some(t) = thread_of(handle) else {
+            set_error(ERROR_INVALID_HANDLE);
+            return 0;
+        };
+        lock(&t.description).clone()
+    };
+    let bytes = name.unwrap_or_else(|| vec![0]);
+    // SAFETY: a block of the requested size, filled and given to the title.
+    unsafe {
+        let block = libc::malloc(bytes.len() * 2).cast::<u16>();
+        if block.is_null() {
+            return 0;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), block, bytes.len());
+        out.write(block);
+    }
+    1
+}
+
 /// The function table `HostPolicy` consults on macOS.
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     let dll = dll.to_ascii_lowercase();
@@ -1136,6 +1220,9 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         GetExitCodeThread,
         GetThreadId,
         OpenThread,
+        GetProcessIdOfThread,
+        SetThreadDescription,
+        GetThreadDescription,
     )
 }
 
@@ -1739,6 +1826,7 @@ mod thread_handle_tests {
             start: 0,
             param: 0,
             id: AtomicU32::new(id),
+            description: Mutex::new(None),
         })
     }
 
@@ -1757,7 +1845,7 @@ mod thread_handle_tests {
         assert_eq!(GetExitCodeThread(handle, &mut code), 1);
         assert_eq!(CloseHandle(handle), 1);
 
-        assert!(OpenThread(0x1F_FFFF, 0, 4243).is_null());
+        assert!(OpenThread(0x1F_FFFF, 0, 0x7000_0001).is_null());
         assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
 
         // The entry outlives the thread it named, and is dropped when found dead.
@@ -1776,11 +1864,59 @@ mod thread_handle_tests {
         assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
     }
 
+    /// `SetThreadDescription` names a thread, and `GetThreadDescription` hands the
+    /// name back in a block of its own; the calling thread keeps its name itself.
+    #[test]
+    fn a_thread_keeps_the_name_it_is_given() {
+        let wide: Vec<u16> = "title-thread\0".encode_utf16().collect();
+        let current = system::GetCurrentThread() as usize as *mut c_void;
+        assert_eq!(SetThreadDescription(current, wide.as_ptr()), 1);
+        let mut out: *mut u16 = std::ptr::null_mut();
+        assert_eq!(GetThreadDescription(current, &mut out), 1);
+        // SAFETY: the block `GetThreadDescription` allocated, NUL-terminated.
+        let name = unsafe { std::slice::from_raw_parts(out, 13) };
+        assert_eq!(String::from_utf16_lossy(name), "title-thread\0");
+
+        let thread = object(0x7000_0002);
+        lock(&THREADS).insert(0x7000_0002, Arc::downgrade(&thread));
+        let handle = OpenThread(0x1F_FFFF, 0, 0x7000_0002);
+        assert_eq!(SetThreadDescription(handle, wide.as_ptr()), 1);
+        assert_eq!(GetThreadDescription(handle, &mut out), 1);
+        // SAFETY: as above.
+        let name = unsafe { std::slice::from_raw_parts(out, 13) };
+        assert_eq!(String::from_utf16_lossy(name), "title-thread\0");
+        assert_eq!(GetProcessIdOfThread(handle), std::process::id());
+        assert_eq!(CloseHandle(handle), 1);
+
+        // A thread nobody named answers with the empty string, not a failure.
+        let unnamed = object(0x7000_0003);
+        lock(&THREADS).insert(0x7000_0003, Arc::downgrade(&unnamed));
+        let handle = OpenThread(0x1F_FFFF, 0, 0x7000_0003);
+        assert_eq!(GetThreadDescription(handle, &mut out), 1);
+        // SAFETY: as above, one unit.
+        assert_eq!(unsafe { out.read() }, 0);
+        assert_eq!(CloseHandle(handle), 1);
+
+        assert_eq!(GetProcessIdOfThread(std::ptr::null_mut()), 0);
+        assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+        assert_eq!(SetThreadDescription(std::ptr::null_mut(), wide.as_ptr()), 0);
+        assert_eq!(GetLastError(), ERROR_INVALID_HANDLE);
+        assert_eq!(SetThreadDescription(current, std::ptr::null()), 0);
+        assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
     #[test]
     fn opening_a_thread_is_answered_rather_than_stubbed() {
         for dll in ["kernel32.dll", "api-ms-win-core-processthreads-l1-1-0.dll"] {
-            assert!(lookup(dll, "OpenThread").is_some(), "{dll}!OpenThread");
-            assert!(lookup(dll, "GetThreadId").is_some(), "{dll}!GetThreadId");
+            for name in [
+                "OpenThread",
+                "GetThreadId",
+                "GetProcessIdOfThread",
+                "SetThreadDescription",
+                "GetThreadDescription",
+            ] {
+                assert!(lookup(dll, name).is_some(), "{dll}!{name}");
+            }
         }
     }
 }

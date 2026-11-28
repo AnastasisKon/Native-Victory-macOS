@@ -32,6 +32,11 @@ static WAIT_ALL: Mutex<()> = Mutex::new(());
 /// Threads in [`wait_multiple`]: with none, a signal makes no wake system call.
 static MULTI_WAITERS: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(test)]
+pub(super) fn multi_waiters() -> u32 {
+    MULTI_WAITERS.load(Ordering::SeqCst)
+}
+
 /// Something a wait could be waiting for was signalled.
 pub(super) fn signalled() {
     // SeqCst on both sides: a waiter that registers after this load reads the new epoch.
@@ -53,15 +58,28 @@ pub(super) fn wait_multiple(objects: &[Waitable], all: bool, timeout: Option<Dur
 fn wait_registered(objects: &[Waitable], all: bool, timeout: Option<Duration>) -> u32 {
     let deadline = timeout.map(|t| Instant::now() + t);
     loop {
-        let seen = EPOCH.load(Ordering::SeqCst);
+        let mut seen = EPOCH.load(Ordering::SeqCst);
         if all {
-            let _one_at_a_time = WAIT_ALL.lock().unwrap_or_else(|e| e.into_inner());
-            let taken = objects.iter().take_while(|o| o.try_take()).count();
-            if taken == objects.len() {
-                return WAIT_OBJECT_0;
-            }
-            for o in &objects[..taken] {
-                o.give_back();
+            let restored = {
+                let _one_at_a_time = WAIT_ALL.lock().unwrap_or_else(|e| e.into_inner());
+                let taken = objects.iter().take_while(|o| o.try_take()).count();
+                if taken == objects.len() {
+                    return WAIT_OBJECT_0;
+                }
+                let mut restored = false;
+                for o in &objects[..taken] {
+                    restored |= o.give_back();
+                }
+                restored
+            };
+            if restored {
+                let after = EPOCH.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+                if MULTI_WAITERS.load(Ordering::SeqCst) > 1 {
+                    wake_all(&EPOCH);
+                }
+                if after == seen.wrapping_add(1) {
+                    seen = after;
+                }
             }
         } else if let Some(i) = objects.iter().position(Waitable::try_take) {
             return WAIT_OBJECT_0 + i as u32;

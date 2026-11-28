@@ -5,9 +5,11 @@
 //! most expensive passes, `=<n>` logs `n`. At each present (a frame's boundary) the passes
 //! timed since the last one are logged, most expensive first, by pipeline and work.
 //!
-//! Only encoder kinds the device reports as sampling at their own boundary are sampled: Metal
-//! asserts (and aborts) on `sampleCountersInBuffer` for a kind it does not support, which is
-//! not the same on every GPU family (a G15X samples dispatch and draw boundaries, not blit).
+//! Only encoder kinds the device reports as sampling at their own boundary (draw/dispatch/blit)
+//! are sampled: Metal asserts (and aborts) on `sampleCountersInBuffer` for an encoder that does
+//! not accept it, and the stage-boundary flag is not a reliable sign — an AGXG15X (M4 Pro)
+//! reports `AtStageBoundary` yet every encoder asserts on the call, so on that GPU family
+//! nothing is sampled.
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -36,6 +38,14 @@ impl Points {
     }
 }
 
+/// The sampling granularity: one sample pair per pass encoder, or (`Draw`) also one sample at
+/// each draw/dispatch boundary inside a render/compute pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Pass,
+    Draw,
+}
+
 /// What one timed pass was: its kind, the pipeline it ran (by pointer; `pipe_names` in gfx.rs
 /// names it), and how much work it held (draws, thread groups, blit ops).
 #[derive(Clone, Debug)]
@@ -45,11 +55,14 @@ pub(crate) struct PassLabel {
     pub work: u64,
 }
 
-/// A timed pass whose samples resolved: the label, and the GPU nanoseconds between its samples.
+/// A timed pass whose samples resolved: the label, the GPU nanoseconds across all its samples
+/// (encoder start to end), and in `Draw` mode the per-draw/per-dispatch intervals between the
+/// samples (empty in `Pass` mode).
 #[derive(Clone, Debug)]
 pub(crate) struct PassSample {
     pub label: PassLabel,
     pub nanos: u64,
+    pub draws: Vec<u64>,
 }
 
 /// The device's timestamp counter set and the encoder kinds it samples: makes one sample buffer
@@ -59,19 +72,22 @@ pub(crate) struct PassTimer {
     set: Retained<ProtocolObject<dyn MTLCounterSet>>,
     /// How many of a frame's most expensive passes to log.
     pub top: usize,
+    mode: Mode,
     points: Points,
 }
 
 impl PassTimer {
     /// `VICTORY_PASS_TIMING` asks for this: `=1` logs a frame's 10 most expensive passes, `=<n>`
-    /// logs `n`. `None` when unset, or when the device samples no encoder kind.
+    /// logs `n`, `=draw` (or `=draw,<n>`) also samples each draw/dispatch boundary inside a
+    /// pass. `None` when unset, or when the device samples no encoder kind.
     pub(crate) fn asked(dev: &Retained<ProtocolObject<dyn MTLDevice>>) -> Option<PassTimer> {
         let v = std::env::var("VICTORY_PASS_TIMING").ok()?;
-        let top = match v.trim() {
-            "1" => 10,
-            s => s.parse::<usize>().ok().filter(|&n| n > 0)?,
+        let v = v.trim();
+        let (mode, top) = match v.strip_prefix("draw") {
+            Some(rest) => (Mode::Draw, rest.strip_prefix(',').and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(10)),
+            None => (Mode::Pass, match v { "1" => 10, s => s.parse::<usize>().ok().filter(|&n| n > 0)? }),
         };
-        let timer = Self::supported(dev, top);
+        let timer = Self::supported(dev, top, mode);
         match &timer {
             Some(t) => {
                 let p = t.points();
@@ -79,6 +95,7 @@ impl PassTimer {
                     compute = p.compute,
                     render = p.render,
                     blit = p.blit,
+                    draw = t.mode == Mode::Draw,
                     top = t.top,
                     "metal: VICTORY_PASS_TIMING on: GPU time per pass, sampled at each encoder's boundary"
                 );
@@ -89,7 +106,11 @@ impl PassTimer {
     }
 
     /// The device's timestamp counter set, if it has one, and the encoder kinds it samples.
-    pub(crate) fn supported(dev: &Retained<ProtocolObject<dyn MTLDevice>>, top: usize) -> Option<PassTimer> {
+    pub(crate) fn supported(dev: &Retained<ProtocolObject<dyn MTLDevice>>, top: usize, mode: Mode) -> Option<PassTimer> {
+        // Only the per-boundary points gate a kind: `supportsCounterSampling(AtStageBoundary)`
+        // is not a reliable sign that an encoder accepts sampleCountersInBuffer — an AGXG15X
+        // (M4 Pro) reports the stage boundary yet every encoder (blit included) asserts on the
+        // call, aborting the process. The draw/dispatch/blit points are the ones that work.
         let points = Points {
             compute: dev.supportsCounterSampling(MTLCounterSamplingPoint::AtDispatchBoundary),
             render: dev.supportsCounterSampling(MTLCounterSamplingPoint::AtDrawBoundary),
@@ -110,34 +131,46 @@ impl PassTimer {
                     })
             })
             ?;
-        Some(PassTimer { dev: dev.clone(), set, top, points })
+        Some(PassTimer { dev: dev.clone(), set, top, mode, points })
     }
 
     pub(crate) fn points(&self) -> Points {
         self.points
     }
 
-    /// A sample buffer for one command buffer of `passes` passes: two samples a pass (its
-    /// encoder's start and end), plus two for the blit pass a refused pass's fills are
+    /// A sample buffer for one command buffer of `passes` passes and (in `Draw` mode) `ops`
+    /// draws/dispatches inside them: one sample at a pass encoder's start and end, plus one per
+    /// draw/dispatch in `Draw` mode, plus two for the blit pass a refused pass's fills are
     /// re-encoded into.
-    pub(crate) fn begin(&self, passes: usize) -> Option<PassTiming> {
+    pub(crate) fn begin(&self, passes: usize, ops: usize) -> Option<PassTiming> {
         let d = MTLCounterSampleBufferDescriptor::new();
         d.setCounterSet(Some(&*self.set));
         d.setLabel(&NSString::from_str("victory pass timing"));
         d.setStorageMode(MTLStorageMode::Shared);
+        let samples = 2 * passes + 2 + if self.mode == Mode::Draw { ops } else { 0 };
         // SAFETY: the count is a plain number; the samples stay below it (see `begin_pass`).
-        unsafe { d.setSampleCount(2 * passes + 2) };
+        unsafe { d.setSampleCount(samples) };
         let buf = self.dev.newCounterSampleBufferWithDescriptor_error(&d).ok()?;
-        Some(PassTiming { buf, next: 0, passes: Vec::with_capacity(passes), points: self.points })
+        Some(PassTiming { buf, next: 0, passes: Vec::with_capacity(passes), mode: self.mode, points: self.points })
     }
 }
 
-/// The timing of one command buffer in flight: its sample buffer, the next sample index (two a
-/// pass), and one label per timed pass, in encode order.
+/// One timed pass: its label, the index of its first sample, and how many samples it took
+/// (start, the `Draw`-mode mid samples, end).
+#[derive(Clone, Debug)]
+pub(crate) struct PassRec {
+    label: PassLabel,
+    start: usize,
+    samples: usize,
+}
+
+/// The timing of one command buffer in flight: its sample buffer, the next sample index, and
+/// one record per timed pass, in encode order.
 pub(crate) struct PassTiming {
     buf: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
     next: usize,
-    passes: Vec<PassLabel>,
+    passes: Vec<PassRec>,
+    mode: Mode,
     points: Points,
 }
 
@@ -156,23 +189,47 @@ impl PassTiming {
         }
     }
 
-    /// Reserves the sample pair for the next pass and returns its start index, or `None` when
-    /// the device does not sample this kind (no label, no samples: the pairs stay aligned).
+    /// Reserves the start sample of the next pass and returns its index, or `None` when the
+    /// device does not sample this kind (no record, no samples: the indices stay aligned).
     pub(crate) fn begin_pass(&mut self, kind: &'static str, pipe: usize, work: u64) -> Option<usize> {
         if !self.kind_ok(kind) {
             return None;
         }
         let at = self.next;
-        self.next += 2;
-        self.passes.push(PassLabel { kind, pipe, work });
+        self.next += 1;
+        self.passes.push(PassRec { label: PassLabel { kind, pipe, work }, start: at, samples: 1 });
         Some(at)
+    }
+
+    /// In `Draw` mode, one more sample inside the current pass (at a draw/dispatch boundary).
+    /// `None` in `Pass` mode and for blit passes, which have no draw boundary.
+    pub(crate) fn sample_mid(&mut self, kind: &str) -> Option<usize> {
+        if self.mode != Mode::Draw || kind == "blit" {
+            return None;
+        }
+        let at = self.next;
+        self.next += 1;
+        if let Some(p) = self.passes.last_mut() {
+            p.samples += 1;
+        }
+        Some(at)
+    }
+
+    /// The end sample of the current pass; returns its index.
+    pub(crate) fn end_pass(&mut self) -> usize {
+        let at = self.next;
+        self.next += 1;
+        if let Some(p) = self.passes.last_mut() {
+            p.samples += 1;
+        }
+        at
     }
 
     pub(crate) fn sample_count(&self) -> usize {
         self.next
     }
 
-    pub(crate) fn labels(&self) -> &[PassLabel] {
+    pub(crate) fn labels(&self) -> &[PassRec] {
         &self.passes
     }
 
@@ -233,19 +290,24 @@ pub(crate) fn completed(serial: u64) {
     // SAFETY: `raw` holds `len` bytes, as asked.
     unsafe { data.getBytes_length(NonNull::new(raw.as_mut_ptr().cast()).unwrap(), len) };
     let mut frame = FRAME.lock().unwrap_or_else(|e| e.into_inner());
-    for (i, label) in timing.labels().iter().enumerate() {
-        // Pass `i`'s samples are at `2*i` and `2*i+1`.
-        let (Some(a), Some(b)) = (raw.get(i * 16..i * 16 + 8), raw.get(i * 16 + 8..i * 16 + 16)) else {
-            continue;
-        };
-        let (a, b) = (
-            u64::from_le_bytes(a.try_into().unwrap()),
-            u64::from_le_bytes(b.try_into().unwrap()),
-        );
-        if a == ERROR_VALUE || b == ERROR_VALUE {
-            continue;
-        }
-        frame.push(PassSample { label: label.clone(), nanos: b.saturating_sub(a) });
+    let ts = |i: usize| -> Option<u64> {
+        let b = raw.get(i * 8..i * 8 + 8)?;
+        let v = u64::from_le_bytes(b.try_into().unwrap());
+        (v != ERROR_VALUE).then_some(v)
+    };
+    for rec in timing.labels() {
+        // The pass's samples are `ts[start .. start+samples]`; its time is end - start, and in
+        // `Draw` mode each consecutive pair is one draw's/dispatch's interval.
+        let Some(first) = ts(rec.start) else { continue };
+        let Some(last) = ts(rec.start + rec.samples - 1) else { continue };
+        let draws = (1..rec.samples - 1)
+            .filter_map(|j| match (ts(rec.start + j), ts(rec.start + j - 1)) {
+                (Some(a), Some(b)) => a.checked_sub(b),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let draws = if draws.len() == rec.samples - 2 { draws } else { Vec::new() };
+        frame.push(PassSample { label: rec.label.clone(), nanos: last.saturating_sub(first), draws });
     }
 }
 
@@ -272,6 +334,22 @@ pub(crate) fn frame_boundary(top: usize, name: impl Fn(usize) -> Option<String>)
             ms = s.nanos as f64 / 1e6,
             "pass time"
         );
+        // In `Draw` mode the pass's slowest draws, most expensive first.
+        if !s.draws.is_empty() {
+            let mut draws = s.draws.clone();
+            draws.sort_by_key(|d| std::cmp::Reverse(*d));
+            for (j, d) in draws.iter().take(3).enumerate() {
+                tracing::info!(
+                    frame = no,
+                    rank = rank + 1,
+                    kind = s.label.kind,
+                    pipe = pipe.as_str(),
+                    draw = j + 1,
+                    ms = *d as f64 / 1e6,
+                    "pass time draw"
+                );
+            }
+        }
     }
     tracing::info!(frame = no, passes = frame.len(), total_ms = total as f64 / 1e6, "pass time: frame total");
     std::mem::take(&mut *frame)

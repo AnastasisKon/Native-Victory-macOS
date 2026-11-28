@@ -518,8 +518,15 @@ impl Metal {
     }
 
     /// GPU time per pass (`VICTORY_PASS_TIMING`; the tests force it on a device that supports it).
-    pub fn with_pass_timing(mut self, on: bool) -> Metal {
-        self.pass_timing = on.then(|| crate::pass_timing::PassTimer::supported(&self.dev, 10)).flatten();
+    pub fn with_pass_timing(self, on: bool) -> Metal {
+        self.with_pass_timing_mode(on, crate::pass_timing::Mode::Pass)
+    }
+
+    /// As [`Metal::with_pass_timing`], with the sampling granularity (`draw` mode samples each
+    /// draw/dispatch boundary inside a pass).
+    pub(crate) fn with_pass_timing_mode(mut self, on: bool, mode: crate::pass_timing::Mode) -> Metal {
+        self.pass_timing =
+            on.then(|| crate::pass_timing::PassTimer::supported(&self.dev, 10, mode)).flatten();
         self
     }
 
@@ -1081,6 +1088,41 @@ mod tests {
     fn recommended_working_set_is_nonzero_on_real_hardware() {
         let m = Metal::new().expect("Metal device available on macOS");
         assert!(m.recommended_working_set() > 0);
+    }
+
+    /// `VICTORY_PASS_TIMING=draw`: each dispatch inside a compute pass gets its own sample, so
+    /// the resolved frame holds the pass and one interval per dispatch.
+    #[test]
+    fn draw_mode_samples_each_dispatch_inside_a_pass() {
+        let Some(m) = backend() else { return };
+        let m = m.with_pass_timing_mode(true, crate::pass_timing::Mode::Draw);
+        if m.pass_timing.is_none() {
+            eprintln!("skipped: this Mac's encoders do not accept counter sampling");
+            return;
+        }
+        let q = m.create_queue().unwrap();
+        let fence = m.create_fence(0).unwrap();
+        let p = m.create_compute_pipeline(AFFINE).unwrap();
+        let mem = Mem::new(&m);
+        mem.set(0, |i| i as u32);
+        let work = [step(&m, &p, &mem, (0, 1), (2, 1)), step(&m, &p, &mem, (1, 2), (3, 0))];
+        m.submit(&q, &Submission { waits: &[], dispatches: &work, signals: &[(&fence, 1)] }).unwrap();
+        assert!(m.wait(&fence, 1, 5000));
+        // The completed handler may run just after the signal: wait for the samples.
+        let mut samples = Vec::new();
+        for _ in 0..100 {
+            samples = crate::pass_timing::frame_boundary(10, |_| None);
+            if !samples.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(samples.len(), 1, "one pass");
+        let s = &samples[0];
+        assert_eq!(s.label.kind, "compute");
+        assert_eq!(s.draws.len(), 2, "one interval per dispatch");
+        assert!(s.draws.iter().all(|d| *d < 60 * 1_000_000_000), "dispatches do not take a minute: {:?}", s.draws);
+        assert!(s.nanos >= *s.draws.iter().max().unwrap(), "the pass is at least its slowest dispatch");
     }
 
     /// A pipeline still compiling when the wait ends is not an error: the same call later picks

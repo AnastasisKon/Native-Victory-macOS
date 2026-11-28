@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+tracing.workspace = true
 miniz_oxide.workspace = true
 
 [features]

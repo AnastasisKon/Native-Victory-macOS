@@ -89,6 +89,154 @@ pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
     }
 }
 
+/// Metal's limit on a mesh pipeline's output, in bytes: `Total mesh size
+/// (N) exceeds the maximum mesh size allowed (32768)` above it: no
+/// pipeline (D3DMetal makes it a no-op).
+pub(crate) const METAL_MESH_BYTES: u32 = 32768;
+
+/// Bytes of one output record (vertex or primitive) of a mesh shader as
+/// Metal counts them, the record being the struct Apple's Metal Shader
+/// Converter (D3DMetal 4.0b3's and the standalone one alike) makes of
+/// the signature: the clip and cull distances as a float array, the
+/// position, then one field per other element in element order (the
+/// distances again among them), each of `cols` 32-bit components and
+/// aligned to its own size: 4, 8, 12 (a 3-vector packs at a multiple of
+/// 12, not 16) or 16 bytes, with no padding at the end. Every field counts,
+/// whether the pixel shader reads it or not. Measured with Metal's own
+/// messages for mesh pipelines of chosen output structs
+/// (`metal_records_are_the_sizes_metal_reports`).
+pub(crate) fn metal_record<'a>(elements: impl IntoIterator<Item = &'a SigElement>) -> u32 {
+    let elements: Vec<&SigElement> = elements.into_iter().collect();
+    let distances: u32 = elements
+        .iter()
+        .filter(|e| matches!(e.kind, 6 | 7))
+        .map(|e| u32::from(e.cols))
+        .sum();
+    let (position, rest): (Vec<&SigElement>, Vec<&SigElement>) =
+        elements.into_iter().partition(|e| e.kind == 3);
+    position.into_iter().chain(rest).fold(4 * distances, |at, e| {
+        let size = 4 * u32::from(e.cols.max(1));
+        at.div_ceil(size) * size + size
+    })
+}
+
+/// Metal's size of a mesh shader's output (see [`metal_record`]).
+pub(crate) fn metal_mesh_bytes(
+    vertices: &[SigElement],
+    primitives: &[SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> u32 {
+    let prims = if primitives.is_empty() {
+        0
+    } else {
+        max_primitives * metal_record(primitives)
+    };
+    max_vertices * metal_record(vertices) + prims
+}
+
+/// An order of mesh output elements whose Metal record ([`metal_record`])
+/// is as small as it can be: system values first, in their order, then
+/// the rest. The elements' rows stay; only their order (their signature
+/// IDs) changes, which D3D12 and Metal do not link by (semantics do).
+///
+/// Only the sizes of the rest matter (4, 8, 12 or 16 bytes, each aligned
+/// to its size), and the padding before a field depends only on where the
+/// record is modulo 48 (their least common multiple). So the smallest
+/// record is found exactly by a search over (how many of each size are
+/// left, offset modulo 48), each state remembered: at most 12 offsets
+/// times the product of (count + 1) of the four sizes: a few hundred
+/// states for a usual mesh, about 700,000 at worst (32 rows of scalars
+/// and vectors mixed), and only for a mesh over Metal's limit. Placing the widest field that needs no
+/// padding first (the rule before this one) misses layouts: the position,
+/// twelve 4-vectors and four 3-vectors take 264 bytes that way but 256
+/// with the 3-vectors after the first two 4-vectors. Of the orders as
+/// small, it takes the least padding next and then the widest field, the
+/// elements of one size in their order.
+pub(crate) fn metal_packed_order(elements: &[SigElement]) -> Vec<usize> {
+    let (mut order, rest): (Vec<usize>, Vec<usize>) =
+        (0..elements.len()).partition(|&i| elements[i].kind != 0);
+    // In 4-byte units: sizes 1 to 4, offsets modulo 12.
+    let units = |i: usize| usize::from(elements[i].cols.clamp(1, 4));
+    let mut by_size: [Vec<usize>; 4] = Default::default();
+    for &i in &rest {
+        by_size[units(i) - 1].push(i);
+    }
+    let counts = by_size.each_ref().map(Vec::len);
+    let start = metal_record(order.iter().map(|&i| &elements[i])) as usize / 4 % 12;
+    let pad = |at: usize, size: usize| (size - at % size) % size;
+    // The least padding to place `left` from offset `at`, remembered.
+    let states = counts.iter().map(|n| n + 1).product::<usize>() * 12;
+    let mut memo = vec![u16::MAX; states];
+    fn least(left: [usize; 4], at: usize, counts: &[usize; 4], memo: &mut [u16]) -> u16 {
+        let key = left
+            .iter()
+            .zip(counts)
+            .fold(0, |k, (&l, &n)| k * (n + 1) + l)
+            * 12
+            + at;
+        if memo[key] != u16::MAX {
+            return memo[key];
+        }
+        let mut best = if left == [0; 4] { 0 } else { u16::MAX };
+        for c in (0..4).filter(|&c| left[c] > 0) {
+            let size = c + 1;
+            let p = (size - at % size) % size;
+            let mut next = left;
+            next[c] -= 1;
+            let total = p as u16 + least(next, (at + p + size) % 12, counts, memo);
+            best = best.min(total);
+        }
+        memo[key] = best;
+        best
+    }
+    let (mut left, mut at) = (counts, start);
+    while left != [0; 4] {
+        let c = (0..4)
+            .filter(|&c| left[c] > 0)
+            .min_by_key(|&c| {
+                let p = pad(at, c + 1);
+                let mut next = left;
+                next[c] -= 1;
+                let total = p as u16 + least(next, (at + p + c + 1) % 12, &counts, &mut memo);
+                (total, p, std::cmp::Reverse(c))
+            })
+            .expect("one left");
+        order.push(by_size[c][counts[c] - left[c]]);
+        at = (at + pad(at, c + 1) + c + 1) % 12;
+        left[c] -= 1;
+    }
+    order
+}
+
+/// Mesh output `elements` without the clip and cull distances at the end
+/// of their order (clip then cull, by index, as the console's distance
+/// vectors carry them) whose channels `idle` names (element, channels):
+/// distances that are +0.0 at every vertex, which clip and cull nothing.
+/// Only from the end, so that the others keep their places in the vectors;
+/// an element left without channels goes. `None` when there are none.
+pub(crate) fn without_idle_distances(
+    elements: &[SigElement],
+    idle: &[(usize, u8)],
+) -> Option<Vec<SigElement>> {
+    let mut distances: Vec<usize> = (0..elements.len())
+        .filter(|&i| matches!(elements[i].kind, 6 | 7))
+        .collect();
+    distances.sort_by_key(|&i| (elements[i].kind, elements[i].index));
+    let mut out = elements.to_vec();
+    'elements: for &i in distances.iter().rev() {
+        let channels = idle.iter().find(|x| x.0 == i).map_or(0, |x| x.1);
+        while out[i].cols > 0 {
+            if channels >> (out[i].cols - 1) & 1 == 0 {
+                break 'elements;
+            }
+            out[i].cols -= 1;
+        }
+    }
+    out.retain(|e| e.cols > 0);
+    (out != elements).then_some(out)
+}
+
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((elements.len() as u32).to_le_bytes());
@@ -504,6 +652,197 @@ mod tests {
         }
         assert_eq!(hex(md5(&[0x61; 55])), "ef1772b6dff9a122358552954ad0df65");
         assert_eq!(hex(md5(&[0x61; 56])), "3b0c8ac703f828b04c6c197006d17218");
+    }
+
+    /// Elements of `cols` 32-bit components, one per row: `(name, kind, cols)`.
+    fn outputs(spec: &[(&str, u8, u8)]) -> Vec<SigElement> {
+        spec.iter()
+            .enumerate()
+            .map(|(row, &(name, kind, cols))| SigElement {
+                name: name.into(),
+                index: row as u32,
+                kind,
+                comp: 9,
+                interp: 2,
+                row: Some(row as u32),
+                col: 0,
+                cols,
+                usage: (1 << cols) - 1,
+                half: false,
+            })
+            .collect()
+    }
+
+    /// The sizes Metal gave for mesh pipelines (128 vertices, no primitive
+    /// data) of chosen output structs: position, 15 float4, then the rest.
+    #[test]
+    fn metal_records_are_the_sizes_metal_reports() {
+        let base: Vec<(&str, u8, u8)> = std::iter::once(("SV_Position", 3, 4))
+            .chain(std::iter::repeat_n(("TEXCOORD", 0, 4), 15))
+            .collect();
+        for (rest, bytes) in [
+            (&[4][..], 34816),
+            (&[1], 33280),
+            (&[2], 33792),
+            (&[3], 35328),
+            (&[1, 1], 33792),
+            (&[1, 4], 36864),
+            (&[3, 1], 35840),
+            (&[1, 3], 35328),
+            (&[3, 3], 36864),
+            (&[3, 3, 3, 3], 39936),
+            (&[4, 3], 36864),
+            (&[3, 2], 36864),
+            (&[2, 3], 35328),
+            (&[1, 1, 1, 3], 36864),
+        ] {
+            let mut spec = base.clone();
+            spec.extend(rest.iter().map(|&c| ("TEXCOORD", 0, c)));
+            let els = outputs(&spec);
+            assert_eq!(metal_mesh_bytes(&els, &[], 128, 128), bytes, "{rest:?}");
+        }
+    }
+
+    /// A synthetic mesh of six groups after the position, each a scalar
+    /// and a 3-vector sharing a row, then a 2-vector and a 4-vector: 48
+    /// bytes a group as laid out (8 of them padding), 40 packed, which
+    /// takes it from over Metal's limit to the sum of its components.
+    #[test]
+    fn packed_order_fits_a_mesh_under_metals_limit() {
+        let mut spec = vec![("SV_Position", 3, 4)];
+        for _ in 0..6 {
+            spec.extend([1, 3, 2, 4].map(|c| ("TEXCOORD", 0, c)));
+        }
+        let mut els = outputs(&spec);
+        // The scalar and the 3-vector of a group share a row.
+        for g in 0..6 {
+            let row = els[1 + 4 * g].row;
+            (els[2 + 4 * g].row, els[2 + 4 * g].col) = (row, 1);
+        }
+        assert_eq!(metal_mesh_bytes(&els, &[], 128, 128), 128 * 304);
+        let order = metal_packed_order(&els);
+        let packed: Vec<SigElement> = order.iter().map(|&i| els[i].clone()).collect();
+        assert_eq!(metal_mesh_bytes(&packed, &[], 128, 128), 128 * 256);
+        // System values first, then the 4-vectors, a 2-vector (which ends
+        // at a multiple of 12), the 3-vectors, the other 2-vectors, the
+        // scalars.
+        assert_eq!(
+            order,
+            [
+                0, 4, 8, 12, 16, 20, 24, 3, 2, 6, 10, 14, 18, 22, 7, 11, 15, 19, 23, 1, 5, 9, 13,
+                17, 21
+            ]
+        );
+        // The position comes first wherever its element is.
+        let mut last = els.clone();
+        last.rotate_left(1);
+        assert_eq!(metal_mesh_bytes(&last, &[], 128, 128), 128 * 304);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..els.len()).collect::<Vec<_>>());
+    }
+
+    /// A synthetic mesh's vertex outputs: the position, clip distances of
+    /// `distances` channels, `vectors` 4-vectors and, with `scalar`, a
+    /// scalar.
+    fn distance_mesh(distances: u8, vectors: usize, scalar: bool) -> Vec<SigElement> {
+        let mut spec = vec![("SV_Position", 3, 4), ("SV_ClipDistance", 6, distances)];
+        spec.extend(std::iter::repeat_n(("TEXCOORD", 0, 4), vectors));
+        if scalar {
+            spec.push(("TEXCOORD", 0, 1));
+        }
+        outputs(&spec)
+    }
+
+    fn packed_bytes(els: &[SigElement]) -> u32 {
+        let packed: Vec<SigElement> = metal_packed_order(els)
+            .into_iter()
+            .map(|i| els[i].clone())
+            .collect();
+        metal_mesh_bytes(&packed, &[], 128, 128)
+    }
+
+    /// Placing the widest field that needs no padding first misses a
+    /// layout that fits: the position, twelve 4-vectors and four 3-vectors
+    /// at 128 vertices take 264 bytes a vertex (33,792 in all) that way,
+    /// and exactly Metal's 32,768 with the 3-vectors after the first two
+    /// 4-vectors.
+    #[test]
+    fn packed_order_finds_a_fit_widest_first_misses() {
+        let mut spec = vec![("SV_Position", 3, 4)];
+        spec.extend(std::iter::repeat_n(("TEXCOORD", 0, 4), 12));
+        spec.extend(std::iter::repeat_n(("TEXCOORD", 0, 3), 4));
+        let els = outputs(&spec);
+        assert_eq!(metal_mesh_bytes(&els, &[], 128, 128), 33792);
+        assert_eq!(packed_bytes(&els), METAL_MESH_BYTES);
+        // The 3-vectors in the reverse order: the same.
+        let mut reversed = els.clone();
+        reversed[13..].reverse();
+        assert_eq!(packed_bytes(&reversed), METAL_MESH_BYTES);
+    }
+
+    /// Meshes no order fits: twenty 3-vectors after the position sum to
+    /// 256 bytes a vertex, but a 3-vector packs only at a multiple of 12,
+    /// so the first pads 8 bytes; one scalar more than the case above is
+    /// over by its components alone.
+    #[test]
+    fn packed_order_cannot_fit_what_no_order_fits() {
+        let mut spec = vec![("SV_Position", 3, 4)];
+        spec.extend(std::iter::repeat_n(("TEXCOORD", 0, 3), 20));
+        assert_eq!(packed_bytes(&outputs(&spec)), 128 * 264);
+        let mut spec = vec![("SV_Position", 3, 4)];
+        spec.extend(std::iter::repeat_n(("TEXCOORD", 0, 4), 12));
+        spec.extend(std::iter::repeat_n(("TEXCOORD", 0, 3), 4));
+        spec.push(("TEXCOORD", 0, 1));
+        assert_eq!(packed_bytes(&outputs(&spec)), 128 * 260);
+    }
+
+    /// Meshes over Metal's limit even packed fit without the clip
+    /// distances that are +0.0 at every vertex, or with an output as narrow
+    /// as its pixel shader reads it.
+    #[test]
+    fn meshes_over_metals_limit_packed_fit_without_what_nothing_reads() {
+        // Four clip distances, of which the last three are idle: counted
+        // twice, as the array and as a field.
+        let els = distance_mesh(4, 13, true);
+        assert_eq!(packed_bytes(&els), 128 * 260);
+        let fewer = without_idle_distances(&els, &[(1, 0b1110)]).unwrap();
+        assert_eq!((fewer.len(), fewer[1].cols), (els.len(), 1));
+        assert_eq!(packed_bytes(&fewer), 128 * 256);
+        // One live distance stays; a pixel shader reading one channel of a
+        // 4-vector lets the mesh keep only that channel.
+        let mut els = distance_mesh(1, 14, false);
+        assert_eq!(packed_bytes(&els), 128 * 272);
+        assert_eq!(without_idle_distances(&els, &[(1, 0)]), None);
+        (els[2].col, els[2].cols) = (3, 1);
+        assert_eq!(packed_bytes(&els), 128 * 256);
+    }
+
+    /// Only the distances at the end of the clip-then-cull order go: the
+    /// console's vectors carry the others by position.
+    #[test]
+    fn idle_distances_go_from_the_end_only() {
+        let els = outputs(&[
+            ("SV_Position", 3, 4),
+            ("SV_CullDistance", 7, 2),
+            ("TEXCOORD", 0, 4),
+            ("SV_ClipDistance", 6, 4),
+        ]);
+        let cols = |idle: &[(usize, u8)]| {
+            without_idle_distances(&els, idle)
+                .map(|e| e.iter().map(|e| (e.kind, e.cols)).collect::<Vec<_>>())
+        };
+        // Clip distances before a live cull distance stay.
+        assert_eq!(cols(&[(3, 0b1111)]), None);
+        assert_eq!(cols(&[(1, 0b01), (3, 0b1111)]), None);
+        assert_eq!(cols(&[(1, 0b10)]), Some(vec![(3, 4), (7, 1), (0, 4), (6, 4)]));
+        // An element left without channels goes, and the one before it is
+        // then the end.
+        assert_eq!(
+            cols(&[(1, 0b11), (3, 0b1010)]),
+            Some(vec![(3, 4), (0, 4), (6, 3)])
+        );
+        assert_eq!(cols(&[(1, 0b11), (3, 0b1111)]), Some(vec![(3, 4), (0, 4)]));
     }
 
     #[test]

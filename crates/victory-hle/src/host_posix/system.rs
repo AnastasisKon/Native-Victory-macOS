@@ -12,7 +12,7 @@
 //! The C runtime (`api-ms-win-crt-*`) is not here.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -2536,14 +2536,19 @@ static FLS_USED: Mutex<Vec<bool>> = Mutex::new(Vec::new());
 /// reads 0, as Windows clears a freed slot in every thread.
 static FLS_GENERATION: [AtomicU32; FLS_SLOTS] = [const { AtomicU32::new(0) }; FLS_SLOTS];
 
+/// Each slot's destructor, as `FlsAlloc` was given it (`0` for none). A slot handed out again
+/// carries the callback of its new owner.
+static FLS_CALLBACKS: [AtomicUsize; FLS_SLOTS] = [const { AtomicUsize::new(0) }; FLS_SLOTS];
+
 thread_local! {
     /// Each slot's value and the generation it was set in.
     static FLS_VALUES: std::cell::RefCell<Vec<(u32, usize)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-// shortcut: the destructor callback is not called (at thread end or `FlsFree`).
-pub extern "system" fn FlsAlloc(_callback: usize) -> u32 {
+/// `FlsAlloc`: a slot, whose `callback` (if any) runs on a thread that ends with a value in it,
+/// and on the thread that frees the slot.
+pub extern "system" fn FlsAlloc(callback: usize) -> u32 {
     let mut used = lock(&FLS_USED);
     let free = used.iter().position(|u| !u).unwrap_or(used.len());
     if free >= FLS_SLOTS {
@@ -2555,18 +2560,71 @@ pub extern "system" fn FlsAlloc(_callback: usize) -> u32 {
     }
     used[free] = true;
     FLS_GENERATION[free].fetch_add(1, Ordering::Relaxed);
+    FLS_CALLBACKS[free].store(callback, Ordering::Relaxed);
+    drop(used);
+    if callback != 0 {
+        // The first destructor a title gives arms the thread-exit hook: until then no thread
+        // has a value whose cleanup anyone could hear of.
+        static ARMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ARMED.get_or_init(|| thread::on_thread_exit(run_fls_destructors));
+    }
     free as u32
 }
 
 pub extern "system" fn FlsFree(index: u32) -> i32 {
-    match lock(&FLS_USED).get_mut(index as usize) {
-        Some(used) if *used => {
-            *used = false;
-            1
+    {
+        let mut used = lock(&FLS_USED);
+        match used.get_mut(index as usize) {
+            Some(used) if *used => *used = false,
+            _ => {
+                set_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
         }
-        _ => {
-            set_error(ERROR_INVALID_PARAMETER);
-            0
+    }
+    // The calling thread's value goes through the slot's destructor, as Windows does. The lock
+    // is not held for it: a destructor allocates slots of its own.
+    run_fls_destructor(index as usize);
+    1
+}
+
+/// Calls `slot`'s destructor for the calling thread with the value this thread holds, and says
+/// whether it did. The value is cleared first, so what a callback sets in its place is a new
+/// value rather than this one again.
+fn run_fls_destructor(slot: usize) -> bool {
+    let Some(callback) = FLS_CALLBACKS.get(slot) else {
+        return false;
+    };
+    let callback = callback.load(Ordering::Relaxed);
+    if callback == 0 {
+        return false;
+    }
+    let generation = FLS_GENERATION[slot].load(Ordering::Relaxed);
+    let value = FLS_VALUES.with(|values| {
+        let mut values = values.borrow_mut();
+        match values.get_mut(slot) {
+            Some(held) if held.0 == generation && held.1 != 0 => Some(std::mem::replace(&mut held.1, 0)),
+            _ => None,
+        }
+    });
+    let Some(value) = value else {
+        return false;
+    };
+    // SAFETY: the title's own destructor, `void (WINAPI *)(PVOID lpFlsData)`.
+    unsafe { native::call_win64(callback, &[value as u64]) };
+    true
+}
+
+/// The thread-exit hook: every slot with a value in this thread runs its destructor, up to four
+/// rounds, so a callback that sets its slot again is called again (Windows' limit).
+fn run_fls_destructors() {
+    for _ in 0..4 {
+        let mut ran = false;
+        for slot in 0..FLS_SLOTS {
+            ran |= run_fls_destructor(slot);
+        }
+        if !ran {
+            break;
         }
     }
 }
@@ -4538,8 +4596,72 @@ mod tests {
         assert_eq!(FlsFree(again), 1);
     }
 
-    const ONE_HOUR_DUE: i64 = -3600 * TICKS_PER_SECOND as i64;
+    /// A slot's destructor runs with the value the ending thread held, and the value goes with
+    /// it: at the thread's end (through the platform's exit hook, which the first callback arms)
+    /// and when the slot is freed.
+    #[test]
+    fn fls_destructors_run_for_the_ending_thread() {
+        static DESTROYED: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn record(value: usize) {
+            DESTROYED.store(value, Ordering::Relaxed);
+        }
 
+        // A title's destructor, as the host sees one: a Windows-ABI call into it.
+        let callback = native::host_callbacks(&[(record as *const () as usize, false)]).unwrap()[0];
+        let slot = FlsAlloc(callback);
+        assert_ne!(slot, FLS_OUT_OF_INDEXES);
+        assert_eq!(FlsSetValue(slot, 0x5A5A), 1);
+        thread::run_thread_exit_hooks();
+        assert_eq!(DESTROYED.load(Ordering::Relaxed), 0x5A5A);
+        assert_eq!(FlsGetValue(slot), 0, "the value goes with its destructor");
+
+        // A second thread's values are its own: this thread's end runs nothing there.
+        DESTROYED.store(0, Ordering::Relaxed);
+        let other = std::thread::spawn(move || {
+            FlsSetValue(slot, 7);
+            FlsGetValue(slot)
+        })
+        .join()
+        .unwrap();
+        assert_eq!((other, DESTROYED.load(Ordering::Relaxed)), (7, 0));
+
+        // Freeing the slot runs it for the thread that frees it.
+        assert_eq!(FlsSetValue(slot, 0x1234), 1);
+        DESTROYED.store(0, Ordering::Relaxed);
+        assert_eq!(FlsFree(slot), 1);
+        assert_eq!(DESTROYED.load(Ordering::Relaxed), 0x1234);
+    }
+
+    /// A destructor that sets its slot again is called again, four rounds of it, as Windows
+    /// does; the fifth value it sets stays for the next time.
+    #[test]
+    fn an_fls_destructor_that_sets_its_slot_again_runs_four_times() {
+        static SLOT: AtomicU32 = AtomicU32::new(0);
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static RESET_FAILED: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn again(value: usize) {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            if FlsSetValue(SLOT.load(Ordering::Relaxed), value) != 1 {
+                RESET_FAILED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let callback = native::host_callbacks(&[(again as *const () as usize, false)]).unwrap()[0];
+        let slot = FlsAlloc(callback);
+        assert_ne!(slot, FLS_OUT_OF_INDEXES);
+        SLOT.store(slot, Ordering::Relaxed);
+        CALLS.store(0, Ordering::Relaxed);
+        assert_eq!(FlsSetValue(slot, 9), 1);
+        thread::run_thread_exit_hooks();
+        assert_eq!(CALLS.load(Ordering::Relaxed), 4);
+        assert_eq!(RESET_FAILED.load(Ordering::Relaxed), 0);
+        // What the callback set last is this thread's value still.
+        assert_eq!(FlsGetValue(slot), 9);
+        assert_eq!(FlsFree(slot), 1);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 5, "freeing runs it once more");
+    }
+
+    const ONE_HOUR_DUE: i64 = -3600 * TICKS_PER_SECOND as i64;
     #[test]
     fn disarming_a_threadpool_timer_does_not_wait_for_its_deadline() {
         static CALLS: AtomicU32 = AtomicU32::new(0);

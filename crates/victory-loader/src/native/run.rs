@@ -175,6 +175,9 @@ pub unsafe fn spawn_title_thread_with(
         notify_threads(DLL_THREAD_ATTACH);
         // SAFETY: forwarded from the caller.
         let code = unsafe { call_thread_entry(start, param) };
+        // The host's own per-thread state goes before the title's images hear of the end: a
+        // library's FLS destructor (hle's, armed by `FlsAlloc`) still sees the thread as it is.
+        thread::run_thread_exit_hooks();
         notify_threads(DLL_THREAD_DETACH);
         on_exit(code);
         code

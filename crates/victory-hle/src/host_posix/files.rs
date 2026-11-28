@@ -27,10 +27,10 @@ use std::ffi::{CStr, c_char, c_void};
 use std::fs::{DirEntry, File, OpenOptions, ReadDir};
 use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
-use std::time::SystemTime;
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, Weak};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::{HANDLES, Object, lock, new_handle, set_error};
 
@@ -173,6 +173,8 @@ pub(crate) struct FileObject {
     writable: bool,
     /// Opened for `FILE_APPEND_DATA` without `FILE_WRITE_DATA`: every write goes to the end.
     append: bool,
+    /// The completion port this handle reports to, and the key it reports with.
+    port: Mutex<Option<(Arc<Port>, usize)>>,
 }
 
 /// The host's metadata of the open file `handle`.
@@ -207,6 +209,7 @@ pub(crate) fn standard(fd: i32) -> Option<Arc<FileObject>> {
         // Reading from the console is what fd 0 is for.
         writable: fd != 0,
         append: false,
+        port: Mutex::new(None),
     }))
 }
 
@@ -293,6 +296,7 @@ fn create(path: Option<PathBuf>, access: u32, disposition: u32, flags: u32) -> *
                 position: Mutex::new(0),
                 writable: write,
                 append,
+                port: Mutex::new(None),
             })))
         }
         Err(e) => {
@@ -426,10 +430,12 @@ pub extern "system" fn ReadFile(
         && let IoPosition::Overlapped(ov) = &position
     {
         ov.complete(STATUS_END_OF_FILE, 0);
+        f.post_completion(0, overlapped, STATUS_END_OF_FILE);
         set_error(ERROR_HANDLE_EOF);
         return 0;
     }
     position.complete(at, done);
+    f.post_completion(done, overlapped, 0);
     1
 }
 
@@ -480,6 +486,7 @@ pub extern "system" fn WriteFile(
         return 0;
     }
     position.complete(at, data.len());
+    f.post_completion(data.len(), overlapped, 0);
     if !written.is_null() {
         // SAFETY: the title's out-pointer.
         unsafe { written.write(len) };
@@ -1370,6 +1377,241 @@ pub extern "system" fn UnmapViewOfFile(base: *const c_void) -> i32 {
     1
 }
 
+// Completion ports: a finished overlapped operation is a packet a worker asks for.
+
+/// A packet a completion port holds: what finished, its key, and the title's
+/// OVERLAPPED, which is how the title knows which request it was.
+pub(crate) struct Packet {
+    bytes: usize,
+    key: usize,
+    /// The title's OVERLAPPED, as an address: a packet crosses threads, and a
+    /// pointer is not `Send`.
+    overlapped: usize,
+    /// 0 for a completed read or write, `STATUS_END_OF_FILE` for a read that
+    /// reached the end, which `GetQueuedCompletionStatus` reports as a failure.
+    status: usize,
+}
+
+/// A completion port: finished packets, and the workers waiting for one.
+pub(crate) struct Port {
+    state: Mutex<PortState>,
+    ready: Condvar,
+}
+
+struct PortState {
+    packets: VecDeque<Packet>,
+}
+
+const INFINITE: u32 = 0xFFFF_FFFF;
+const ERROR_TIMEOUT: u32 = 1460;
+/// `OVERLAPPED_ENTRY`: key, OVERLAPPED, Internal, byte count.
+const OVERLAPPED_ENTRY: usize = 4 * std::mem::size_of::<usize>();
+
+impl Port {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PortState {
+                packets: VecDeque::new(),
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn post(&self, packet: Packet) {
+        lock(&self.state).packets.push_back(packet);
+        self.ready.notify_one();
+        super::sync::signalled();
+    }
+
+    /// The next packet, waiting up to `ms` (`INFINITE` for as long as it takes).
+    fn take(&self, ms: u32) -> Option<Packet> {
+        let deadline = (ms != INFINITE).then(|| Instant::now() + Duration::from_millis(u64::from(ms)));
+        let mut state = lock(&self.state);
+        loop {
+            if let Some(packet) = state.packets.pop_front() {
+                return Some(packet);
+            }
+            match deadline {
+                None => state = self.ready.wait(state).ok()?,
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return None;
+                    }
+                    state = self.ready.wait_timeout(state, deadline - now).ok()?.0;
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn port_of(handle: *mut c_void) -> Option<Arc<Port>> {
+    match lock(&HANDLES).get(&(handle as usize)) {
+        Some(Object::Port(p)) => Some(p.clone()),
+        _ => None,
+    }
+}
+
+impl FileObject {
+    /// Reports a finished overlapped operation to the port this handle reports to,
+    /// which is what a title waiting on a port instead of on an event asks for.
+    fn post_completion(&self, bytes: usize, overlapped: *mut u8, status: usize) {
+        if overlapped.is_null() {
+            return;
+        }
+        let association = lock(&self.port).clone();
+        let Some((port, key)) = association else {
+            return;
+        };
+        port.post(Packet {
+            bytes,
+            key,
+            overlapped: overlapped as usize,
+            status,
+        });
+    }
+}
+
+/// `CreateIoCompletionPort`: a new port, or this file associated with an existing
+/// one, which is then returned as it was (Windows hands back the same handle).
+pub extern "system" fn CreateIoCompletionPort(
+    file: *mut c_void,
+    port: *mut c_void,
+    key: usize,
+    _threads: u32,
+) -> *mut c_void {
+    if port.is_null() {
+        if file as usize != INVALID_HANDLE_VALUE {
+            set_error(ERROR_INVALID_PARAMETER);
+            return std::ptr::null_mut();
+        }
+        return new_handle(Object::Port(Arc::new(Port::new())));
+    }
+    let Some(existing) = port_of(port) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return std::ptr::null_mut();
+    };
+    if file as usize != INVALID_HANDLE_VALUE {
+        let Some(object) = file_of(file) else {
+            set_error(ERROR_INVALID_HANDLE);
+            return std::ptr::null_mut();
+        };
+        *lock(&object.port) = Some((existing, key));
+    }
+    port
+}
+
+/// `PostQueuedCompletionStatus`: a packet of the caller's own making, which is how
+/// a title tells a worker to stop.
+pub extern "system" fn PostQueuedCompletionStatus(
+    port: *mut c_void,
+    bytes: u32,
+    key: usize,
+    overlapped: *mut u8,
+) -> i32 {
+    let Some(port) = port_of(port) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    port.post(Packet {
+        bytes: bytes as usize,
+        key,
+        overlapped: overlapped as usize,
+        status: 0,
+    });
+    1
+}
+
+/// `GetQueuedCompletionStatus`: the next finished packet, waiting up to `ms`.
+pub extern "system" fn GetQueuedCompletionStatus(
+    port: *mut c_void,
+    bytes: *mut u32,
+    key: *mut usize,
+    overlapped: *mut *mut u8,
+    ms: u32,
+) -> i32 {
+    let Some(port) = port_of(port) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    let Some(packet) = port.take(ms) else {
+        set_error(ERROR_TIMEOUT);
+        return 0;
+    };
+    // SAFETY: the title's out-pointers, all of which it may leave null.
+    unsafe {
+        if !bytes.is_null() {
+            bytes.write(packet.bytes as u32);
+        }
+        if !key.is_null() {
+            key.write(packet.key);
+        }
+        if !overlapped.is_null() {
+            overlapped.write(packet.overlapped as *mut u8);
+        }
+    }
+    if packet.status != 0 {
+        set_error(ERROR_HANDLE_EOF);
+        return 0;
+    }
+    1
+}
+
+/// `GetQueuedCompletionStatusEx`: up to `count` packets at once, one wait.
+pub extern "system" fn GetQueuedCompletionStatusEx(
+    port: *mut c_void,
+    entries: *mut u8,
+    count: u32,
+    removed: *mut u32,
+    ms: u32,
+    _alertable: i32,
+) -> i32 {
+    let Some(port) = port_of(port) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    if entries.is_null() || count == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some(first) = port.take(ms) else {
+        set_error(ERROR_TIMEOUT);
+        return 0;
+    };
+    let mut taken = vec![first];
+    // Whatever else is already finished comes too, without another wait.
+    {
+        let mut state = lock(&port.state);
+        while (taken.len() as u32) < count {
+            match state.packets.pop_front() {
+                Some(packet) => taken.push(packet),
+                None => break,
+            }
+        }
+    }
+    let mut failed = false;
+    for (i, packet) in taken.iter().enumerate() {
+        // SAFETY: the title's array of `count` OVERLAPPED_ENTRY.
+        unsafe {
+            let entry = entries.add(i * OVERLAPPED_ENTRY);
+            entry.cast::<usize>().write(packet.key);
+            entry
+                .add(8)
+                .cast::<usize>()
+                .write(packet.overlapped as usize);
+            entry.add(16).cast::<usize>().write(packet.status);
+            entry.add(24).cast::<usize>().write(packet.bytes);
+        }
+        failed |= packet.status != 0;
+    }
+    // SAFETY: the title's out word.
+    unsafe { removed.write(taken.len() as u32) };
+    if failed {
+        set_error(ERROR_HANDLE_EOF);
+    }
+    i32::from(!failed)
+}
+
 /// Names this module answers for.
 pub(super) fn lookup(name: &str) -> Option<usize> {
     macro_rules! table {
@@ -1409,6 +1651,10 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
         MapViewOfFileEx,
         UnmapViewOfFile,
         FlushViewOfFile,
+        CreateIoCompletionPort,
+        PostQueuedCompletionStatus,
+        GetQueuedCompletionStatus,
+        GetQueuedCompletionStatusEx,
     )
 }
 
@@ -1718,6 +1964,134 @@ mod tests {
         }
         assert!(OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr()).is_null());
         assert_eq!(super::super::GetLastError(), ERROR_FILE_NOT_FOUND);
+    }
+
+    fn port() -> *mut c_void {
+        let handle = CreateIoCompletionPort(invalid_handle(), std::ptr::null_mut(), 0, 0);
+        assert!(!handle.is_null());
+        handle
+    }
+
+    fn overlapped_for(offset: u64, event: *mut c_void) -> Vec<u8> {
+        let mut ov = vec![0u8; 32];
+        ov[16..24].copy_from_slice(&offset.to_le_bytes());
+        ov[24..32].copy_from_slice(&(event as usize).to_le_bytes());
+        ov
+    }
+
+    /// A packet the caller posted comes back with its key, byte count and
+    /// OVERLAPPED, and a port with nothing finished times out instead.
+    #[test]
+    fn a_posted_packet_comes_back_and_an_empty_port_times_out() {
+        let port = port();
+        let mut request = [0u8; 32];
+        assert_eq!(
+            PostQueuedCompletionStatus(port, 512, 0x1234, request.as_mut_ptr()),
+            1
+        );
+        let (mut bytes, mut key) = (0u32, 0usize);
+        let mut got: *mut u8 = std::ptr::null_mut();
+        assert_eq!(
+            GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut got, 1000),
+            1
+        );
+        assert_eq!((bytes, key, got), (512, 0x1234, request.as_mut_ptr()));
+
+        set_error(0);
+        assert_eq!(
+            GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut got, 10),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_TIMEOUT);
+        assert_eq!(super::super::CloseHandle(port), 1);
+    }
+
+    /// A file associated with a port reports its finished overlapped read there:
+    /// the byte count, the key it was associated with, and the title's OVERLAPPED.
+    #[test]
+    fn an_overlapped_read_reports_to_the_port_the_file_is_associated_with() {
+        let (_dir, _path, file) = mapped_file(&[9u8; 4096]);
+        let port = port();
+        assert_eq!(
+            CreateIoCompletionPort(file, port, 7, 1),
+            port,
+            "the same port handle comes back"
+        );
+
+        let mut buffer = [0u8; 64];
+        let mut ov = overlapped_for(128, std::ptr::null_mut());
+        let mut read = 0u32;
+        assert_eq!(
+            ReadFile(file, buffer.as_mut_ptr(), 64, &mut read, ov.as_mut_ptr()),
+            1
+        );
+        let (mut bytes, mut key) = (0u32, 0usize);
+        let mut got: *mut u8 = std::ptr::null_mut();
+        assert_eq!(
+            GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut got, 1000),
+            1
+        );
+        assert_eq!((bytes, key, got), (64, 7, ov.as_mut_ptr()));
+
+        // Read to the end: the packet says so, and the call reports the failure.
+        let mut ov = overlapped_for(4096, std::ptr::null_mut());
+        assert_eq!(
+            ReadFile(file, buffer.as_mut_ptr(), 64, &mut read, ov.as_mut_ptr()),
+            0
+        );
+        assert_eq!(
+            GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut got, 1000),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_HANDLE_EOF);
+        assert_eq!((bytes, got), (0, ov.as_mut_ptr()));
+
+        assert_eq!(super::super::CloseHandle(file), 1);
+        assert_eq!(super::super::CloseHandle(port), 1);
+    }
+
+    /// A file with no port posts nothing, and the batch form hands over what is
+    /// already finished in one call.
+    #[test]
+    fn a_file_without_a_port_posts_nothing_and_the_batch_form_drains() {
+        let (_dir, _path, file) = mapped_file(&[3u8; 1024]);
+        let mut buffer = [0u8; 16];
+        let mut ov = overlapped_for(0, std::ptr::null_mut());
+        let mut read = 0u32;
+        assert_eq!(
+            ReadFile(file, buffer.as_mut_ptr(), 16, &mut read, ov.as_mut_ptr()),
+            1
+        );
+        assert_eq!(read, 16);
+
+        let port = port();
+        let (mut bytes, mut key) = (0u32, 0usize);
+        let mut got: *mut u8 = std::ptr::null_mut();
+        assert_eq!(
+            GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut got, 20),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_TIMEOUT);
+
+        for (count, key) in [(10u32, 1usize), (20, 2)] {
+            assert_eq!(
+                PostQueuedCompletionStatus(port, count, key, std::ptr::null_mut()),
+                1
+            );
+        }
+        let mut entries = [0u8; 4 * 32];
+        let mut removed = 0u32;
+        assert_eq!(
+            GetQueuedCompletionStatusEx(port, entries.as_mut_ptr(), 2, &mut removed, 1000, 0),
+            1
+        );
+        assert_eq!(removed, 2);
+        // SAFETY: two OVERLAPPED_ENTRY of the title's array.
+        let first = unsafe { entries.as_ptr().cast::<usize>().read_unaligned() };
+        let second = unsafe { entries.as_ptr().add(32).cast::<usize>().read_unaligned() };
+        assert_eq!((first, second), (1, 2), "the key field of each entry");
+        assert_eq!(super::super::CloseHandle(port), 1);
+        assert_eq!(super::super::CloseHandle(file), 1);
     }
 
     #[test]

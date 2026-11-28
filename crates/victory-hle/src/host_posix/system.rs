@@ -1127,6 +1127,123 @@ pub extern "system" fn GetLogicalProcessorInformation(out: *mut u8, length: *mut
     1
 }
 
+/// How many cores are the fast kind (`hw.perflevel0`): the ones a scheduler
+/// should fill first. `None` when the host does not say.
+fn performance_cores() -> Option<u32> {
+    // SAFETY: a plain sysctl read of a u32.
+    unsafe {
+        let mut value = 0u32;
+        let mut size = size_of::<u32>();
+        let read = libc::sysctlbyname(
+            c"hw.perflevel0.physicalcpu".as_ptr(),
+            (&raw mut value).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        );
+        (read == 0 && size == size_of::<u32>()).then_some(value)
+    }
+}
+
+// The extended logical-processor information: one entry per answer, each with
+// its own relationship and size, as Windows lays them out.
+
+const RELATION_PROCESSOR_CORE: u32 = 0;
+const RELATION_CACHE: u32 = 2;
+const RELATION_PROCESSOR_PACKAGE: u32 = 3;
+const RELATION_GROUP: u32 = 4;
+const RELATION_ALL: u32 = 0xFFFF;
+
+/// Appends one `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX`: the relationship, the
+/// entry's size, then the relationship's own structure. Entries are eight-byte
+/// aligned and the size covers the whole entry.
+fn push_relation(out: &mut Vec<u8>, relationship: u32, payload: &[u8]) {
+    let size = (8 + payload.len() + 7) & !7;
+    out.extend_from_slice(&relationship.to_le_bytes());
+    out.extend_from_slice(&(size as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    out.resize(out.len() + (size - 8 - payload.len()), 0);
+}
+
+/// `PROCESSOR_RELATIONSHIP`: the cores in one group, with `class` telling a
+/// scheduler how efficient they are (zero is the most efficient kind here).
+fn processor_relationship(mask: u64, class: u8) -> Vec<u8> {
+    let mut payload = [0u8; 40];
+    payload[0] = 0; // Flags: LTP_PC_SMT is not set, these cores are whole.
+    payload[1] = class;
+    payload[22..24].copy_from_slice(&1u16.to_le_bytes()); // GroupCount
+    payload[24..32].copy_from_slice(&mask.to_le_bytes()); // GroupMask[0].Mask
+    // Group 0 and the reserved words stay zero.
+    payload.to_vec()
+}
+
+/// `GROUP_RELATIONSHIP`: the one processor group, with every processor in it.
+fn group_relationship(count: u32, mask: u64) -> Vec<u8> {
+    let mut payload = [0u8; 72];
+    payload[0..2].copy_from_slice(&1u16.to_le_bytes()); // MaximumGroupCount
+    payload[2..4].copy_from_slice(&1u16.to_le_bytes()); // ActiveGroupCount
+    payload[24] = count.min(64) as u8; // GroupInfo[0].MaximumProcessorCount
+    payload[25] = count.min(64) as u8; // GroupInfo[0].ActiveProcessorCount
+    payload[64..72].copy_from_slice(&mask.to_le_bytes()); // ActiveProcessorMask
+    payload.to_vec()
+}
+
+/// The entries an answer holds, or `None` for a relationship this host does not
+/// answer: caches and NUMA nodes are not described here, and a caller asking for
+/// one is told so rather than handed an entry that would parse as something it
+/// is not.
+fn logical_processor_entries(relationship: u32) -> Option<Vec<u8>> {
+    let n = cpus().min(64);
+    let every = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+    let wanted = |kind: u32| relationship == kind || relationship == RELATION_ALL;
+    let mut out = Vec::new();
+    if wanted(RELATION_PROCESSOR_CORE) {
+        // One logical processor is one core here, which is what `GetSystemInfo`
+        // advertises too.
+        let fast = performance_cores().unwrap_or(n).min(n);
+        for i in 0..n {
+            let class = u8::from(i >= fast);
+            push_relation(&mut out, RELATION_PROCESSOR_CORE, &processor_relationship(1 << i, class));
+        }
+    }
+    if wanted(RELATION_PROCESSOR_PACKAGE) {
+        push_relation(&mut out, RELATION_PROCESSOR_PACKAGE, &processor_relationship(every, 0));
+    }
+    if wanted(RELATION_GROUP) {
+        push_relation(&mut out, RELATION_GROUP, &group_relationship(n, every));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+pub extern "system" fn GetLogicalProcessorInformationEx(
+    relationship: u32,
+    buffer: *mut u8,
+    length: *mut u32,
+) -> i32 {
+    if length.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some(bytes) = logical_processor_entries(relationship) else {
+        tracing::warn!("GetLogicalProcessorInformationEx: {relationship:#x} is not answered");
+        // A relationship this host has nothing to say about, named.
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let needed = bytes.len() as u32;
+    // SAFETY: the title's length word and buffer.
+    unsafe {
+        let room = length.read_unaligned();
+        length.write_unaligned(needed);
+        if buffer.is_null() || room < needed {
+            set_error(ERROR_INSUFFICIENT_BUFFER);
+            return 0;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
+    }
+    1
+}
+
 pub extern "system" fn IsProcessorFeaturePresent(feature: u32) -> i32 {
     // SSE and later, RDTSC, NX, cmpxchg16b, XSAVE, AVX2, RDRAND: the console's CPU has them.
     // Not `__fastfail` (23): a failure then goes through `abort`, which we log.
@@ -3158,6 +3275,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             GetUserDefaultGeoName,
             GetUserDefaultUILanguage,
             GetSystemTimeAdjustment,
+            GetLogicalProcessorInformationEx,
             GetConsoleWindow,
             GetConsoleScreenBufferInfo,
             WriteConsoleW,
@@ -4619,5 +4737,143 @@ mod create_remote_thread_tests {
             .is_null()
         );
         assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
+    }
+}
+
+#[cfg(test)]
+mod logical_processor_tests {
+    use super::*;
+
+    /// Walks the entries a call filled: each carries its own relationship and
+    /// size, and the sizes step to the next entry.
+    fn entries(bytes: &[u8]) -> Vec<(u32, u32, &[u8])> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at < bytes.len() {
+            let relationship = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            assert!(size >= 8 && at + size <= bytes.len(), "entry size {size} runs out");
+            out.push((relationship, size as u32, &bytes[at + 8..at + size]));
+            at += size;
+        }
+        assert_eq!(at, bytes.len(), "the entries do not fill the buffer exactly");
+        out
+    }
+
+    fn fill(relationship: u32) -> Vec<u8> {
+        let mut needed = 0u32;
+        assert_eq!(
+            GetLogicalProcessorInformationEx(relationship, std::ptr::null_mut(), &mut needed),
+            0,
+            "the size query answered as if it had filled a buffer"
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+        assert!(needed > 0);
+        let mut buffer = vec![0u8; needed as usize];
+        assert_eq!(
+            GetLogicalProcessorInformationEx(relationship, buffer.as_mut_ptr(), &mut needed),
+            1
+        );
+        buffer.truncate(needed as usize);
+        buffer
+    }
+
+    /// One entry per logical processor, each with its own bit and its place in
+    /// the single group, and a package that covers all of them.
+    #[test]
+    fn every_logical_processor_gets_a_core_entry() {
+        let n = cpus().min(64) as usize;
+        let core = fill(RELATION_PROCESSOR_CORE);
+        let cores = entries(&core);
+        assert_eq!(cores.len(), n);
+        for (i, (relationship, size, payload)) in cores.iter().enumerate() {
+            assert_eq!(*relationship, RELATION_PROCESSOR_CORE);
+            assert_eq!(*size, 48, "PROCESSOR_RELATIONSHIP with one group mask");
+            assert_eq!(payload[0], 0, "a whole core, not two of them");
+            let groups = u16::from_le_bytes([payload[22], payload[23]]);
+            assert_eq!(groups, 1);
+            let mask = u64::from_le_bytes(payload[24..32].try_into().unwrap());
+            assert_eq!(mask, 1 << i, "core {i} has the wrong processor");
+            // Group 0: the low word after the mask, and the reserved words zero.
+            assert_eq!(&payload[32..40], &[0u8; 8]);
+        }
+
+        // The package covers every processor, and the group says the same.
+        let package_bytes = fill(RELATION_PROCESSOR_PACKAGE);
+        let package = entries(&package_bytes);
+        assert_eq!(package.len(), 1);
+        let every = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        assert_eq!(
+            u64::from_le_bytes(package[0].2[24..32].try_into().unwrap()),
+            every
+        );
+
+        let group_bytes = fill(RELATION_GROUP);
+        let group = entries(&group_bytes);
+        assert_eq!(group.len(), 1);
+        let (_, size, payload) = group[0];
+        assert_eq!(size, 80, "GROUP_RELATIONSHIP with one group");
+        assert_eq!(u16::from_le_bytes([payload[0], payload[1]]), 1);
+        assert_eq!(u16::from_le_bytes([payload[2], payload[3]]), 1);
+        assert_eq!((payload[24], payload[25]), (n as u8, n as u8));
+        assert_eq!(
+            u64::from_le_bytes(payload[64..72].try_into().unwrap()),
+            every
+        );
+
+        // Everything at once is the three answers in one buffer.
+        let all_bytes = fill(RELATION_ALL);
+        let all = entries(&all_bytes);
+        assert_eq!(all.len(), n + 2);
+        assert_eq!(
+            all.iter().filter(|e| e.0 == RELATION_PROCESSOR_CORE).count(),
+            n
+        );
+    }
+
+    /// A buffer that is too small is told the size, and a relationship this host
+    /// does not describe is refused rather than answered with something else.
+    #[test]
+    fn a_short_buffer_and_an_unanswered_relationship_are_told_apart() {
+        let mut needed = 0u32;
+        assert_eq!(
+            GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut needed),
+            0
+        );
+        let full = needed;
+        let mut small = vec![0u8; 8];
+        let mut room = small.len() as u32;
+        assert_eq!(
+            GetLogicalProcessorInformationEx(
+                RELATION_PROCESSOR_CORE,
+                small.as_mut_ptr(),
+                &mut room
+            ),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+        assert_eq!(room, full, "the size a buffer needs");
+
+        for unanswered in [RELATION_CACHE, 1 /* a NUMA node */, 0x1234] {
+            let mut room = 0u32;
+            let mut buffer = vec![0u8; 4096];
+            assert_eq!(
+                GetLogicalProcessorInformationEx(unanswered, buffer.as_mut_ptr(), &mut room),
+                0,
+                "{unanswered:#x} was answered"
+            );
+            assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn the_extended_call_is_answered_rather_than_stubbed() {
+        assert!(
+            lookup(
+                "api-ms-win-core-sysinfo-l1-1-0.dll",
+                "GetLogicalProcessorInformationEx"
+            )
+            .is_some()
+        );
     }
 }

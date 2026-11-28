@@ -349,7 +349,7 @@ impl<B: PresentBackend> Title<B> {
     /// Fence `key`'s completed value (made with `initial` if it has no backend fence yet).
     pub fn fence_value(&mut self, key: usize, initial: u64) -> u64 {
         let value = match self.fence(key, initial) {
-            Ok(f) => self.host.backend.completed(&f).max(initial),
+            Ok(f) => self.host.backend.completed(&f),
             Err(_) => initial,
         };
         // As in `completed`: read first, then copy back.

@@ -236,7 +236,7 @@ fn refresh(t: &mut MetalTitle) {
         }
     }
     for (fence, value) in t.completed() {
-        crate::fence::raise(fence as This, value);
+        crate::fence::sync_host(fence as This, value);
     }
 }
 
@@ -343,19 +343,23 @@ pub(crate) fn queue_released(queue: This) {
 }
 
 /// `ID3D12Fence::Signal`.
-pub(crate) fn fence_signal(fence: This, value: u64) {
+pub(crate) fn fence_signal(fence: This, value: u64) -> bool {
     let initial = crate::fence::initial(fence);
-    with_title(|t| t.signal_cpu(fence as usize, initial, value));
+    with_title(|t| {
+        t.signal_cpu(fence as usize, initial, value);
+        crate::fence::set(fence, value);
+    })
+    .is_some()
 }
 
-/// The value fence `fence` has completed, queues pumped first.
-pub(crate) fn fence_poll(fence: This) -> u64 {
+/// Syncs fence `fence`'s completed value from the host, queues pumped first.
+pub(crate) fn fence_poll(fence: This) {
     let initial = crate::fence::initial(fence);
     with_title(|t| {
         t.pump();
-        t.fence_value(fence as usize, initial)
-    })
-    .unwrap_or(initial)
+        let value = t.fence_value(fence as usize, initial);
+        crate::fence::sync_host(fence, value);
+    });
 }
 
 /// `GetCompletedValue` of a fence that has no GPU behind it yet: nothing to ask.

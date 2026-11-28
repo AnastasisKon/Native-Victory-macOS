@@ -405,11 +405,41 @@ fn step_over_assert(ctx: &mut Context, rec: &ExceptionRecord) -> bool {
         if !list.contains(&rva) {
             return false;
         }
-        // Logged every time, so a log never hides a patched run.
-        tracing::warn!(
-            rva = format_args!("{rva:#x}"),
-            "stepped over a title int3 (VICTORY_SKIP_TITLE_INT3)"
-        );
+        // Logged, so a log never hides a patched run, but not once per hit: one of the title's
+        // asserts sits in a retry loop that runs about twenty thousand times a second, so a
+        // warning each wrote 494,416 lines (90 MB) in 25 s of a run, on the fault path, while the
+        // loop it documents kept spinning. The first few hits are named, then every ten
+        // thousandth with the count so far, and the rest go to `debug`: `RUST_LOG=debug` still
+        // shows every one.
+        const NAMED: u64 = 8;
+        const BETWEEN: u64 = 10_000;
+        static HITS: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
+        let hits = {
+            let mut seen = HITS.lock().unwrap_or_else(|e| e.into_inner());
+            match seen.iter_mut().find(|(of, _)| *of == rva) {
+                Some((_, n)) => {
+                    *n += 1;
+                    *n
+                }
+                None => {
+                    seen.push((rva, 1));
+                    1
+                }
+            }
+        };
+        if hits <= NAMED || hits % BETWEEN == 0 {
+            tracing::warn!(
+                rva = format_args!("{rva:#x}"),
+                hits,
+                "stepped over a title int3 (VICTORY_SKIP_TITLE_INT3)"
+            );
+        } else {
+            tracing::debug!(
+                rva = format_args!("{rva:#x}"),
+                hits,
+                "stepped over a title int3 (VICTORY_SKIP_TITLE_INT3)"
+            );
+        }
         // The first skip of an assert also names the callers that reached it: the title's assert
         // sites carry no message string (an inlined `__debugbreak`-style `int3`, then a jump), so
         // the chain is what identifies one. Once per RVA, since a skip can run a million times.
@@ -448,6 +478,16 @@ fn step_over_assert(ctx: &mut Context, rec: &ExceptionRecord) -> bool {
     }
 }
 
+/// The addresses in a `VICTORY_PEEK` list: hex, `0x` optional as for every other switch here, and
+/// comma-separated. An entry that does not parse is left out rather than ending the run: it is a
+/// debugging aid, and a typo in one address should not cost the addresses after it.
+fn peek_list(value: &str) -> Vec<usize> {
+    value
+        .split(',')
+        .filter_map(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
 /// # Safety
 /// `ctx` and `rec` stay valid until the thread is resumed.
 unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
@@ -483,6 +523,7 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
             // VICTORY_DUMP_THREADS=0: at a breakpoint (the title's asserts). An access violation
             // waits for `unhandled`: the title's handlers take some and go on.
             super::super::dump::report_at_fault(r.code, false);
+<<<<<<< HEAD
             // Debugging aid: VICTORY_PEEK=<entry>,... prints a qword for each: an RVA of the
             // faulting image, an absolute address, or `reg+offset` in the faulting frame, which
             // reads a field of the object a fault is about without knowing where the heap put it.
@@ -490,6 +531,17 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
             if let Ok(list) = std::env::var("VICTORY_PEEK") {
                 for entry in list.split(',') {
                     let Some(at) = crate::peek::address(entry, &c.gpr, base) else { continue };
+=======
+            // Debugging aid: VICTORY_PEEK=rva,rva,... prints those qwords of
+            // the faulting image.
+            if let (Ok(list), Some(base)) = (
+                std::env::var("VICTORY_PEEK"),
+                unwind::image_base_of(c.rip as usize),
+            ) {
+                for rva in peek_list(&list) {
+                    // Beyond the image: an absolute address.
+                    let at = if rva > 0x1000_0000 { rva } else { base + rva };
+>>>>>>> origin/main
                     // An address written down by hand can name nothing, and a fault taken here
                     // would be a second one inside this dispatch, not the one being reported.
                     match super::super::dump::read_checked(at) {
@@ -980,5 +1032,23 @@ pub mod api {
             };
         }
         EXCEPTION_CONTINUE_SEARCH_DISPOSITION
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `VICTORY_PEEK` takes hex with or without the prefix, as the other switches do, and an
+    /// entry that does not parse costs only itself.
+    #[test]
+    fn a_peek_list_takes_hex_addresses() {
+        assert_eq!(peek_list("1817c2a50"), vec![0x1_817c_2a50]);
+        assert_eq!(
+            peek_list("0x1817c2a50, 1330a44"),
+            vec![0x1_817c_2a50, 0x0133_0a44]
+        );
+        assert_eq!(peek_list("1817c2a50,zz,0x"), vec![0x1_817c_2a50]);
+        assert!(peek_list("").is_empty());
     }
 }

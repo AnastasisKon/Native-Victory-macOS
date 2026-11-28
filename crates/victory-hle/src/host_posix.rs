@@ -472,6 +472,8 @@ pub(crate) enum Object {
     Timer(Arc<system::TimerObject>),
     /// A file mapping (`files::Section`).
     Section(Arc<files::Section>),
+    /// A completion port (`files::Port`).
+    Port(Arc<files::Port>),
 }
 
 /// A title thread: its end, its suspension count and its Mach port.

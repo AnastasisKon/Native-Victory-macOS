@@ -2316,6 +2316,61 @@ pub extern "system" fn EventWriteTransfer(
     0
 }
 
+// Classic (WPP) tracing. A provider registers, and from then on every gate
+// reports what a machine with no trace session started reports: no logger, no
+// enable level, no flags. None of it is a stub, so a runtime that traces and
+// then reads those gates finds them answered rather than zeroed by the
+// fallback.
+
+/// Stands for a registration; never a host handle value.
+static TRACE_REGISTRATION: u8 = 0;
+
+pub extern "system" fn RegisterTraceGuidsW(
+    _request: *const c_void,
+    _context: *const c_void,
+    control: *const c_void,
+    count: u32,
+    _trace: *const c_void,
+    _mof_path: *const u16,
+    _mof_resource: *const u16,
+    handle: *mut u64,
+) -> u32 {
+    if control.is_null() || count == 0 || handle.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    // SAFETY: the title's out pointer; a registration it hands back later.
+    unsafe { handle.write((&raw const TRACE_REGISTRATION) as u64) };
+    0
+}
+
+pub extern "system" fn UnregisterTraceGuids(_registration: u64) -> u32 {
+    0
+}
+
+/// `NULL`: no logger, so the caller traces nothing.
+pub extern "system" fn GetTraceLoggerHandle(_buffer: *const c_void) -> u64 {
+    0
+}
+
+pub extern "system" fn GetTraceEnableLevel(_logger: u64) -> u8 {
+    0
+}
+
+pub extern "system" fn GetTraceEnableFlags(_logger: u64) -> u32 {
+    0
+}
+
+/// Variadic: the messages after `number` are not read, since there is no
+/// logger to hand them to.
+pub extern "system" fn TraceMessage(
+    _logger: u64,
+    _flags: u32,
+    _guid: *const c_void,
+    _number: u16,
+) -> u32 {
+    0
+}
+
 // bcrypt.
 
 pub extern "system" fn BCryptOpenAlgorithmProvider(
@@ -2443,6 +2498,20 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
     // caller reads as success with a null key in hand.
     if dll.starts_with("api-ms-win-core-registry-") {
         return table!(RegOpenKeyExW, RegOpenKeyW, RegQueryValueExW, RegCloseKey);
+    }
+    // Classic (WPP) tracing is where a DLL built against the API sets announces
+    // itself; the generic set table below carries none of it. Stubbed,
+    // `RegisterTraceGuidsW` returns 0 — "registered", with a null registration
+    // — and every gate after it reads a logger that never existed.
+    if dll == "api-ms-win-eventing-classicprovider-l1-1-0.dll" {
+        return table!(
+            RegisterTraceGuidsW,
+            UnregisterTraceGuids,
+            GetTraceLoggerHandle,
+            GetTraceEnableLevel,
+            GetTraceEnableFlags,
+            TraceMessage,
+        );
     }
     let kernel = dll == "kernel32.dll"
         || dll == "kernelbase.dll"
@@ -2578,6 +2647,12 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             RegOpenKeyW,
             RegQueryValueExW,
             RegCloseKey,
+            RegisterTraceGuidsW,
+            UnregisterTraceGuids,
+            GetTraceLoggerHandle,
+            GetTraceEnableLevel,
+            GetTraceEnableFlags,
+            TraceMessage,
             EventRegister,
             EventUnregister,
             EventSetInformation,
@@ -3231,5 +3306,64 @@ mod console_mode_tests {
                 assert_eq!(found, super::lookup("advapi32.dll", name), "{dll}!{name}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn classic_tracing_registers_and_then_reports_no_logger() {
+        for name in [
+            "RegisterTraceGuidsW",
+            "UnregisterTraceGuids",
+            "GetTraceLoggerHandle",
+            "GetTraceEnableLevel",
+            "GetTraceEnableFlags",
+            "TraceMessage",
+        ] {
+            assert!(
+                super::lookup("api-ms-win-eventing-classicprovider-l1-1-0.dll", name).is_some(),
+                "{name} is not answered"
+            );
+        }
+        let control = 0u8;
+        let mut registration = 0u64;
+        assert_eq!(
+            RegisterTraceGuidsW(
+                std::ptr::null(),
+                std::ptr::null(),
+                (&raw const control).cast(),
+                1,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut registration,
+            ),
+            0
+        );
+        // A registration is a non-null token, and every gate that follows says
+        // "no trace session", which is what this host has.
+        assert_ne!(registration, 0);
+        assert_eq!(UnregisterTraceGuids(registration), 0);
+        assert_eq!(GetTraceLoggerHandle(std::ptr::null()), 0);
+        assert_eq!(GetTraceEnableLevel(registration), 0);
+        assert_eq!(GetTraceEnableFlags(registration), 0);
+        assert_eq!(TraceMessage(0, 0, std::ptr::null(), 1), 0);
+        // Nothing to register is refused, as the API refuses it.
+        assert_eq!(
+            RegisterTraceGuidsW(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut registration,
+            ),
+            ERROR_INVALID_PARAMETER
+        );
     }
 }

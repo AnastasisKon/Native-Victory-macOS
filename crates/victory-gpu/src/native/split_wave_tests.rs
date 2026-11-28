@@ -2636,6 +2636,38 @@ fn a_vccz_branch_where_the_lanes_disagree_answers_for_the_wave() {
     assert_eq!(got, want, "the console takes the branch for the wave as a whole");
 }
 
+/// The negated form of that shape: `s_cbranch_vccnz` on the same split mask. On the console the
+/// mask is not zero for either wave (wave 0's lanes 33..63, wave 1's whole wave), so both take the
+/// branch and neither runs the `v_mov_b32 v2, 7` behind it: every lane keeps the 0 written before.
+/// The fast path's per-lane reading leaves lanes 0..32 of wave 0 with the 7 instead, which the
+/// strict switch refuses so lockstep can answer it.
+#[test]
+fn a_vccnz_branch_where_the_lanes_disagree_answers_for_the_wave_with_the_strict_switch() {
+    let mut w = vec![
+        V_LSHLREV_V1_2_V0,
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D82_00A0, // v_cmp_lt_u32 vcc, 32, v0 (32 < lane: on from lane 33 up)
+        0x87EA_6A7E, // s_and_b64 vcc, exec, vcc
+        0xBF87_0001, // s_cbranch_vccnz 1
+        0x7E04_0287, // v_mov_b32 v2, 7
+    ];
+    w.extend(GLOBAL_STORE_V2_AT_V1);
+    w.push(S_ENDPGM);
+    // The default translation takes this shape (that is the defect), so only the strict form is
+    // translated here; its per-lane answer is pinned by the ignored `..._answers_for_the_wave`.
+    let options = victory_shader::emit::Options { strict_vccz_branch: true, ..several_waves() };
+    let native = compute_native(&w, 5, 0, 128, true);
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let container = empty_container();
+    let container = victory_shader::Container::parse(&container).expect("container");
+    let cs = victory_shader::emit::translate_native(&container, &native, options).expect("emit");
+    let [c, d] = halves(VA_A + 0x4_0000);
+    dispatch(&mut t, &cs, &[0, 0, c, d, 0], false);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    assert_eq!(f.get(DST, 128), vec![0u32; 128], "neither wave's mask is zero");
+}
+
 /// The same program with the strict `vccz` switch on (`Options::strict_vccz_branch`, from
 /// `VICTORY_STRICT_VCCZ_BRANCH=1`): the fast path refuses it, the lockstep retry translates it in the
 /// paired form, and the branch is then the console's - `s_cmp_eq_u64 vcc, 0` over the wave - so

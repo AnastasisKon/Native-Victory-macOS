@@ -440,6 +440,12 @@ pub enum LaneExit {
     Indirect,
 }
 
+/// The refusal of a `vccz`/`vccnz` branch whose `vcc` is a lane mask the two halves of a console
+/// wave can see differently: the console tests the wave's whole 64-bit mask, and the per-lane form
+/// answers each lane's own bit (#527).
+pub(crate) const SPLIT_MASK_BRANCH: &str =
+    "a vccz branch on a lane mask the two halves of a console wave can see differently";
+
 /// A [`Program`] as one lane runs it: same blocks, per-lane branches.
 #[derive(Debug, Clone)]
 pub struct Structured {
@@ -492,7 +498,19 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true, false)
+    structure_as(program, true, false, strict_vccz_branch())
+}
+
+/// [`structure`], refusing a `vccz`/`vccnz` branch on a split mask when `strict` is set
+/// ([`SPLIT_MASK_BRANCH`]; `Options::strict_vccz_branch`, off by default).
+pub fn structure_with(program: &Program, strict: bool) -> Result<Structured, ShaderError> {
+    structure_as(program, true, false, strict)
+}
+
+/// Whether the strict form is on: `VICTORY_STRICT_VCCZ_BRANCH=1`.
+fn strict_vccz_branch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_STRICT_VCCZ_BRANCH").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -500,7 +518,7 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false, false)
+    structure_as(program, false, false, strict_vccz_branch())
 }
 
 /// The form a console wave run in lockstep takes (`emit/lockstep.rs`): every branch tests a
@@ -508,12 +526,18 @@ pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
 /// whole mask first, [`crate::emit`]'s `lockstep_branches`), so every lane reaches every block
 /// and each vector instruction keeps EXEC as its guard.
 pub fn lockstep(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true, true)
+    structure_as(program, true, true, strict_vccz_branch())
 }
 
-fn structure_as(program: &Program, helpers: bool, lockstep: bool) -> Result<Structured, ShaderError> {
+fn structure_as(
+    program: &Program,
+    helpers: bool,
+    lockstep: bool,
+    strict: bool,
+) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
     l.lockstep = lockstep;
+    l.strict = strict;
     if !helpers {
         l.kills.clear();
     }
@@ -521,6 +545,9 @@ fn structure_as(program: &Program, helpers: bool, lockstep: bool) -> Result<Stru
         let (execs, kill_lanes) = l.masks_in_order();
         let cond = l.paths()?;
         let wrong = l.wrong_joins(&cond);
+        if let Some(offset) = l.split_mask_branch {
+            return Err(ShaderError::Unsupported { offset, what: SPLIT_MASK_BRANCH });
+        }
         if wrong.is_empty() {
             return l.finish(&execs, kill_lanes, &cond);
         }
@@ -595,6 +622,11 @@ struct Lanes<'a> {
     active: Set<Value>,
     /// See [`Structured::restored`].
     restored: Map<Value, Value>,
+    /// Refuse a `vccz`/`vccnz` branch on a split mask instead of answering per lane
+    /// ([`SPLIT_MASK_BRANCH`]).
+    strict: bool,
+    /// The first such branch's offset, once one is seen.
+    split_mask_branch: Option<usize>,
     /// `v_readlane_b32` results of a constant lane whose spilled value was a
     /// 32-bit scalar constant.
     restored_const: Map<Value, u32>,
@@ -667,6 +699,8 @@ impl<'a> Lanes<'a> {
             when: vec![None; blocks.len()],
             active: Set::default(),
             restored: Map::default(),
+            strict: false,
+            split_mask_branch: None,
             restored_const: Map::default(),
             kills: HashSet::new(),
             lockstep: false,
@@ -2114,6 +2148,17 @@ impl<'a> Lanes<'a> {
         None
     }
 
+    /// Whether every atom of `b` is the same in every lane: a scalar, or a mask that is all lanes
+    /// or none, which a branch on the wave's 64-bit mask answers as the per-lane form does.
+    fn mask_is_uniform(&self, b: Bool) -> bool {
+        self.b.vars(b).into_iter().all(|v| {
+            matches!(
+                self.b.atoms[v as usize],
+                Atom::Uniform(_) | Atom::Constant(0) | Atom::Constant(u64::MAX)
+            )
+        })
+    }
+
     /// Whether a lane entering block `b` leaves the program doing nothing but
     /// scalar work and a `done` export to `null` (a discard's exit).
     fn kill_exit(&self, mut b: usize) -> bool {
@@ -2151,6 +2196,13 @@ impl<'a> Lanes<'a> {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
+                // The console tests the wave's whole 64-bit mask; a mask the per-lane form splits
+                // can differ between the halves of a console wave, and each half would answer for
+                // itself. With the switch on, say so and let the lockstep retry answer it
+                // (`emit/lockstep.rs`, `branches`), instead of drawing the wrong thing.
+                if self.strict && !self.lockstep && !self.mask_is_uniform(vcc) {
+                    self.split_mask_branch.get_or_insert(inst.machine.offset);
+                }
                 let any = self.b.and(vcc, exec);
                 if n.ends_with("nz") {
                     any
@@ -2296,6 +2348,30 @@ mod tests {
 
     fn guarded(s: &Structured) -> usize {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
+    }
+
+    /// `v_cmp_lt_u32 vcc, 32, v0` is on from lane 33 up, so `s_and_b64 vcc, exec, vcc` then
+    /// `s_cbranch_vccz` tests a mask whose halves can differ: the strict form refuses it (#527).
+    #[test]
+    fn a_vccz_branch_on_a_split_mask_is_refused_only_in_the_strict_form() {
+        let p = build(
+            &[
+                0x7D82_00A0, // v_cmp_lt_u32 vcc, 32, v0
+                0x87EA_6A7E, // s_and_b64 vcc, exec, vcc
+                0xBF86_0001, // s_cbranch_vccz 1
+                0x7E04_0287, // v_mov_b32 v2, 7
+                S_ENDPGM,
+            ],
+            true,
+        );
+        // Off, as today: structured as one lane runs it.
+        assert!(structure_with(&p, false).is_ok());
+        // On: refused, naming the branch, so the lockstep retry can answer it for the wave.
+        let err = structure_with(&p, true).expect_err("the strict form refuses a split mask");
+        assert!(
+            matches!(err, ShaderError::Unsupported { what, .. } if what == SPLIT_MASK_BRANCH),
+            "{err:?}"
+        );
     }
 
     #[test]

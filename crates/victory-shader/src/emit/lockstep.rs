@@ -38,11 +38,21 @@ pub(crate) const NOT_UNIFORM: &str = "a branch not uniform across a console wave
 /// Whether a refused program may run in lockstep: wave64 compute on a 32-lane host whose group is
 /// one console wave.
 pub(super) fn fits(native: &NativeProgram, st: &Structured, options: &Options) -> bool {
+    !st.lockstep && lossless(native, options)
+}
+
+/// [`fits`] for a program the fast path never structured: the strict form of `structure` refused
+/// it before there was a [`Structured`] to ask, and lockstep structures it itself.
+pub(super) fn fits_refused(native: &NativeProgram, options: &Options) -> bool {
+    lossless(native, options)
+}
+
+/// Whether lockstep's group is the one console wave, as the console's dispatch lays it out.
+fn lossless(native: &NativeProgram, options: &Options) -> bool {
     let StageIo::Cs(cs) = &native.io else { return false };
     options.wave32_host
         && native.stage == HwStage::Cs
         && native.wave64
-        && !st.lockstep
         && {
             let lanes = cs.threads.iter().product::<u32>();
             lanes <= 64 || options.paired_waves && lanes.is_multiple_of(64)

@@ -5,7 +5,8 @@
 //! Metal Shader Converter.
 
 use super::addr_tests::{
-    CANARY, Fixture, VA_A, dispatch, halves, title, translate_io, translate_wave, try_translate_wave,
+    CANARY, Fixture, VA_A, compute_native, dispatch, empty_container, halves, title, translate_io,
+    translate_wave, try_translate_wave,
 };
 use crate::native::list::NativeList;
 use crate::native::shaders;
@@ -2527,12 +2528,13 @@ fn a_vote_used_as_a_branch_follows_each_console_wave_in_the_paired_form() {
 /// zero for either wave and on the console both waves run the guarded body with EXEC as it was:
 /// every lane stores 7.
 ///
-/// The fast path does not give that answer today. It lowers the branch as a test of the lane's own
-/// vcc bit, so on the GPU lanes 0..32 (the ones the vote did not name) skip the body and store 0
-/// while 33..127 store 7 - a per-lane answer where the console's is per wave. Ignored until the
-/// lowering is fixed: the paired form (`Options::paired_waves`) is the route that makes it per wave
-/// (`a_vote_used_as_a_branch_follows_each_console_wave_in_the_paired_form`), and until these
-/// programs take it, translating this shape silently draws the wrong lighting rather than refusing.
+/// The default fast path does not give that answer. It lowers the branch as a test of the lane's
+/// own vcc bit, so on the GPU lanes 0..32 (the ones the vote did not name) skip the body and store
+/// 0 while 33..127 store 7 - a per-lane answer where the console's is per wave. The strict form of
+/// `structure` (`Options::strict_vccz_branch`, `VICTORY_STRICT_VCCZ_BRANCH=1`) refuses the shape
+/// instead and the lockstep retry answers it per wave
+/// (`a_vccz_branch_where_the_lanes_disagree_answers_for_the_wave_with_the_strict_switch`); while
+/// the switch is off, translating this shape keeps drawing the per-lane answer.
 #[test]
 #[ignore = "the fast path lowers s_cbranch_vccz per lane instead of per console wave (#527)"]
 fn a_vccz_branch_where_the_lanes_disagree_answers_for_the_wave() {
@@ -2552,16 +2554,50 @@ fn a_vccz_branch_where_the_lanes_disagree_answers_for_the_wave() {
     assert_eq!(got, want, "the console takes the branch for the wave as a whole");
 }
 
-/// The same program in the paired form, which does not get it: `run_group` translates with
-/// `Options::paired_waves`, but lockstep is only tried after the fast path has *refused* a program
-/// (`emit`'s retry), and the fast path accepts this one - wrongly - so the paired lowering is never
-/// reached and the per-lane answer above comes back unchanged.
+/// The same program with the strict `vccz` switch on (`Options::strict_vccz_branch`, from
+/// `VICTORY_STRICT_VCCZ_BRANCH=1`): the fast path refuses it, the lockstep retry translates it in the
+/// paired form, and the branch is then the console's - `s_cmp_eq_u64 vcc, 0` over the wave - so
+/// every lane stores 7. This is the fix for #527's second shape, measured end to end.
+#[test]
+fn a_vccz_branch_where_the_lanes_disagree_answers_for_the_wave_with_the_strict_switch() {
+    let mut w = vec![
+        V_LSHLREV_V1_2_V0,
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D82_00A0, // v_cmp_lt_u32 vcc, 32, v0 (32 < lane: on from lane 33 up)
+        0x87EA_6A7E, // s_and_b64 vcc, exec, vcc
+        0xBF86_0001, // s_cbranch_vccz 1
+        0x7E04_0287, // v_mov_b32 v2, 7
+    ];
+    w.extend(GLOBAL_STORE_V2_AT_V1);
+    w.push(S_ENDPGM);
+    // Both console waves see a vcc that is not zero, so neither takes the branch and both keep 7.
+    // Translated as the host translates (`translate_native`): the strict form refuses it, and the
+    // lockstep retry that refusal is passed to is what answers it for each wave.
+    let options = victory_shader::emit::Options { strict_vccz_branch: true, ..several_waves() };
+    let native = compute_native(&w, 5, 0, 128, true);
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let container = empty_container();
+    let container = victory_shader::Container::parse(&container).expect("container");
+    let cs = victory_shader::emit::translate_native(&container, &native, options).expect("emit");
+    let [c, d] = halves(VA_A + 0x4_0000);
+    dispatch(&mut t, &cs, &[0, 0, c, d, 0], false);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    let got = f.get(DST, 128);
+    assert_eq!(got.len(), 128);
+    assert_eq!(got, vec![7u32; 128], "the branch is the wave's own, so its lanes agree");
+}
+
+/// The same program in the paired form without the strict switch, which does not get it:
+/// `run_group` translates with `Options::paired_waves`, but lockstep is only tried after the fast
+/// path has *refused* a program (`emit`'s retry), and the fast path accepts this one - wrongly - so
+/// the paired lowering is never reached and the per-lane answer above comes back unchanged.
 ///
-/// That is the shape of the fix for #527's second shape: make the fast path refuse a `vccz`/`vccnz`
-/// branch whose `vcc` is a per-lane mask it cannot test wave-wide (it refuses other cross-half
-/// reads that way), so the retry runs, and lockstep's `branches` - which turns the branch into
-/// `s_cmp_eq_u64 vcc, 0` and a scalar `s_cbranch_scc1` - then answers it for the wave. Ignored until
-/// that refusal exists; the assertion below is the answer to expect afterwards.
+/// This is what `Options::strict_vccz_branch` adds: the refusal a `vccz` branch on a split mask
+/// needs (`structure::structure_with`), after which lockstep's `branches` - which turns the branch
+/// into `s_cmp_eq_u64 vcc, 0` and a scalar `s_cbranch_scc1` - answers it for the wave. Ignored
+/// because it translates the way the default options do; the strict switch's own test above is the
+/// same program with that refusal in place.
 #[test]
 #[ignore = "the fast path accepts this shape, so the lockstep retry (and the paired form) never runs (#527)"]
 fn a_vccz_branch_where_the_lanes_disagree_answers_for_the_wave_in_the_paired_form() {

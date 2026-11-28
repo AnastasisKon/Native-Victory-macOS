@@ -149,7 +149,19 @@ pub(super) fn try_translate_wave(
     wave64: bool,
     options: victory_shader::emit::Options,
 ) -> Result<HostShader, victory_shader::ShaderError> {
-    let native = NativeProgram {
+    try_translate_native(&compute_native(words, sgprs, rsrc2, threads, wave64), options)
+}
+
+/// A compute program of `words` in `threads` threads (root constants in `s0..s<sgprs>`, `rsrc2`
+/// set), as a console shader reports it.
+pub(super) fn compute_native(
+    words: &[u32],
+    sgprs: u32,
+    rsrc2: u32,
+    threads: u32,
+    wave64: bool,
+) -> NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64,
         vgprs: 16,
@@ -167,8 +179,17 @@ pub(super) fn try_translate_wave(
             threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    try_translate_native(&native, options)
+    }
+}
+
+/// The bytes of a container of no parts: `DXBC`, a digest, version 1.0, its size, no parts.
+pub(super) fn empty_container() -> Vec<u8> {
+    let mut empty = b"DXBC".to_vec();
+    empty.extend([0; 16]);
+    empty.extend([1, 0, 0, 0]);
+    empty.extend(32u32.to_le_bytes());
+    empty.extend(0u32.to_le_bytes());
+    empty
 }
 
 /// A 64-lane compute shader with root constants in `s0..s3` and a root view (`kind`, a root
@@ -210,16 +231,11 @@ fn try_translate_native(
 ) -> Result<HostShader, victory_shader::ShaderError> {
     let mut p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     p.thread_counts = options.thread_counts;
-    let st = structure::structure(&p).expect("structure");
+    let st = structure::structure_with(&p, options.strict_vccz_branch).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, native).expect("io::raise");
-    // A container of no parts: `DXBC`, a digest, version 1.0, its size, no parts.
-    let mut empty = b"DXBC".to_vec();
-    empty.extend([0; 16]);
-    empty.extend([1, 0, 0, 0]);
-    empty.extend(32u32.to_le_bytes());
-    empty.extend(0u32.to_le_bytes());
-    let c = Container::parse(&empty).expect("container");
+    let c = empty_container();
+    let c = Container::parse(&c).expect("container");
     emit_with(&c, native, &p, &st, &io, &res, options)
 }
 

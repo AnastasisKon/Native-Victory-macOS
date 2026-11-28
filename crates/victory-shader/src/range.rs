@@ -38,7 +38,7 @@ pub fn build(
     wave64: bool,
     vgprs: u16,
 ) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
-    build_with_thread_counts(code, wave64, vgprs, false)
+    build_with_thread_counts(code, wave64, vgprs, false, false)
 }
 
 pub(crate) fn build_with_thread_counts(
@@ -46,6 +46,7 @@ pub(crate) fn build_with_thread_counts(
     wave64: bool,
     vgprs: u16,
     thread_counts: bool,
+    strict_vccz_branch: bool,
 ) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
     let mut p = ir::build(code, wave64, vgprs)?;
     let assumed: HashMap<usize, u8> = p
@@ -57,21 +58,27 @@ pub(crate) fn build_with_thread_counts(
         .collect();
     if !assumed.is_empty() {
         // Prove ranges with full entry EXEC before applying the dispatch mask.
-        let (bounded, st) = bound_relative_moves(code, p, assumed)?;
+        let (bounded, st) = bound_relative_moves(code, p, assumed, strict_vccz_branch)?;
         if !thread_counts {
             return Ok((bounded, st));
         }
         p = bounded;
     }
     p.thread_counts = thread_counts;
-    let st = structure::structure(&p);
+    let st = structuring(&p, strict_vccz_branch);
     Ok((p, st))
+}
+
+/// [`structure::structure`], or its strict form (`Options::strict_vccz_branch`) when asked for.
+fn structuring(p: &Program, strict_vccz_branch: bool) -> Result<Structured, ShaderError> {
+    if strict_vccz_branch { structure::structure_with(p, true) } else { structure::structure(p) }
 }
 
 fn bound_relative_moves(
     code: &[u8],
     p: Program,
     mut assumed: HashMap<usize, u8>,
+    strict_vccz_branch: bool,
 ) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
     // Each round grows a bound or drops a move; few programs need more than two.
     for _ in 0..8 {
@@ -79,7 +86,7 @@ fn bound_relative_moves(
             break;
         }
         let q = ir::build_bounded(code, p.wave64, p.vgprs, &assumed)?;
-        let Ok(s) = structure::structure(&q) else {
+        let Ok(s) = structuring(&q, strict_vccz_branch) else {
             break;
         };
         let found = relative_bounds(&q, &s);
@@ -92,7 +99,7 @@ fn bound_relative_moves(
                 return Ok((q, Ok(s)));
             }
             let q = ir::build_bounded(code, p.wave64, p.vgprs, &proven)?;
-            let s = structure::structure(&q);
+            let s = structuring(&q, strict_vccz_branch);
             return Ok((q, s));
         }
         assumed = assumed
@@ -102,7 +109,7 @@ fn bound_relative_moves(
     }
     // Structurisation is most of a large program's translation: the unbounded
     // form is structured only when the bounded one is not used.
-    let st = structure::structure(&p);
+    let st = structuring(&p, strict_vccz_branch);
     Ok((p, st))
 }
 

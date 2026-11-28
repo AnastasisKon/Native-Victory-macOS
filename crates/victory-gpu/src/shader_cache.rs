@@ -308,6 +308,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         wave32_host: false,
         // The paired form is for 32-lane hosts.
         paired_waves: false,
+        strict_vccz_branch: false,
         // The D3D12 host copies title memory: it needs the pages marked.
         zero_copy_memory: false,
         rect_list: false,

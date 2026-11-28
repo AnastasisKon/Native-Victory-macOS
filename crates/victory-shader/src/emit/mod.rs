@@ -308,6 +308,7 @@ pub const TRANSLATION_SWITCHES: &[&str] = &[
     "VICTORY_DEBUG_VS_POS",
     "VICTORY_DEBUG_VS_TRI",
     "VICTORY_NO_LOCKSTEP",
+    "VICTORY_STRICT_VCCZ_BRANCH",
 ];
 
 /// The [`TRANSLATION_SWITCHES`] that are set, as `NAME=value` lines in the
@@ -472,6 +473,10 @@ pub struct Options {
     /// (#376; after TaynanGT/Vice-Tay 5e588e8). Off by default; the native host sets it from
     /// `VICTORY_PAIRED_WAVES=1`.
     pub paired_waves: bool,
+    /// Refuse a `vccz`/`vccnz` branch whose `vcc` is a lane mask the two halves of a console wave
+    /// can see differently, instead of answering each lane's own bit: the lockstep retry then
+    /// answers it for the wave (`structure::SPLIT_MASK_BRANCH`, #527). Off by default.
+    pub strict_vccz_branch: bool,
     /// The host's title memory is the memory the GPU reads and writes (the native Metal
     /// host: one buffer per pool, no copies): accesses at computed addresses still go through
     /// the page table of "Title memory" to find the host view, but mark nothing, so the
@@ -534,6 +539,16 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    translate_native(&c, &native, options)
+}
+
+/// The console program `native` of the container `c`, translated as `options` say: the stages of
+/// [`translate_with`] after the container is read, for callers that hold a program already.
+pub fn translate_native(
+    c: &Container,
+    native: &NativeProgram,
+    options: Options,
+) -> Result<HostShader, ShaderError> {
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let (p, st) = crate::range::build_with_thread_counts(
@@ -541,16 +556,28 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
         native.wave64,
         native.vgprs,
         options.thread_counts && native.stage == HwStage::Cs,
+        options.strict_vccz_branch,
     )?;
-    let guessed = graphics::is_guessed(&c);
+    let guessed = graphics::is_guessed(c);
     let computed_buffers =
         (guessed || native.stage == HwStage::Cs) && options.zero_copy_memory;
     let res = resource::track_graphics(
         &p, &native.layout, native.stage, st.as_ref().ok(), computed_buffers,
     )?;
-    let io = io::raise_graphics(&p, &native, guessed)?;
-    let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    let io = io::raise_graphics(&p, native, guessed)?;
+    let st = match st {
+        Ok(st) => st,
+        // The strict form of `structure` refuses a `vccz` branch on a lane mask the two halves of
+        // a console wave can see differently (#527); lockstep answers such a branch for the whole
+        // wave, so a refusal it can take is retried there rather than reported.
+        Err(ShaderError::Unsupported { what: structure::SPLIT_MASK_BRANCH, .. })
+            if lockstep::fits_refused(native, &options) =>
+        {
+            return lockstep::retry(c, native, &p, &io, &res, options);
+        }
+        Err(e) => return Err(e),
+    };
+    emit_with(c, native, &p, &st, &io, &res, options)
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
@@ -721,7 +748,8 @@ fn emit_fast(
             let Some(q) = ir::keep_lanes_to_end(p) else {
                 return Err(e);
             };
-            return emit_fast(c, native, &q, &structure::structure(&q)?, io, res, options);
+            let st = structure::structure_with(&q, options.strict_vccz_branch)?;
+            return emit_fast(c, native, &q, &st, io, res, options);
         }
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a

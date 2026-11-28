@@ -233,8 +233,13 @@ pub extern "system" fn XMemVirtualQuery(
     1
 }
 
-// `XMemAlloc` attributes: alignment as log2 (5 bits at 24, 4 bytes and up
-// from 2), then the memory type, then bit 33: a 32-bit address.
+// `XMemAlloc` attributes, as the GDK's `XALLOC_ATTRIBUTES` union lays them out
+// (`xmem.h`: `ObjectType:14, PageSize:2, AllocatorId:8, Alignment:5,
+// MemoryType:4, Address32BitMapping:1, reserved:30`): the alignment is the
+// log2 of the byte alignment in 5 bits at 24 (`XALLOC_ALIGNMENT_4` is 2,
+// `_256` is 8), the memory type is 4 bits at 29, and a 32-bit address is bit
+// 33. What constrains us is the alignment; the type and the allocator change
+// nothing on unified memory.
 const ALIGNMENT_SHIFT: u64 = 24;
 const ALLOC_32BIT: u64 = 1 << 33;
 /// Our block header: the block's size and alignment, just below the
@@ -538,6 +543,45 @@ mod tests {
         let process = std::ptr::null_mut();
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
+    }
+
+    /// Attributes built the way the GDK's `MAKE_XALLOC_ATTRIBUTES` builds them, from the fields of
+    /// its `XALLOC_ATTRIBUTES` union (`xmem.h`).
+    fn make_attributes(
+        object_type: u64,
+        page_size: u64,
+        allocator_id: u64,
+        alignment: u64,
+        memory_type: u64,
+        address32: u64,
+    ) -> u64 {
+        object_type & 0x3fff
+            | (page_size & 0x3) << 14
+            | (allocator_id & 0xff) << 16
+            | (alignment & 0x1f) << 24
+            | (memory_type & 0xf) << 29
+            | (address32 & 1) << 33
+    }
+
+    /// Our two constants are the union's fields: the alignment is the 5 bits at 24 (tilde the log2
+    /// alignment `XALLOC_ALIGNMENT_*` names) and the 32-bit mapping is bit 33.
+    #[test]
+    fn attributes_are_the_gdk_layout() {
+        // A 256-byte alignment (`XALLOC_ALIGNMENT_256` = 8) over a graphics-cacheable memory type.
+        let attributes = make_attributes(0x21, 2, 3, 8, 3, 0);
+        assert_eq!(attributes >> ALIGNMENT_SHIFT & 0x1f, 8);
+        let made = layout(100, attributes).unwrap();
+        assert_eq!(made.align(), 256, "the alignment field is the log2 of the bytes");
+        // The memory type does not move the alignment, and a 32-bit mapping is our bit 33.
+        let typed = make_attributes(0x21, 2, 3, 8, 0xb, 0);
+        assert_eq!(layout(100, typed).unwrap().align(), 256);
+        assert_eq!(make_attributes(0, 0, 0, 0, 0, 1) & ALLOC_32BIT, ALLOC_32BIT);
+        // Below `XALLOC_ALIGNMENT_16` (4) an alignment is a floor of 16, which is what the header
+        // words hold: `ANY` is 0, `_4` is 2, `_8` is 3.
+        for any in [0, 2, 3] {
+            let attributes = make_attributes(0, 0, 0, any, 0, 0);
+            assert_eq!(layout(100, attributes).unwrap().align(), 16, "field {any}");
+        }
     }
 
     #[test]

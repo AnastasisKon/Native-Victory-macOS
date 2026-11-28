@@ -40,11 +40,92 @@ pub(crate) fn address(entry: &str, gpr: &[u64; 16], base: Option<usize>) -> Opti
     }
 }
 
-/// The sum of a `+`-separated hex offset list (`0x` optional; empty is 0), as the entries after a
-/// register write it. A term that is no hex, or a sum past the address space, names nothing.
+/// What an entry names in a frame, read through `read` — which is the dispatch's checked read, so
+/// an address written down by hand that names nothing is reported rather than faulted on.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "x86_64")), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Read {
+    Value(usize),
+    /// The entry parses, and the address it names is not mapped.
+    Unmapped,
+    /// The entry is not one this parser knows.
+    NoEntry,
+}
+
+/// The qword an entry names, following pointers as it goes: `rsi+0x50` reads a field of the frame,
+/// `[rsi+0x10020]+0x38` reads the writer pointer and then a field of what it names, and the
+/// brackets nest, so `[[rsi+0x10020]+0x40]+0x60` reaches a field of an object two steps out. Each
+/// level that names nothing ends the walk rather than faulting in it.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "x86_64")), allow(dead_code))]
+pub(crate) fn read_entry(
+    entry: &str,
+    gpr: &[u64; 16],
+    base: Option<usize>,
+    read: impl Fn(usize) -> Option<usize> + Copy,
+) -> Read {
+    let entry = entry.trim();
+    if let Some(rest) = entry.strip_prefix('[') {
+        // The bracket that closes this one, counting the brackets inside it: `[[a]+8]+0x10` is a
+        // field of what the pointer `[a]+8` names, not an entry called `[a`.
+        let Some(end) = closing_bracket(rest) else {
+            return Read::NoEntry;
+        };
+        let (inner, after) = (&rest[..end], &rest[end + 1..]);
+        let Some(offset) = sum_offsets(after) else {
+            return Read::NoEntry;
+        };
+        let at = match read_entry(inner, gpr, base, read) {
+            Read::Value(at) => at,
+            other => return other,
+        };
+        return match at.checked_add(offset) {
+            Some(at) => match read(at) {
+                Some(value) => Read::Value(value),
+                None => Read::Unmapped,
+            },
+            None => Read::Unmapped,
+        };
+    }
+    match address(entry, gpr, base) {
+        Some(at) => match read(at) {
+            Some(value) => Read::Value(value),
+            None => Read::Unmapped,
+        },
+        None => Read::NoEntry,
+    }
+}
+
+/// The byte index of the `]` that closes the `[` whose contents are `rest`, counting the brackets
+/// inside it; `None` when nothing closes it.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "x86_64")), allow(dead_code))]
+pub(crate) fn closing_bracket(rest: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    for (at, ch) in rest.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The sum of a `+`-separated hex offset list after a bracketed entry (`0x` optional; empty is 0,
+/// and a leading `+` is allowed). A term that is no hex, or a sum past the address space, names
+/// nothing.
 #[cfg_attr(not(all(target_os = "macos", target_arch = "x86_64")), allow(dead_code))]
 pub(crate) fn sum_offsets(spec: &str) -> Option<usize> {
+    let spec = spec.trim();
+    let spec = spec.strip_prefix('+').unwrap_or(spec).trim();
     let mut sum = 0usize;
+    if spec.is_empty() {
+        return Some(0);
+    }
     for term in spec.split('+') {
         let term = term.trim();
         if term.is_empty() {
@@ -53,22 +134,6 @@ pub(crate) fn sum_offsets(spec: &str) -> Option<usize> {
         sum = sum.checked_add(usize::from_str_radix(term.trim_start_matches("0x"), 16).ok()?)?;
     }
     Some(sum)
-}
-
-/// An entry that follows a pointer before reading: `[rsi+0x10020]+0x38` reads the qword the writer
-/// pointer `[rsi+0x10020]` names, at `+0x38` — a field of an object the frame only points at. Split
-/// into the entry read first and the offset added to the value read there.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "x86_64")), allow(dead_code))]
-pub(crate) fn deref_entry(entry: &str) -> Option<(&str, usize)> {
-    let rest = entry.trim().strip_prefix('[')?;
-    let (inner, after) = rest.split_once(']')?;
-    let after = after.trim();
-    let offset = match after.strip_prefix('+') {
-        Some(terms) => sum_offsets(terms)?,
-        None if after.is_empty() => 0,
-        None => return None,
-    };
-    Some((inner.trim(), offset))
 }
 
 #[cfg(test)]
@@ -100,20 +165,33 @@ mod tests {
         assert_eq!(address("nonsense", &gpr, None), None);
     }
 
-    /// An entry may follow a pointer first: `[entry]+offset` reads the qword the inner entry
-    /// names, then the qword at that value plus the offset. A bracketed entry with no closing
-    /// bracket, and one with something that is no offset after it, name nothing.
+    /// An entry may follow pointers before reading, and the brackets nest: each level reads the
+    /// qword the entry inside names and adds what comes after the bracket. A fake memory stands in
+    /// for the title's, so the walk is checked without a run.
     #[test]
-    fn peek_entries_follow_a_pointer_before_reading() {
+    fn peek_entries_follow_pointers_before_reading() {
+        // A tiny memory: 0x1000 holds 0x2000, 0x2000 holds 0x1234, 0x2008 holds 0x3000,
+        // 0x3010 holds 0xbeef.
+        let mut mem = [0usize; 0x1000];
+        mem[0x1000 / 8] = 0x2000;
+        mem[0x2000 / 8] = 0x1234;
+        mem[0x2008 / 8] = 0x3000;
+        mem[0x3010 / 8] = 0xbeef;
+        let read = |at: usize| mem.get(at / 8).copied().filter(|_| at.is_multiple_of(8));
+        let gpr = [0u64; 16];
+        // The bare hex entries are RVAs, so they are counted from an image at 0.
+        assert_eq!(read_entry("[1000]+8", &gpr, Some(0), read), Read::Value(0x3000));
         assert_eq!(
-            deref_entry("[rsi+0x10020]+0x38"),
-            Some(("rsi+0x10020", 0x38))
+            read_entry("[[1000]+8]+0x10", &gpr, Some(0), read),
+            Read::Value(0xbeef)
         );
-        assert_eq!(deref_entry("[ 0x181796a00 ]"), Some(("0x181796a00", 0)));
-        assert_eq!(deref_entry("[rsi]+8+8"), Some(("rsi", 0x10)));
-        assert_eq!(deref_entry("[rsi"), None);
-        assert_eq!(deref_entry("[rsi]x"), None);
-        assert_eq!(deref_entry("rsi+0x50"), None);
+        assert_eq!(read_entry("[1000]", &gpr, Some(0), read), Read::Value(0x1234));
+        // A bracket that never closes, and something after it that is no offset, name nothing.
+        assert_eq!(read_entry("[1000", &gpr, Some(0), read), Read::NoEntry);
+        assert_eq!(read_entry("[1000]x", &gpr, Some(0), read), Read::NoEntry);
+        // An address the memory does not cover is unmapped, and an entry that is no address is none.
+        assert_eq!(read_entry("[1000]+0x8000", &gpr, Some(0), read), Read::Unmapped);
+        assert_eq!(read_entry("nonsense", &gpr, Some(0), read), Read::NoEntry);
     }
 
     /// Offsets add up: an entry names a field of the object a register points into, and two terms

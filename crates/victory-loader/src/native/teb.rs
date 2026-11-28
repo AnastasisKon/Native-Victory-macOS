@@ -41,6 +41,40 @@ pub const OFF_IN_HOST_CTX: usize = 0x1F20;
 pub const OFF_IN_HOST_RBP: usize = 0x1F28;
 /// Modules with static TLS one thread can hold (the array's length).
 pub const MAX_TLS_MODULES: usize = 64;
+
+core::arch::global_asm!(
+    // GetLastError() and SetLastError(code), Windows ABI, for title code: both touch only the
+    // TEB at the caller's GS base, so they run with no bridge swap and cost the call itself
+    // instead of the ~370 ns GS swap each way. Bound with `bridge::declare_direct`.
+    ".p2align 4",
+    ".globl _victory_GetLastError",
+    "_victory_GetLastError:",
+    "mov eax, gs:[{last_error}]",
+    "ret",
+    ".p2align 4",
+    ".globl _victory_SetLastError",
+    "_victory_SetLastError:",
+    "mov gs:[{last_error}], ecx",
+    "ret",
+    last_error = const OFF_LAST_ERROR,
+);
+
+unsafe extern "win64" {
+    fn victory_GetLastError() -> u32;
+    fn victory_SetLastError(code: u32);
+}
+
+/// The address title code calls for `GetLastError` with no bridge: reads `gs:[OFF_LAST_ERROR]`
+/// of the TEB its GS base points at.
+pub fn direct_get_last_error_address() -> usize {
+    victory_GetLastError as *const () as usize
+}
+
+/// The address title code calls for `SetLastError` with no bridge: writes `ecx` to
+/// `gs:[OFF_LAST_ERROR]` of that TEB.
+pub fn direct_set_last_error_address() -> usize {
+    victory_SetLastError as *const () as usize
+}
 const PEB_SIZE: usize = 0x800;
 const OFF_PEB_IMAGE_BASE: usize = 0x10;
 
@@ -316,6 +350,51 @@ mod tests {
         let bytes = unsafe { std::slice::from_raw_parts(block, 16) };
         assert_eq!(&bytes[..8], &init);
         assert_eq!(&bytes[8..16], &[0u8; 8]);
+    }
+
+    #[test]
+    fn direct_last_error_reads_and_writes_the_callers_gs_base() {
+        // SAFETY: swaps GS to `base` with the same machdep call the bridge uses.
+        unsafe fn set_gs(base: usize) {
+            #[allow(unused_unsafe)]
+            unsafe {
+                std::arch::asm!(
+                    "mov rdi, {base}",
+                    "mov eax, 0x3000003",
+                    "syscall",
+                    base = in(reg) base,
+                    out("rax") _,
+                    lateout("rcx") _,
+                    lateout("r11") _,
+                    options(nostack),
+                );
+            }
+        }
+        let mut fake = vec![0u8; TEB_SIZE];
+        fake[OFF_LAST_ERROR..OFF_LAST_ERROR + 4].copy_from_slice(&0xBEEFu32.to_le_bytes());
+        let fake_base = fake.as_mut_ptr() as usize;
+        let host_gs = host_tsd_base();
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: puts this thread's host GS base back.
+                unsafe { set_gs(self.0) };
+            }
+        }
+        let _restore = Restore(host_gs);
+        let got;
+        let wrote;
+        // SAFETY: GS points at `fake`, which outlives the two calls, and is restored before any
+        // host code (TLS access) runs again.
+        unsafe {
+            set_gs(fake_base);
+            got = victory_GetLastError();
+            victory_SetLastError(0x1234);
+            wrote = u32::from_le_bytes(fake[OFF_LAST_ERROR..OFF_LAST_ERROR + 4].try_into().unwrap());
+            set_gs(host_gs);
+        }
+        assert_eq!(got, 0xBEEF);
+        assert_eq!(wrote, 0x1234);
     }
 
     #[test]

@@ -979,12 +979,21 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     if let Some(address) = exceptions(name) {
         return Some(address);
     }
+    // TEB-only functions run with the title's GS base and no bridge swap, so a call costs the
+    // call itself instead of the ~370 ns GS swap each way (docs/native-host.md).
+    let direct = |address: usize| {
+        native::declare_direct(address);
+        Some(address)
+    };
+    match name {
+        "GetLastError" => return direct(teb::direct_get_last_error_address()),
+        "SetLastError" => return direct(teb::direct_set_last_error_address()),
+        _ => {}
+    }
     if let Some(address) = sync::lookup(name).or_else(|| files::lookup(name)) {
         return Some(address);
     }
     table!(
-        GetLastError,
-        SetLastError,
         GetCurrentThreadId,
         GetCurrentProcessId,
         QueryPerformanceFrequency,
@@ -1521,5 +1530,23 @@ mod memory_tests {
         assert_eq!(CloseHandle(auto_ev), 1);
         assert_eq!(CloseHandle(other_ev), 1);
         assert_eq!(CloseHandle(never_ev), 1);
+    }
+
+    #[test]
+    fn last_error_is_bound_direct_so_the_title_needs_no_bridge_stub() {
+        for dll in [
+            "kernel32.dll",
+            "kernelbase.dll",
+            "ntdll.dll",
+            "api-ms-win-core-errorhandling-l1-1-0.dll",
+        ] {
+            let get = lookup(dll, "GetLastError").expect("GetLastError resolves");
+            let set = lookup(dll, "SetLastError").expect("SetLastError resolves");
+            assert_eq!(get, teb::direct_get_last_error_address(), "{dll}");
+            assert_eq!(set, teb::direct_set_last_error_address(), "{dll}");
+            // A direct function gets no stub: the binder hands the title the address itself.
+            assert_eq!(native::bridge::stub_for(get).unwrap(), get, "{dll}");
+            assert_eq!(native::bridge::stub_for(set).unwrap(), set, "{dll}");
+        }
     }
 }

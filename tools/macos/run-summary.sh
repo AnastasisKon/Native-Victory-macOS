@@ -149,6 +149,16 @@ function field(line, key,   re, s) { # value of `key=...` (optionally quoted) in
     if (pms[nptp] > pam[a]) pam[a] = pms[nptp]
     paw[a] = field(line, "work")
   }
+  # glue::warn_drop_pipe (#531): one line per pipeline a draw or dispatch was dropped for, so the
+  # log names it even when its refusal was logged earlier or without one.
+  if (line ~ /dropped for want of a host pipeline \(first of this pipeline\)/) {
+    x = line
+    if (ts != "") { sub(/^[^ ]+ +[A-Z]+ +/, "", x) }
+    sub(/.*pipeline=/, "", x)
+    gsub(/^"|"$/, "", x)
+    x = norm(x)
+    if (!(x in ppset)) { ppset[x] = 1; pp[++npp] = x }
+  }
   if (line ~ /pass time: frame=/) {
     nptf++
     ftp += field(line, "passes") + 0
@@ -191,6 +201,7 @@ function metrics(   i, k, w, nw, v, r, u, kd, d, end) { # the --compare rows, on
     emit("row", "submit timing: slowest ms", sprintf("%.1f", sub_max))
   }
   if (nunm) emit("row", "unmapped levels lines", nunm)
+  if (npp) emit("row", "pipelines with no host pipeline", npp + 0)
   # Only when the log has them: a log without VICTORY_PASS_TIMING keeps the table as it was.
   if (nptf) {
     emit("row", "pass-timing frames", nptf + 0)
@@ -272,6 +283,15 @@ END {
         printf "    %8.2f ms x%d (max %.2f)  kind=%s pipe=%s work~%s\n", av[ix[i]], pac[a], pam[a], q[1], q[2], paw[a]
       }
     }
+    print ""
+  }
+
+  # Only when the log names them (glue::warn_drop_pipe): other logs keep the summary they had.
+  if (npp) {
+    print "-- pipelines dropped for want of a host pipeline"
+    printf "  %d named (the first 64 of the run; each line once)\n", npp
+    for (i = 1; i <= npp && i <= 20; i++) printf "    %s\n", substr(pp[i], 1, 150)
+    if (npp > 20) printf "  ... %d more\n", npp - 20
     print ""
   }
 
@@ -399,6 +419,7 @@ metal: command buffer failed: NSError { code: 2, "Caused GPU Hang Error (0000000
 @ESC@[2m2026-01-01T00:00:05.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::host: submit timing: lists=2 cmds=17 prep=1.5ms encode_commit=0.3ms total=1.8ms
 @ESC@[2m2026-01-01T00:00:05.100000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::host: submit timing: lists=1 cmds=9 prep=2.5ms encode_commit=0.5ms total=3.0ms
 @ESC@[2m2026-01-01T00:00:05.200000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::textures: unmapped levels: 12.0MB in 3 levels of 2 textures (f28=10.0MB f45=2.0MB)
+@ESC@[2m2026-01-01T00:00:04.600000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_gpu::native::glue: a draw or execution dropped for want of a host pipeline (first of this pipeline) pipeline="[\"vs 1111222233334444\", \"ps 5555666677778888\"] into DrawTargets { color: [Some(0x1234)], depth: None }"
 @ESC@[2m2026-01-01T00:00:05.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_metal::pass_timing: pass time frame=64 rank=1 kind=render pipe=6adfc332b21374b3 work=12 ms=42.5
 @ESC@[2m2026-01-01T00:00:05.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_metal::pass_timing: pass time frame=64 rank=2 kind=compute pipe="abc123def456" work=64 ms=9.25
 @ESC@[2m2026-01-01T00:00:05.100000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_metal::pass_timing: pass time: frame=64 passes=2 total_ms=51.75
@@ -417,6 +438,8 @@ LOG
   chk 'mixer seconds: 1, spatial stream activations: 1, DSP connects: 0, DSP streams: 0'
   chk 'submit timing (VICTORY_SUBMIT_TIMING): 2 submissions, total 4.8 ms (prep 4.0 ms, encode+commit 0.8 ms), slowest 3.0 ms'
   chk 'unmapped mip levels (VICTORY_TRACE_UNMAPPED_LEVELS): 1 lines, last: victory_gpu::native::textures: unmapped levels: 12.0MB in 3 levels of 2 textures'
+  chk '1 named (the first 64 of the run; each line once)'
+  chk 'vs H.*ps H.*into DrawTargets'
   chk 'victory: fatal signal 11 (code 1) at address 0x7ff8deadbeef'
   chk 'frames timed: 1, passes timed: 2, GPU pass time 51.8 ms total, 51.8 ms mean/frame, max frame 51.8 ms'
   chk '42.50 ms  frame=64 rank=1 kind=render pipe=6adfc332b21374b3 work=12'

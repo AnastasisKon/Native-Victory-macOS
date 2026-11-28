@@ -1040,7 +1040,9 @@ that pipeline - its stages' shader hashes and its render targets, `pipeline =`
 on the warning - once for each, up to 64, so a run's log says which pipeline a
 drop was even when its refusal was logged earlier or happened without one (#531;
 before, that only happened under `VICTORY_TRACE_TARGETS`). Test:
-`glue::a_dropped_pipeline_is_named_once`.
+`glue::a_dropped_pipeline_is_named_once`. `tools/macos/run-summary.sh` lists those
+pipelines in a section of its own and carries their count in the `--compare`
+table, so a before/after run shows which pipelines gained a host pipeline.
 
 Two more kinds are dropped one command at a time when a piece is submitted
 (`NativeHost::execute`), where the whole piece used to be refused: a draw or

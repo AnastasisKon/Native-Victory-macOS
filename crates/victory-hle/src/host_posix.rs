@@ -65,6 +65,7 @@ const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INVALID_ADDRESS: u32 = 487;
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
+const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
 const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
 
 const MEM_COMMIT: u32 = 0x1000;
@@ -1068,6 +1069,22 @@ pub extern "system" fn OpenThread(_access: u32, _inherit: i32, id: u32) -> *mut 
     new_handle(Object::Thread(t))
 }
 
+/// `ExitThread`: the calling title thread ends here, with `code`, and the
+/// loader finishes it where it entered title code (its `DLL_THREAD_DETACH`
+/// notices, then its exit code). Title code after the call does not run:
+/// `_endthreadex` is the same call for the CRT. A thread the title did not
+/// start (a thread-pool worker running one of its callbacks) has no entry
+/// frame to leave: the call says so and returns, leaving the thread running.
+pub extern "system" fn ExitThread(code: u32) {
+    if !native::in_title_thread() {
+        tracing::warn!("ExitThread outside a title thread entry point: the thread runs on");
+        set_error(ERROR_CALL_NOT_IMPLEMENTED);
+        return;
+    }
+    // SAFETY: reached through the host stub from a title thread's entry point.
+    unsafe { native::exit_title_thread(code) }
+}
+
 /// `GetProcessIdOfThread`: every thread this host can name is in this process.
 pub extern "system" fn GetProcessIdOfThread(handle: *mut c_void) -> u32 {
     if handle as isize == system::GetCurrentThread() || thread_of(handle).is_some() {
@@ -1222,6 +1239,7 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         GetExitCodeThread,
         GetThreadId,
         OpenThread,
+        ExitThread,
         GetProcessIdOfThread,
         SetThreadDescription,
         GetThreadDescription,
@@ -1920,5 +1938,23 @@ mod thread_handle_tests {
                 assert!(lookup(dll, name).is_some(), "{dll}!{name}");
             }
         }
+    }
+
+    /// `ExitThread` ends a title thread where it is called (the loader's entry
+    /// frame is left, so nothing after the call runs). A thread the title did
+    /// not start has no such frame: it is told so and runs on, which is what
+    /// this test's own thread is.
+    #[test]
+    fn exit_thread_ends_only_a_thread_with_a_title_entry_frame() {
+        for dll in ["kernel32.dll", "api-ms-win-core-processthreads-l1-1-0.dll"] {
+            assert!(lookup(dll, "ExitThread").is_some(), "{dll}!ExitThread");
+        }
+        let seen = std::thread::spawn(|| {
+            ExitThread(7);
+            GetLastError()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(seen, ERROR_CALL_NOT_IMPLEMENTED);
     }
 }

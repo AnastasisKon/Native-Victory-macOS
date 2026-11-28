@@ -51,6 +51,8 @@ IMPORT void DebugBreak(void);
 IMPORT u32 SuspendThread(ptr);
 IMPORT u32 ResumeThread(ptr);
 IMPORT int GetThreadContext(ptr, ptr);
+IMPORT void ExitThread(u32);
+IMPORT int GetExitCodeThread(ptr, u32 *);
 IMPORT u32 WaitForMultipleObjects(u32, const ptr *, int, u32);
 IMPORT int SwitchToThread(void);
 IMPORT void InitializeCriticalSection(ptr);
@@ -544,6 +546,7 @@ enum {
     T_CV = 1u << 16,
     T_CV_TIMEOUT = 1u << 17,
     T_SWITCH = 1u << 18,
+    T_EXIT_THREAD = 1u << 19,
 };
 
 static volatile u32 ran_flag, spin_stop;
@@ -568,6 +571,17 @@ static u32 __attribute__((noinline)) spin_worker(ptr param)
 static u32 __attribute__((noinline)) after_spin_worker(void)
 {
     return 0;
+}
+
+/* ExitThread's worker: the store after the call must never run. */
+static volatile u32 after_exit_flag;
+
+static u32 __attribute__((noinline)) exit_worker(ptr param)
+{
+    (void)param;
+    ExitThread(7);
+    after_exit_flag = 1;
+    return 9;
 }
 
 /* A CONTEXT is 0x4D0 bytes, 16-aligned. */
@@ -635,6 +649,19 @@ u32 probe_threads(ptr unused)
     spin_stop = 1;
     WaitForSingleObject(sp, 5000);
     CloseHandle(sp);
+
+    /* ExitThread ends the thread where it is called: the code after it never
+     * runs, and the exit code is the one it was given. */
+    after_exit_flag = 0;
+    ptr xt = CreateThread(0, 0, (ptr)exit_worker, 0, 0, 0);
+    if (xt) {
+        u32 exit_code = 0;
+        WaitForSingleObject(xt, 5000);
+        if (GetExitCodeThread(xt, &exit_code) && exit_code == 7 && !after_exit_flag)
+            ok |= T_EXIT_THREAD;
+        CloseHandle(xt);
+    }
+
     CloseHandle(done);
     return ok;
 }

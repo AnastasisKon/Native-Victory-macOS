@@ -246,7 +246,14 @@ mod run {
 
     #[test]
     fn threads_notices_suspension_and_context() {
-        assert_all(run_probe("probe_threads", 0), 0xFF, "probe_threads");
+        // Bit 19 is `T_EXIT_THREAD`: a thread that calls `ExitThread` ends there, with
+        // that code, and the store after the call never runs. Bits 8 and up are
+        // probe_sync's, which shifts its own down.
+        assert_all(
+            run_probe("probe_threads", 0),
+            0xFF | 1 << 19,
+            "probe_threads",
+        );
     }
 
     #[test]

@@ -1176,6 +1176,224 @@ pub extern "system" fn GetSystemTimePreciseAsFileTime(out: *mut u64) {
     GetSystemTimeAsFileTime(out);
 }
 
+// What the title thinks it is running on: the OS version, and the machine's facts.
+
+/// The Windows version reported: the console's own build family, which is what a
+/// title gates its features on. shortcut: the console reports its own build; this is
+/// the Windows 10 2004 build the GDK's own headers target, and no title here has
+/// asked for a build number this host could answer more truthfully.
+const WINDOWS_MAJOR: u32 = 10;
+const WINDOWS_MINOR: u32 = 0;
+const WINDOWS_BUILD: u32 = 19041;
+const VER_PLATFORM_WIN32_NT: u32 = 2;
+const VER_NT_WORKSTATION: u8 = 1;
+
+/// `OSVERSIONINFOEXW`'s size, which is what a title passes for it.
+const VERSION_INFO_EX: u32 = 156;
+
+/// Fills an `OSVERSIONINFOEXW` (or the shorter `OSVERSIONINFOW`, by the size the
+/// caller wrote) with the version this host reports.
+fn fill_version_info(info: *mut u8) {
+    if info.is_null() {
+        return;
+    }
+    // SAFETY: the title's structure, whose size is its first word.
+    unsafe {
+        let size = info.cast::<u32>().read();
+        info.add(4).cast::<u32>().write(WINDOWS_MAJOR);
+        info.add(8).cast::<u32>().write(WINDOWS_MINOR);
+        info.add(12).cast::<u32>().write(WINDOWS_BUILD);
+        info.add(16).cast::<u32>().write(VER_PLATFORM_WIN32_NT);
+        // szCSDVersion: no service pack.
+        std::ptr::write_bytes(info.add(20), 0, 128);
+        if size >= VERSION_INFO_EX {
+            info.add(148).cast::<u16>().write(0); // wServicePackMajor
+            info.add(150).cast::<u16>().write(0); // wServicePackMinor
+            info.add(152).cast::<u16>().write(0); // wSuiteMask
+            info.add(154).write(VER_NT_WORKSTATION);
+            info.add(155).write(0);
+        }
+    }
+}
+
+/// `RtlGetVersion`: the version, and `STATUS_SUCCESS` even when the caller's size
+/// would make `GetVersionExW` fail.
+pub extern "system" fn RtlGetVersion(info: *mut u8) -> i32 {
+    fill_version_info(info);
+    0
+}
+
+pub extern "system" fn GetVersionExW(info: *mut u8) -> i32 {
+    if info.is_null() {
+        return 0;
+    }
+    // SAFETY: the title's structure, whose size is its first word.
+    let size = unsafe { info.cast::<u32>().read() };
+    if size != 156 && size != 148 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    fill_version_info(info);
+    1
+}
+
+/// The `VER_*` bits `VerifyVersionInfoW` compares, in the low byte of its type mask.
+const VER_MINORVERSION: u8 = 0x1;
+const VER_MAJORVERSION: u8 = 0x2;
+const VER_BUILDNUMBER: u8 = 0x4;
+const VER_PLATFORMID: u8 = 0x8;
+const VER_SERVICEPACKMINOR: u8 = 0x10;
+const VER_SERVICEPACKMAJOR: u8 = 0x20;
+const VER_SUITENAME: u8 = 0x40;
+const VER_PRODUCT_TYPE: u8 = 0x80;
+
+/// The `VER_*` operator in the high byte of the type mask.
+const VER_EQUAL: u8 = 1;
+const VER_GREATER: u8 = 2;
+const VER_GREATER_EQUAL: u8 = 3;
+const VER_LESS: u8 = 4;
+const VER_LESS_EQUAL: u8 = 5;
+const VER_AND: u8 = 6;
+const VER_OR: u8 = 7;
+
+const ERROR_OLD_WIN_VERSION: u32 = 1150;
+
+/// `VerifyVersionInfoW`: whether this host's version satisfies the condition, which
+/// is how a title decides between its Windows 7 and Windows 10 paths without a
+/// manifest. The operator is the high byte of `type_mask`, the fields the low byte.
+pub extern "system" fn VerifyVersionInfoW(
+    condition: *const u8,
+    type_mask: u32,
+    _lparam: usize,
+) -> i32 {
+    if condition.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: the title's CONDITION_VECTOR, 16 bytes: the words it names are read
+    // below, and it wrote the ones its mask selected.
+    let condition = unsafe { std::slice::from_raw_parts(condition, 16) };
+    let word = |at: usize| u16_from(condition, at);
+    let operator = ((type_mask >> 8) & 0xFF) as u8;
+    let compare = |wanted: u16, actual: u32| -> bool {
+        let wanted = u32::from(wanted);
+        match operator {
+            VER_EQUAL => actual == wanted,
+            VER_GREATER => actual > wanted,
+            VER_GREATER_EQUAL => actual >= wanted,
+            VER_LESS => actual < wanted,
+            VER_LESS_EQUAL => actual <= wanted,
+            VER_AND => actual & wanted == wanted,
+            VER_OR => actual & wanted != 0,
+            _ => false,
+        }
+    };
+    let mask = type_mask as u8;
+    let mut satisfied = true;
+    if mask & VER_MAJORVERSION != 0 {
+        satisfied &= compare(word(0), WINDOWS_MAJOR);
+    }
+    if mask & VER_MINORVERSION != 0 {
+        satisfied &= compare(word(2), WINDOWS_MINOR);
+    }
+    if mask & VER_BUILDNUMBER != 0 {
+        satisfied &= compare(word(4), WINDOWS_BUILD);
+    }
+    if mask & VER_PLATFORMID != 0 {
+        satisfied &= compare(word(6), VER_PLATFORM_WIN32_NT);
+    }
+    if mask & VER_SERVICEPACKMAJOR != 0 {
+        satisfied &= compare(word(10), 0);
+    }
+    if mask & VER_SERVICEPACKMINOR != 0 {
+        satisfied &= compare(word(8), 0);
+    }
+    if mask & VER_SUITENAME != 0 {
+        satisfied &= compare(word(12), 0);
+    }
+    if mask & VER_PRODUCT_TYPE != 0 {
+        satisfied &= compare(word(14), u32::from(VER_NT_WORKSTATION));
+    }
+    if satisfied {
+        return 1;
+    }
+    set_error(ERROR_OLD_WIN_VERSION);
+    0
+}
+
+fn u16_from(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
+/// `QueryUnbiasedInterruptTime`: 100 ns units since boot, which this host's own
+/// counter already is.
+pub extern "system" fn QueryUnbiasedInterruptTime(out: *mut u64) -> i32 {
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: the title's out word.
+    unsafe { out.write(clock::counter() / 100) };
+    1
+}
+
+/// `GetSystemTimes`: the process's own user and kernel time and no idle time, which
+/// is the honest answer here: this host does not account for another process's idling
+/// and a title only subtracts two readings of it.
+pub extern "system" fn GetSystemTimes(idle: *mut u64, kernel: *mut u64, user: *mut u64) -> i32 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: a local `rusage`, filled by the call.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        set_error(ERROR_NOT_SUPPORTED);
+        return 0;
+    }
+    // SAFETY: the call above filled it.
+    let usage = unsafe { usage.assume_init() };
+    let mut ticks = |tv: libc::timeval| -> u64 {
+        (tv.tv_sec as u64) * TICKS_PER_SECOND + (tv.tv_usec as u64) * 10
+    };
+    // SAFETY: the title's out words, each of which it may leave null.
+    unsafe {
+        if !idle.is_null() {
+            idle.write(0);
+        }
+        if !kernel.is_null() {
+            kernel.write(ticks(usage.ru_stime));
+        }
+        if !user.is_null() {
+            user.write(ticks(usage.ru_utime));
+        }
+    }
+    1
+}
+
+/// `GetPhysicallyInstalledSystemMemory`: the machine's RAM in KiB, from the host.
+pub extern "system" fn GetPhysicallyInstalledSystemMemory(out: *mut u64) -> i32 {
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut bytes: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    // SAFETY: a local out value and its size, for the documented sysctl.
+    let ok = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&raw mut bytes).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok != 0 || bytes == 0 {
+        set_error(ERROR_NOT_SUPPORTED);
+        return 0;
+    }
+    // SAFETY: the title's out word.
+    unsafe { out.write(bytes / 1024) };
+    1
+}
+
 pub extern "system" fn GetSystemTime(out: *mut SystemTimeFields) {
     // SAFETY: a SYSTEMTIME.
     unsafe { out.write_unaligned(to_system_time(now_ticks())) };
@@ -4231,6 +4449,8 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
     }
     let kernel = dll == "kernel32.dll"
         || dll == "kernelbase.dll"
+        // The `Rtl*` names are ntdll's, and a title imports them from there.
+        || dll == "ntdll.dll"
         || dll.starts_with("api-ms-win-core-")
         || dll.starts_with("api-ms-win-eventing-");
     if kernel {
@@ -4276,6 +4496,12 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             DecodePointer,
             GetSystemTimeAsFileTime,
             GetSystemTimePreciseAsFileTime,
+            RtlGetVersion,
+            GetVersionExW,
+            VerifyVersionInfoW,
+            QueryUnbiasedInterruptTime,
+            GetSystemTimes,
+            GetPhysicallyInstalledSystemMemory,
             GetSystemTime,
             GetLocalTime,
             FileTimeToSystemTime,
@@ -6412,6 +6638,123 @@ mod apartment_and_winrt_tests {
             ("api-ms-win-core-winrt-error-l1-1-0.dll", "SetRestrictedErrorInfo"),
         ] {
             assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
+        }
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    fn condition(words: &[(usize, u16)]) -> [u8; 16] {
+        let mut condition = [0u8; 16];
+        for &(at, value) in words {
+            condition[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        condition
+    }
+
+    /// The version a title asks for is filled in, both the short and the extended
+    /// form, and a size that is neither is refused the way `GetVersionExW` refuses it.
+    #[test]
+    fn the_version_is_filled_in_both_forms() {
+        let mut extended = [0u8; 156];
+        extended[0..4].copy_from_slice(&156u32.to_le_bytes());
+        assert_eq!(GetVersionExW(extended.as_mut_ptr()), 1);
+        let word = |at: usize| u32::from_le_bytes(extended[at..at + 4].try_into().unwrap());
+        assert_eq!(
+            (word(4), word(8), word(12), word(16)),
+            (WINDOWS_MAJOR, WINDOWS_MINOR, WINDOWS_BUILD, VER_PLATFORM_WIN32_NT)
+        );
+        assert_eq!(extended[20], 0, "no service pack string");
+        assert_eq!(extended[154], VER_NT_WORKSTATION);
+        assert_eq!(extended[148..154], [0u8; 6], "no service pack, no suite");
+
+        // The shorter form is filled as far as it goes, and the extended tail is left.
+        let mut short = [0xFFu8; 148];
+        short[0..4].copy_from_slice(&148u32.to_le_bytes());
+        assert_eq!(GetVersionExW(short.as_mut_ptr()), 1);
+        assert_eq!(u32::from_le_bytes(short[12..16].try_into().unwrap()), WINDOWS_BUILD);
+
+        let mut wrong = [0u8; 156];
+        wrong[0..4].copy_from_slice(&100u32.to_le_bytes());
+        set_error(0);
+        assert_eq!(GetVersionExW(wrong.as_mut_ptr()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        // RtlGetVersion reports the same version and always succeeds.
+        let mut rtl = [0u8; 156];
+        rtl[0..4].copy_from_slice(&156u32.to_le_bytes());
+        assert_eq!(RtlGetVersion(rtl.as_mut_ptr()), 0);
+        assert_eq!(
+            u32::from_le_bytes(rtl[12..16].try_into().unwrap()),
+            WINDOWS_BUILD
+        );
+    }
+
+    /// The version comparison answers with the operator it was given, which is how a
+    /// title picks between its Windows 7 and Windows 10 paths.
+    #[test]
+    fn the_version_comparison_answers_with_its_operator() {
+        let build = |operator: u8, wanted: u16| {
+            let mask = u32::from(VER_BUILDNUMBER) | (u32::from(operator) << 8);
+            VerifyVersionInfoW(condition(&[(4, wanted)]).as_ptr(), mask, 0)
+        };
+        assert_eq!(build(VER_GREATER_EQUAL, 7601), 1, "Windows 7 or later");
+        assert_eq!(build(VER_GREATER_EQUAL, WINDOWS_BUILD as u16), 1);
+        assert_eq!(build(VER_EQUAL, WINDOWS_BUILD as u16), 1);
+        assert_eq!(build(VER_LESS, WINDOWS_BUILD as u16), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_OLD_WIN_VERSION);
+        assert_eq!(build(VER_GREATER, WINDOWS_BUILD as u16), 0);
+        assert_eq!(build(VER_GREATER, WINDOWS_BUILD as u16 - 1), 1);
+
+        // Two fields at once both have to hold.
+        let both = condition(&[(0, 10), (4, 19041)]);
+        let mask = u32::from(VER_MAJORVERSION | VER_BUILDNUMBER) | (u32::from(VER_GREATER_EQUAL) << 8);
+        assert_eq!(VerifyVersionInfoW(both.as_ptr(), mask, 0), 1);
+        let older = condition(&[(0, 11)]);
+        assert_eq!(
+            VerifyVersionInfoW(
+                older.as_ptr(),
+                u32::from(VER_MAJORVERSION) | (u32::from(VER_GREATER_EQUAL) << 8),
+                0
+            ),
+            0
+        );
+    }
+
+    /// The machine's facts: an interrupt time that moves, the process's own CPU time,
+    /// and the RAM the host reports.
+    #[test]
+    fn the_interrupt_time_and_the_machines_time_and_memory_are_answered() {
+        let (mut first, mut second) = (0u64, 0u64);
+        assert_eq!(QueryUnbiasedInterruptTime(&mut first), 1);
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(QueryUnbiasedInterruptTime(&mut second), 1);
+        assert!(second > first, "the interrupt time stood still");
+        assert_eq!(QueryUnbiasedInterruptTime(std::ptr::null_mut()), 0);
+
+        let (mut idle, mut kernel, mut user) = (1u64, 0u64, 0u64);
+        assert_eq!(GetSystemTimes(&mut idle, &mut kernel, &mut user), 1);
+        assert_eq!(idle, 0, "idle is not accounted for here");
+        assert!(kernel + user > 0, "the process has used no CPU time");
+
+        let mut memory = 0u64;
+        assert_eq!(GetPhysicallyInstalledSystemMemory(&mut memory), 1);
+        assert!(memory > 1024, "{memory} KiB of RAM is not a Mac");
+        assert_eq!(GetPhysicallyInstalledSystemMemory(std::ptr::null_mut()), 0);
+
+        for dll in ["kernel32.dll", "ntdll.dll"] {
+            for name in [
+                "RtlGetVersion",
+                "GetVersionExW",
+                "VerifyVersionInfoW",
+                "QueryUnbiasedInterruptTime",
+                "GetSystemTimes",
+                "GetPhysicallyInstalledSystemMemory",
+            ] {
+                assert!(super::super::lookup(dll, name).is_some(), "{dll}!{name}");
+            }
         }
     }
 }

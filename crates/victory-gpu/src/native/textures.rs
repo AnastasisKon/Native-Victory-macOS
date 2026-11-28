@@ -326,6 +326,19 @@ struct Level {
     slice_pitch: usize,
 }
 
+/// Hashes title memory: on the rayon pool when there is a lot of it, so a big texture's sync
+/// does not serialize on one core while the others idle.
+fn hash_of(bytes: &[u8]) -> blake3::Hash {
+    const PARALLEL: usize = 1 << 20;
+    if bytes.len() >= PARALLEL {
+        let mut h = blake3::Hasher::new();
+        h.update_rayon(bytes);
+        h.finalize()
+    } else {
+        blake3::hash(bytes)
+    }
+}
+
 fn is_all_zero(bytes: &[u8]) -> bool {
     let (chunks, tail) = bytes.as_chunks::<64>();
     // Big ranges are checked on the rayon pool, like their hash (see `hash_of`).
@@ -684,23 +697,29 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
             continue;
         };
         let mut h = blake3::Hasher::new();
+        // Big textures are hashed whole on the rayon pool instead of chunk by chunk here.
+        let big = size >= (1 << 20);
         let mut unreadable = false;
         // Keep the bytes when the texture is small enough to hand to the submission, so it
         // detiles them without reading the memory again (the whole read is the sync's main cost).
         let keep = size > 0 && size <= stash_max_texture();
+        // One buffer holds the bytes either because they are big (hashed whole on the rayon
+        // pool) or because the submission will take them (`keep`).
         let mut whole: Vec<u8> = Vec::new();
-        if keep {
+        if big || keep {
             whole.reserve(size);
         }
         for off in (0..size).step_by(buf.len()) {
             let n = buf.len().min(size - off);
             unreadable |= !read_bytes(pool.as_deref(), at + off, &mut buf[..n], was_partial);
-            h.update(&buf[..n]);
-            if keep {
+            if big || keep {
                 whole.extend_from_slice(&buf[..n]);
             }
+            if !big {
+                h.update(&buf[..n]);
+            }
         }
-        let h = h.finalize();
+        let h = if big { hash_of(&whole) } else { h.finalize() };
         watch_in(watched, |w| {
             // Released, or begun/applied by a submission while it was hashed here: this reading is
             // the older one, and the next round compares with the submission's.
@@ -1220,7 +1239,7 @@ impl<B: PresentBackend> Title<B> {
         let _ = read_into(Some(&pools), info.memory as usize, &mut tiled, t.partial);
         // The title wrote the memory since the host texture was filled from it: its bytes stay,
         // and the next submission uploads them.
-        if t.last != Some(blake3::hash(&tiled)) {
+        if t.last != Some(hash_of(&tiled)) {
             return;
         }
         if let Err(error) = download(&self.host.backend, &t.texture, info, &mut tiled) {
@@ -1229,7 +1248,7 @@ impl<B: PresentBackend> Title<B> {
             }
             return;
         }
-        let hash = blake3::hash(&tiled);
+        let hash = hash_of(&tiled);
         if t.last == Some(hash) {
             return;
         }
@@ -2094,7 +2113,7 @@ impl Job {
             let unreadable = read_into(Some(&self.pools), self.memory, tiled, self.partial);
             (unreadable, started.elapsed())
         };
-        let hash = from_stash.map_or_else(|| blake3::hash(tiled), |s| s.hash);
+        let hash = from_stash.map_or_else(|| hash_of(tiled), |s| s.hash);
         let hashed = started.elapsed();
         let changed = self.last != Some(hash);
         let addressable = self.layout.addressable();
@@ -2568,6 +2587,19 @@ mod tests {
         }
         let all_bits = (0..layout.mips.len()).fold(0u32, |a, m| if m < 32 { a | (1u32 << m) } else { a });
         assert_eq!(bits, all_bits);
+    }
+
+    #[test]
+    fn hash_of_matches_blake3_across_the_parallel_threshold() {
+        // Sizes straddling the 1 MiB rayon cutoff, including empty and odd tails.
+        let sizes = [
+            0usize, 1, 63, 64, 65, (1 << 20) - 1, 1 << 20, (1 << 20) + 1, (1 << 20) + 63,
+            (1 << 20) * 3 + 7,
+        ];
+        for size in sizes {
+            let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            assert_eq!(hash_of(&bytes), blake3::hash(&bytes), "size {size}");
+        }
     }
 
     fn watched(entries: impl Into<HashMap<usize, (usize, usize, bool, u64)>>) -> Watched {

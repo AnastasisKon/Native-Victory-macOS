@@ -72,6 +72,8 @@ pub fn switch_delta(jobs: Option<usize>) -> anyhow::Result<()> {
         ..base
     };
     let counts = [const { AtomicUsize::new(0) }; 4];
+    // The containers a switch changes, with what the translation that refused them said.
+    let changed = std::sync::Mutex::new(Vec::new());
     let next = AtomicUsize::new(0);
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -82,12 +84,25 @@ pub fn switch_delta(jobs: Option<usize>) -> anyhow::Result<()> {
                 s.spawn(|| {
                     while let Some(file) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
                         let Some(container) = shaders::read_kept(file) else { continue };
-                        let one = victory_shader::emit::translate_with(&container, base).is_ok();
-                        let two = victory_shader::emit::translate_with(&container, switched).is_ok();
-                        let k = outcome(one, two);
+                        let one = victory_shader::emit::translate_with(&container, base);
+                        let two = victory_shader::emit::translate_with(&container, switched);
+                        let k = outcome(one.is_ok(), two.is_ok());
                         if k == LOST || k == RECOVERED {
-                            let name = file.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-                            tracing::info!(container = %name, lost = k == LOST, "a switch changes this container");
+                            let name = file
+                                .file_name()
+                                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                            // The refusal of the mode that refused it: the switch's own for a lost
+                            // container, the defaults' for a recovered one.
+                            let why = match k {
+                                LOST => two.err(),
+                                _ => one.err(),
+                            };
+                            let why = why.map_or_else(String::new, |e| e.to_string());
+                            tracing::info!(container = %name, lost = k == LOST, %why, "a switch changes this container");
+                            let mut changed = changed.lock().unwrap_or_else(|e| e.into_inner());
+                            if changed.len() < 40 {
+                                changed.push((k, name, why));
+                            }
                         }
                         counts[k].fetch_add(1, Ordering::Relaxed);
                     }
@@ -111,6 +126,22 @@ pub fn switch_delta(jobs: Option<usize>) -> anyhow::Result<()> {
     println!("  lost by switches       {lost} (translated today, refused with them)");
     println!("  refused both ways      {refused}");
     println!("switches     paired_waves and strict_vccz_branch (VICTORY_PAIRED_WAVES, VICTORY_STRICT_VCCZ_BRANCH)");
+    // Named, not only counted: a lost container is the risk a default flip carries, and the reason
+    // says which refusal to look at. The first 40 of the run, as `warn_drop_pipe` does for drops.
+    let changed = changed.into_inner().unwrap_or_else(|e| e.into_inner());
+    for (k, label) in [(LOST, "lost"), (RECOVERED, "recovered")] {
+        let named: Vec<_> = changed.iter().filter(|(o, ..)| *o == k).collect();
+        if named.is_empty() {
+            continue;
+        }
+        println!("{label}:");
+        for (_, name, why) in named.iter().take(10) {
+            println!("  {name}  {why}");
+        }
+        if named.len() > 10 {
+            println!("  ... {} more", named.len() - 10);
+        }
+    }
     Ok(())
 }
 

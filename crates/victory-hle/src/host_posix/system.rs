@@ -29,8 +29,10 @@ const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_NOT_SUPPORTED: u32 = 50;
 const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_NOT_OWNER: u32 = 288;
+const ERROR_IO_PENDING: u32 = 997;
 const ERROR_INVALID_FLAGS: u32 = 1004;
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
@@ -2256,6 +2258,106 @@ pub extern "system" fn InitOnceExecuteOnce(
     }
 }
 
+/// The flags `InitOnceBeginInitialize` and `InitOnceComplete` take.
+const INIT_ONCE_CHECK_ONLY: u32 = 0x1;
+const INIT_ONCE_ASYNC: u32 = 0x2;
+const INIT_ONCE_INIT_FAILED: u32 = 0x4;
+
+/// Writes a finished one-time initialization's context to the caller's out word.
+fn write_once_context(state: u64, context: *mut *mut c_void) {
+    if !context.is_null() {
+        // SAFETY: the title's output word.
+        unsafe { context.write((state & !3) as *mut c_void) };
+    }
+}
+
+/// `InitOnceBeginInitialize`: claims the run `InitOnceExecuteOnce` would have run, or reports
+/// the one that already finished, on the same word: 0 new, 1 running, the context with bit 1
+/// set done. With `INIT_ONCE_CHECK_ONLY` nothing is claimed and a run still under way is
+/// reported as pending instead of waited for.
+///
+/// An asynchronous begin hands back the slot the winner's context goes in, which this
+/// emulation has nowhere to keep: it says so rather than hand back a slot nobody fills.
+pub extern "system" fn InitOnceBeginInitialize(
+    once: *mut AtomicU64,
+    flags: u32,
+    pending: *mut i32,
+    context: *mut *mut c_void,
+) -> i32 {
+    if flags & INIT_ONCE_ASYNC != 0 {
+        set_error(ERROR_CALL_NOT_IMPLEMENTED);
+        return 0;
+    }
+    // SAFETY: the title's INIT_ONCE, a pointer-sized word.
+    let word = unsafe { &*once };
+    if flags & INIT_ONCE_CHECK_ONLY != 0 {
+        let state = word.load(Ordering::Acquire);
+        if state & 3 != 2 {
+            if !pending.is_null() {
+                // SAFETY: the title's output word.
+                unsafe { pending.write(1) };
+            }
+            set_error(ERROR_IO_PENDING);
+            return 0;
+        }
+        write_once_context(state, context);
+        if !pending.is_null() {
+            // SAFETY: as above.
+            unsafe { pending.write(0) };
+        }
+        return 1;
+    }
+    loop {
+        match word.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                if !pending.is_null() {
+                    // SAFETY: the title's output word.
+                    unsafe { pending.write(1) };
+                }
+                return 1;
+            }
+            Err(state) if state & 3 == 2 => {
+                write_once_context(state, context);
+                if !pending.is_null() {
+                    // SAFETY: as above.
+                    unsafe { pending.write(0) };
+                }
+                return 1;
+            }
+            Err(_) => std::thread::sleep(Duration::from_micros(200)),
+        }
+    }
+}
+
+/// `InitOnceComplete`: stores the context of the run a begin claimed the word for. Only the
+/// claim may complete it; a failed attempt hands the word back for the next caller to try.
+pub extern "system" fn InitOnceComplete(
+    once: *mut AtomicU64,
+    flags: u32,
+    context: *mut c_void,
+) -> i32 {
+    if flags & INIT_ONCE_ASYNC != 0 {
+        set_error(ERROR_CALL_NOT_IMPLEMENTED);
+        return 0;
+    }
+    // SAFETY: the title's INIT_ONCE, a pointer-sized word.
+    let word = unsafe { &*once };
+    let done = if flags & INIT_ONCE_INIT_FAILED != 0 {
+        0
+    } else {
+        context as u64 | 2
+    };
+    if word
+        .compare_exchange(1, done, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // Nothing was claimed, or the run already finished: this caller never began it.
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    1
+}
+
 // Fiber local storage, per thread (a fiber is a thread here).
 
 const FLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
@@ -3854,6 +3956,8 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             InterlockedFlushSList,
             QueryDepthSList,
             InitOnceExecuteOnce,
+            InitOnceBeginInitialize,
+            InitOnceComplete,
             FlsAlloc,
             FlsFree,
             FlsGetValue,
@@ -5609,6 +5713,72 @@ mod resource_tests {
                 "{name} is not answered"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod init_once_tests {
+    use super::*;
+
+    #[test]
+    fn a_begin_claims_the_word_and_complete_hands_the_context_back() {
+        let once = AtomicU64::new(0);
+        let word = (&once) as *const AtomicU64 as *mut AtomicU64;
+        let data = 0u64;
+        let context_value = (&data) as *const u64 as *mut c_void;
+        let (mut pending, mut context) = (-1i32, std::ptr::null_mut());
+
+        // Check-only claims nothing: an untouched word is pending and has no context yet.
+        assert_eq!(
+            InitOnceBeginInitialize(word, INIT_ONCE_CHECK_ONLY, &mut pending, &mut context),
+            0
+        );
+        assert_eq!((pending, context, once.load(Ordering::Relaxed)), (1, std::ptr::null_mut(), 0));
+        assert_eq!(super::super::GetLastError(), ERROR_IO_PENDING);
+
+        // A plain begin claims it, and says the caller must run the initialization.
+        assert_eq!(InitOnceBeginInitialize(word, 0, &mut pending, &mut context), 1);
+        assert_eq!((pending, once.load(Ordering::Relaxed)), (1, 1));
+
+        // A second begin waits for the claim, so it is only answered by the complete.
+        assert_eq!(InitOnceComplete(word, 0, context_value), 1);
+        assert_eq!(once.load(Ordering::Relaxed), context_value as u64 | 2);
+        assert_eq!(InitOnceComplete(word, 0, context_value), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        for flags in [0, INIT_ONCE_CHECK_ONLY] {
+            context = std::ptr::null_mut();
+            assert_eq!(InitOnceBeginInitialize(word, flags, &mut pending, &mut context), 1);
+            assert_eq!((pending, context), (0, context_value));
+        }
+    }
+
+    #[test]
+    fn a_failed_run_hands_the_word_back_and_async_says_it_is_not_implemented() {
+        let once = AtomicU64::new(0);
+        let word = (&once) as *const AtomicU64 as *mut AtomicU64;
+        let (mut pending, mut context) = (-1i32, std::ptr::null_mut());
+
+        assert_eq!(InitOnceBeginInitialize(word, 0, &mut pending, &mut context), 1);
+        assert_eq!(InitOnceComplete(word, INIT_ONCE_INIT_FAILED, std::ptr::null_mut()), 1);
+        assert_eq!(once.load(Ordering::Relaxed), 0);
+        assert_eq!(InitOnceBeginInitialize(word, 0, &mut pending, &mut context), 1);
+        assert_eq!(pending, 1);
+
+        assert_eq!(
+            InitOnceBeginInitialize(word, INIT_ONCE_ASYNC, &mut pending, &mut context),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_CALL_NOT_IMPLEMENTED);
+        assert_eq!(InitOnceComplete(word, INIT_ONCE_ASYNC, std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_CALL_NOT_IMPLEMENTED);
+
+        // A complete with nothing claimed is the caller's own mistake.
+        let fresh = AtomicU64::new(2);
+        let done = (&fresh) as *const AtomicU64 as *mut AtomicU64;
+        assert_eq!(InitOnceComplete(done, 0, std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(fresh.load(Ordering::Relaxed), 2);
     }
 }
 

@@ -200,6 +200,13 @@ pub unsafe fn run_entry(image: &'static NativeImage) -> Result<u32> {
 /// thread start and end. A `DllMain` that returns `FALSE` stops the title
 /// with an error, with the DLLs started before it detached.
 ///
+/// `image` may be a DLL rather than an executable: it is then started the
+/// way `LoadLibrary` starts one (its `DllMain` hears `DLL_PROCESS_ATTACH`
+/// with no `reserved` argument, and the result is `0`, not an exit code). A
+/// DLL's entry point is `DllMain`, so it is never called as an executable's
+/// entry point, which would pass the executable's one argument in `rcx` and
+/// leave `fdwReason` to chance.
+///
 /// # Safety
 /// As for [`run_entry`], and the DLLs' imports must be bound and the DLLs
 /// finalized.
@@ -207,7 +214,12 @@ pub unsafe fn run_entry_with(
     image: &'static NativeImage,
     dlls: &[&'static super::dll::TitleDll],
 ) -> Result<u32> {
-    let entry = image.entry().context("image has no entry point")?;
+    let as_dll = image.info().is_dll();
+    let entry = match image.entry() {
+        Some(entry) => entry,
+        None if as_dll => 0,
+        None => return Err(anyhow::anyhow!("image has no entry point")),
+    };
     let stack = usize::try_from(image.info().stack_reserve)
         .unwrap_or(usize::MAX)
         .max(1 << 20);
@@ -236,10 +248,31 @@ pub unsafe fn run_entry_with(
                 }
                 register_dll_thread_notices(&dll.image);
             }
-            register_thread_callbacks(image);
-            attach(image, DLL_PROCESS_ATTACH);
-            let code = call_thread_entry(entry, 0);
-            attach(image, DLL_PROCESS_DETACH);
+            let code = if as_dll {
+                // As `LoadLibrary` starts one: its `DllMain` hears the attach
+                // (`reserved` is 0, this process not having imported it), and
+                // its `BOOL` result says whether it started. Its `DllMain`
+                // hears of threads from here on too.
+                if !attach_dll(image, DLL_PROCESS_ATTACH, 0) {
+                    for done in dlls.iter().rev() {
+                        attach_dll(&done.image, DLL_PROCESS_DETACH, 1);
+                    }
+                    *failed.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some("DllMain of the image returned FALSE".to_owned());
+                    return STATUS_DLL_INIT_FAILED;
+                }
+                register_dll_thread_notices(image);
+                0
+            } else {
+                register_thread_callbacks(image);
+                attach(image, DLL_PROCESS_ATTACH);
+                call_thread_entry(entry, 0)
+            };
+            if as_dll {
+                attach_dll(image, DLL_PROCESS_DETACH, 0);
+            } else {
+                attach(image, DLL_PROCESS_DETACH);
+            }
             for dll in dlls.iter().rev() {
                 attach_dll(&dll.image, DLL_PROCESS_DETACH, 1);
             }

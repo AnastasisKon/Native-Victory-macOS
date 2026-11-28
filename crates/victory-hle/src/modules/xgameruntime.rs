@@ -317,6 +317,56 @@ pub extern "system" fn XErrorSetOptions(on_debugger: u32, without_debugger: u32)
     );
 }
 
+/// The async identities of the file-based save API's calls, one tag each.
+static SAVE_FOLDER: u8 = 0;
+
+/// `XGameSaveFilesGetFolderWithUiAsync` (`XGameSaveFiles.h`): the folder the title may read and
+/// write save files in. There is no UI to show — one local user, no cloud copy — so the folder is
+/// the call's result at once: the path, in bytes, with its NUL.
+pub extern "system" fn XGameSaveFilesGetFolderWithUiAsync(
+    _user: *const c_void,
+    config: *const c_char,
+    block: *mut xasync::AsyncBlock,
+) -> HRESULT {
+    let result = xgamesave::files_folder(text(config).as_deref()).map(|folder| {
+        // The title opens this path: the host's own spelling, terminated for it.
+        let mut bytes = folder.to_string_lossy().into_owned().into_bytes();
+        bytes.push(0);
+        bytes
+    });
+    xasync::finished_with(block, (&raw const SAVE_FOLDER).cast(), result)
+}
+
+/// `XGameSaveFilesGetFolderWithUiResult`: the folder from the call above, into the caller's buffer.
+/// A buffer too small for it fails with `E_NOT_SUFFICIENT_BUFFER` and is not written.
+pub extern "system" fn XGameSaveFilesGetFolderWithUiResult(
+    block: *mut xasync::AsyncBlock,
+    folder_size: usize,
+    folder: *mut c_char,
+) -> HRESULT {
+    let mut used = 0;
+    xasync::XAsyncGetResult(
+        block,
+        (&raw const SAVE_FOLDER).cast(),
+        folder_size,
+        folder.cast(),
+        &mut used,
+    )
+}
+
+/// `XGameSaveFilesGetRemainingQuota`: the provider's quota left for this user and configuration,
+/// in bytes, the same figure the container API's quota call reports.
+pub extern "system" fn XGameSaveFilesGetRemainingQuota(
+    _user: *const c_void,
+    config: *const c_char,
+    out: *mut i64,
+) -> HRESULT {
+    match xgamesave::files_remaining(text(config).as_deref()) {
+        Ok(left) => put(out, left),
+        Err(hr) => hr,
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xgameruntime",
@@ -332,6 +382,9 @@ pub(crate) fn module() -> HleModule {
             hle_export!(XErrorReport),
             hle_export!(XErrorSetCallback),
             hle_export!(XErrorSetOptions),
+            hle_export!(XGameSaveFilesGetFolderWithUiAsync),
+            hle_export!(XGameSaveFilesGetFolderWithUiResult),
+            hle_export!(XGameSaveFilesGetRemainingQuota),
         ],
     }
 }
@@ -340,6 +393,71 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
     use crate::modules::kernel::{FreeLibrary, GetProcAddress, LoadLibraryExA};
+
+    #[test]
+    fn the_file_save_api_hands_out_a_folder_a_file_can_be_written_in() {
+        use crate::modules::xasync::AsyncBlock;
+        use crate::runtime;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        let previous = runtime::title();
+        runtime::set_title(runtime::Title {
+            id: 7,
+            storage: storage.clone(),
+            storage_bytes: 1000,
+            ..Default::default()
+        });
+        let config = c"profile-saves";
+
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(
+            XGameSaveFilesGetFolderWithUiAsync(std::ptr::null(), config.as_ptr(), &mut block),
+            S_OK
+        );
+        let mut size = 0;
+        assert_eq!(xasync::XAsyncGetResultSize(&mut block, &mut size), S_OK);
+        // One byte short of the path and its NUL: refused, and nothing written. Asked first, as
+        // the call is released by the get that succeeds.
+        let mut small = vec![0xAAu8; size - 1];
+        assert_eq!(
+            XGameSaveFilesGetFolderWithUiResult(&mut block, size - 1, small.as_mut_ptr().cast()),
+            xasync::E_NOT_SUFFICIENT_BUFFER
+        );
+        assert!(small.iter().all(|b| *b == 0xAA));
+        let mut folder = vec![0u8; size];
+        assert_eq!(
+            XGameSaveFilesGetFolderWithUiResult(&mut block, size, folder.as_mut_ptr().cast()),
+            S_OK
+        );
+        // The path is the provider's own: under the title's saves, the one user's folder, this
+        // configuration's. A title opens it as it is, so it is a host path.
+        let path = std::ffi::CStr::from_bytes_until_nul(&folder)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let expected = storage
+            .with_file_name("saves")
+            .join(format!("{:016X}", crate::modules::xuser::XUID));
+        assert!(std::path::Path::new(path).starts_with(&expected), "{path}");
+        assert!(std::path::Path::new(path).ends_with("profile-saves"), "{path}");
+        assert!(std::path::Path::new(path).is_dir(), "{path}");
+        // It is writable, which is the point of handing it out.
+        std::fs::write(std::path::Path::new(path).join("slot.dat"), b"save").unwrap();
+
+        // The quota is the provider's, taken with the saves lock.
+        let mut left = 0i64;
+        assert_eq!(
+            XGameSaveFilesGetRemainingQuota(std::ptr::null(), config.as_ptr(), &mut left),
+            S_OK
+        );
+        assert!(left > 0 && left <= 256 << 20, "{left}");
+        runtime::set_title(previous);
+    }
 
     #[test]
     fn title_stub_loads_the_runtime_dynamically() {
@@ -354,6 +472,9 @@ mod tests {
             c"QueryApiImpl",
             c"UninitializeApiImpl",
             c"XErrorReport",
+            c"XGameSaveFilesGetFolderWithUiAsync",
+            c"XGameSaveFilesGetFolderWithUiResult",
+            c"XGameSaveFilesGetRemainingQuota",
         ] {
             assert!(!proc(name).is_null(), "{name:?}");
         }

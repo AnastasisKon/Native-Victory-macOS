@@ -988,6 +988,8 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     match name {
         "GetLastError" => return direct(teb::direct_get_last_error_address()),
         "SetLastError" => return direct(teb::direct_set_last_error_address()),
+        "TlsGetValue" => return direct(teb::direct_tls_get_value_address()),
+        "TlsSetValue" => return direct(teb::direct_tls_set_value_address()),
         _ => {}
     }
     if let Some(address) = sync::lookup(name).or_else(|| files::lookup(name)) {
@@ -1006,8 +1008,6 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         VirtualProtect,
         TlsAlloc,
         TlsFree,
-        TlsGetValue,
-        TlsSetValue,
         CreateEventW,
         SetEvent,
         ResetEvent,
@@ -1533,7 +1533,7 @@ mod memory_tests {
     }
 
     #[test]
-    fn last_error_is_bound_direct_so_the_title_needs_no_bridge_stub() {
+    fn teb_only_functions_are_bound_direct_so_the_title_needs_no_bridge_stub() {
         for dll in [
             "kernel32.dll",
             "kernelbase.dll",
@@ -1544,9 +1544,14 @@ mod memory_tests {
             let set = lookup(dll, "SetLastError").expect("SetLastError resolves");
             assert_eq!(get, teb::direct_get_last_error_address(), "{dll}");
             assert_eq!(set, teb::direct_set_last_error_address(), "{dll}");
+            let tls_get = lookup(dll, "TlsGetValue").expect("TlsGetValue resolves");
+            let tls_set = lookup(dll, "TlsSetValue").expect("TlsSetValue resolves");
+            assert_eq!(tls_get, teb::direct_tls_get_value_address(), "{dll}");
+            assert_eq!(tls_set, teb::direct_tls_set_value_address(), "{dll}");
             // A direct function gets no stub: the binder hands the title the address itself.
-            assert_eq!(native::bridge::stub_for(get).unwrap(), get, "{dll}");
-            assert_eq!(native::bridge::stub_for(set).unwrap(), set, "{dll}");
+            for address in [get, set, tls_get, tls_set] {
+                assert_eq!(native::bridge::stub_for(address).unwrap(), address, "{dll}");
+            }
         }
     }
 }

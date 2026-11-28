@@ -56,12 +56,44 @@ core::arch::global_asm!(
     "_victory_SetLastError:",
     "mov gs:[{last_error}], ecx",
     "ret",
+    // TlsGetValue(index) / TlsSetValue(index, value), same story: the 64 slots at
+    // gs:[OFF_TLS_SLOTS] plus LastError. An out-of-range index sets ERROR_INVALID_PARAMETER
+    // (87) and fails, as the bridged implementation does.
+    ".p2align 4",
+    ".globl _victory_TlsGetValue",
+    "_victory_TlsGetValue:",
+    "cmp ecx, {slots}",
+    "jae 1f",
+    "mov dword ptr gs:[{last_error}], 0",
+    "mov rax, gs:[rcx*8 + {tls_slots}]",
+    "ret",
+    "1:",
+    "mov dword ptr gs:[{last_error}], 87",
+    "xor eax, eax",
+    "ret",
+    ".p2align 4",
+    ".globl _victory_TlsSetValue",
+    "_victory_TlsSetValue:",
+    "cmp ecx, {slots}",
+    "jae 1f",
+    "mov gs:[rcx*8 + {tls_slots}], rdx",
+    "mov dword ptr gs:[{last_error}], 0",
+    "mov eax, 1",
+    "ret",
+    "1:",
+    "mov dword ptr gs:[{last_error}], 87",
+    "xor eax, eax",
+    "ret",
     last_error = const OFF_LAST_ERROR,
+    tls_slots = const OFF_TLS_SLOTS,
+    slots = const TLS_SLOT_COUNT,
 );
 
 unsafe extern "win64" {
     fn victory_GetLastError() -> u32;
     fn victory_SetLastError(code: u32);
+    fn victory_TlsGetValue(index: u32) -> usize;
+    fn victory_TlsSetValue(index: u32, value: usize) -> u32;
 }
 
 /// The address title code calls for `GetLastError` with no bridge: reads `gs:[OFF_LAST_ERROR]`
@@ -74,6 +106,18 @@ pub fn direct_get_last_error_address() -> usize {
 /// `gs:[OFF_LAST_ERROR]` of that TEB.
 pub fn direct_set_last_error_address() -> usize {
     victory_SetLastError as *const () as usize
+}
+
+/// The address title code calls for `TlsGetValue` with no bridge: the slot at
+/// `gs:[OFF_TLS_SLOTS + 8*index]`, or null with `LastError` 87 when `index >= TLS_SLOT_COUNT`.
+pub fn direct_tls_get_value_address() -> usize {
+    victory_TlsGetValue as *const () as usize
+}
+
+/// The address title code calls for `TlsSetValue` with no bridge: writes `rdx` to the slot
+/// above, or fails with `LastError` 87 when `index >= TLS_SLOT_COUNT`.
+pub fn direct_tls_set_value_address() -> usize {
+    victory_TlsSetValue as *const () as usize
 }
 const PEB_SIZE: usize = 0x800;
 const OFF_PEB_IMAGE_BASE: usize = 0x10;
@@ -382,19 +426,34 @@ mod tests {
             }
         }
         let _restore = Restore(host_gs);
+        // A value in TLS slot 3, to read back through gs:.
+        fake[OFF_TLS_SLOTS + 3 * 8..OFF_TLS_SLOTS + 4 * 8].copy_from_slice(&0xABCDusize.to_le_bytes());
         let got;
         let wrote;
-        // SAFETY: GS points at `fake`, which outlives the two calls, and is restored before any
+        let (tls_ok, tls_bad, tls_wrote, tls_err);
+        // SAFETY: GS points at `fake`, which outlives the calls, and is restored before any
         // host code (TLS access) runs again.
         unsafe {
             set_gs(fake_base);
             got = victory_GetLastError();
             victory_SetLastError(0x1234);
             wrote = u32::from_le_bytes(fake[OFF_LAST_ERROR..OFF_LAST_ERROR + 4].try_into().unwrap());
+            tls_ok = victory_TlsGetValue(3);
+            tls_wrote = victory_TlsSetValue(4, 0x5678);
+            tls_bad = victory_TlsGetValue(TLS_SLOT_COUNT as u32);
+            tls_err = u32::from_le_bytes(fake[OFF_LAST_ERROR..OFF_LAST_ERROR + 4].try_into().unwrap());
             set_gs(host_gs);
         }
         assert_eq!(got, 0xBEEF);
         assert_eq!(wrote, 0x1234);
+        assert_eq!(tls_ok, 0xABCD);
+        assert_eq!(tls_wrote, 1);
+        assert_eq!(
+            usize::from_le_bytes(fake[OFF_TLS_SLOTS + 4 * 8..OFF_TLS_SLOTS + 5 * 8].try_into().unwrap()),
+            0x5678
+        );
+        assert_eq!(tls_bad, 0, "an out-of-range index returns null");
+        assert_eq!(tls_err, 87, "and sets ERROR_INVALID_PARAMETER");
     }
 
     #[test]

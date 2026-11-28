@@ -680,6 +680,199 @@ pub extern "system" fn UpdateProcThreadAttribute(
 /// `DeleteProcThreadAttributeList`: there is no list, and nothing to free.
 pub extern "system" fn DeleteProcThreadAttributeList(_list: *mut c_void) {}
 
+// Resources, read out of the mapped image's own directory: a module's resource
+// tree is type, then name, then language, so a lookup walks three levels of it.
+
+const ERROR_RESOURCE_TYPE_NOT_FOUND: u32 = 1813;
+const ERROR_RESOURCE_NAME_NOT_FOUND: u32 = 1814;
+const ERROR_RESOURCE_LANG_NOT_FOUND: u32 = 1815;
+
+/// Where a module's resource directory starts, from the headers of the image
+/// mapped at `base`, or `None` when it has none.
+fn resource_directory(base: usize) -> Option<*const u8> {
+    if base == 0 {
+        return None;
+    }
+    // SAFETY: `base` is a mapped image and these are its own headers, which the
+    // loader wrote and which stay for the life of the process.
+    unsafe {
+        let image = base as *const u8;
+        let pe_at = image.add(0x3C).cast::<u32>().read_unaligned() as usize;
+        let pe = image.add(pe_at);
+        if pe.cast::<u32>().read_unaligned() != 0x0000_4550 {
+            return None;
+        }
+        // The file header is 20 bytes after the signature, then the optional
+        // header, whose data directory follows its fixed part.
+        let optional = pe.add(24);
+        let directory = match optional.cast::<u16>().read_unaligned() {
+            0x20B => optional.add(112), // PE32+
+            0x10B => optional.add(96),  // PE32
+            _ => return None,
+        };
+        // Entry 2 is the resource directory: its address, then its size.
+        let rva = directory.add(2 * 8).cast::<u32>().read_unaligned() as usize;
+        (rva != 0).then(|| image.add(rva))
+    }
+}
+
+/// One level of the tree: the entry for `name` (compared as Windows compares it,
+/// without case) or for the integer `id` when `name` is `None`.
+///
+/// Returns the entry's own offset word, whose top bit says whether it points at
+/// the next level or at the data.
+///
+/// # Safety
+///
+/// `level` and `base` are inside a mapped image's resource directory, and
+/// `level` is a directory rather than a leaf.
+unsafe fn resource_level(
+    level: *const u8,
+    base: *const u8,
+    name: Option<&str>,
+    id: u32,
+) -> Option<u32> {
+    // SAFETY: the caller's promise: both pointers are inside a mapped image.
+    unsafe {
+        let named = level.add(12).cast::<u16>().read_unaligned() as usize;
+        let ids = level.add(14).cast::<u16>().read_unaligned() as usize;
+        for i in 0..named + ids {
+            let entry = level.add(16 + i * 8);
+            let key = entry.cast::<u32>().read_unaligned();
+            let offset = entry.add(4).cast::<u32>().read_unaligned();
+            match name {
+                // A named entry holds the offset of its string, which is a length
+                // and then that many UTF-16 characters.
+                Some(wanted) if key & 0x8000_0000 != 0 => {
+                    let text = base.add((key & 0x7FFF_FFFF) as usize);
+                    let len = text.cast::<u16>().read_unaligned() as usize;
+                    let units = std::slice::from_raw_parts(text.add(2).cast::<u16>(), len);
+                    if String::from_utf16_lossy(units).eq_ignore_ascii_case(wanted) {
+                        return Some(offset);
+                    }
+                }
+                Some(_) => {}
+                None if key & 0x8000_0000 == 0 && key == id => return Some(offset),
+                None => {}
+            }
+        }
+    }
+    None
+}
+
+/// A type or name argument: an integer id below 0x10000, or the address of a
+/// string, which is how `MAKEINTRESOURCE` and a plain string are told apart.
+fn resource_id(value: usize) -> Option<u32> {
+    (value < 0x1_0000).then_some(value as u32)
+}
+
+/// The name a string argument holds.
+///
+/// # Safety
+///
+/// `value` is the address of a NUL-terminated wide string.
+unsafe fn resource_name(value: usize) -> String {
+    // SAFETY: the caller's promise: a NUL-terminated string.
+    unsafe {
+        let text = value as *const u16;
+        let mut n = 0usize;
+        while *text.add(n) != 0 {
+            n += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, n))
+    }
+}
+
+/// The module a call names: its own base, or the title image's when it passes
+/// null, which is what Windows means by null there.
+fn resource_base(module: *mut c_void) -> usize {
+    if module.is_null() {
+        crate::runtime::main_image().unwrap_or(0)
+    } else {
+        module as usize
+    }
+}
+
+/// `FindResourceExW`: the image's own resource entry, or the reason there is
+/// none.
+pub extern "system" fn FindResourceExW(
+    module: *mut c_void,
+    kind: usize,
+    name: usize,
+    language: u16,
+) -> *mut c_void {
+    let base = resource_base(module);
+    let Some(directory) = resource_directory(base) else {
+        tracing::warn!("FindResourceExW: the module at {base:#x} has no resources");
+        set_error(ERROR_RESOURCE_TYPE_NOT_FOUND);
+        return std::ptr::null_mut();
+    };
+    // SAFETY: every part of the directory below is inside the mapped image.
+    unsafe {
+        let kind_name = resource_id(kind).map_or_else(|| Some(resource_name(kind)), |_| None);
+        let Some(kind_offset) = resource_level(directory, directory, kind_name.as_deref(), kind as u32)
+        else {
+            set_error(ERROR_RESOURCE_TYPE_NOT_FOUND);
+            return std::ptr::null_mut();
+        };
+        if kind_offset & 0x8000_0000 == 0 {
+            // A leaf where a level belongs: not a resource tree.
+            set_error(ERROR_RESOURCE_TYPE_NOT_FOUND);
+            return std::ptr::null_mut();
+        }
+        let by_name = resource_id(name).map_or_else(|| Some(resource_name(name)), |_| None);
+        let names = directory.add((kind_offset & 0x7FFF_FFFF) as usize);
+        let Some(name_offset) = resource_level(names, directory, by_name.as_deref(), name as u32)
+        else {
+            set_error(ERROR_RESOURCE_NAME_NOT_FOUND);
+            return std::ptr::null_mut();
+        };
+        if name_offset & 0x8000_0000 == 0 {
+            set_error(ERROR_RESOURCE_NAME_NOT_FOUND);
+            return std::ptr::null_mut();
+        }
+        // The languages: the one asked for, or the first when zero means any.
+        let languages = directory.add((name_offset & 0x7FFF_FFFF) as usize);
+        let found = if language == 0 {
+            let ids = languages.add(14).cast::<u16>().read_unaligned();
+            (ids > 0).then(|| languages.add(20).cast::<u32>().read_unaligned())
+        } else {
+            resource_level(languages, directory, None, u32::from(language))
+        };
+        let Some(leaf) = found else {
+            set_error(ERROR_RESOURCE_LANG_NOT_FOUND);
+            return std::ptr::null_mut();
+        };
+        if leaf & 0x8000_0000 != 0 {
+            set_error(ERROR_RESOURCE_LANG_NOT_FOUND);
+            return std::ptr::null_mut();
+        }
+        // `HRSRC` is the image's own data entry, which is what Windows hands out
+        // for a mapped module.
+        directory.add(leaf as usize) as *mut c_void
+    }
+}
+
+/// `LoadResource`: the resource's bytes, already in the mapped image, so the data
+/// entry's address is all that is needed.
+pub extern "system" fn LoadResource(module: *mut c_void, resource: *mut c_void) -> *mut c_void {
+    if resource.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let base = resource_base(module);
+    if base == 0 {
+        set_error(ERROR_INVALID_HANDLE);
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `resource` is a data entry of the image at `base`.
+    unsafe {
+        let entry = resource as *const u8;
+        let rva = entry.cast::<u32>().read_unaligned() as usize;
+        (base + rva) as *mut c_void
+    }
+}
+
 /// `GetConsoleWindow`: this host writes to the standard streams, so a console
 /// is here and its window is a handle of its own (as `CreateWindowExA` above
 /// answers for a library's message window). Nothing draws on it.
@@ -3317,6 +3510,8 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             CompareStringEx,
             GetStringTypeW,
             GetStringTypeExW,
+            FindResourceExW,
+            LoadResource,
             GetCPInfo,
             LCMapStringEx,
             GetUserDefaultLocaleName,
@@ -5019,5 +5214,124 @@ mod string_type_tests {
     fn the_two_names_are_answered_rather_than_stubbed() {
         assert!(lookup("api-ms-win-core-string-l1-1-0.dll", "GetStringTypeExW").is_some());
         assert!(lookup("api-ms-win-core-string-l1-1-0.dll", "GetStringTypeW").is_some());
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    fn put(bytes: &mut [u8], at: usize, value: u32) {
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put16(bytes: &mut [u8], at: usize, value: u16) {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// An entry of a directory: the key (an id, or an offset with the top bit
+    /// set) and where it points (another directory's offset with the top bit
+    /// set, or a leaf's offset).
+    fn entry(bytes: &mut [u8], at: usize, key: u32, offset: u32) {
+        put(bytes, at, key);
+        put(bytes, at + 4, offset);
+    }
+
+    /// An image with the headers and the resource tree a real one has:
+    ///
+    /// - type 10 (by id) and type `ABC` (by name) both holding
+    /// - name 101 in language 0x409, whose data is
+    /// - the five bytes `hello`, at 0x300.
+    fn image() -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x400];
+        // The headers: `e_lfanew`, the signature, and a PE32+ optional header
+        // whose data directory entry 2 names the resource directory at 0x200.
+        put(&mut bytes, 0x3C, 0x40);
+        bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
+        put16(&mut bytes, 0x58, 0x20B);
+        let directory = 0x40 + 24 + 2 * 8;
+        put(&mut bytes, directory + 112, 0x200);
+        put(&mut bytes, directory + 116, 0x200);
+
+        // The root: one id and one named type, both pointing at 0x230.
+        put16(&mut bytes, 0x200 + 12, 1); // NumberOfNamedEntries
+        put16(&mut bytes, 0x200 + 14, 1); // NumberOfIdEntries
+        entry(&mut bytes, 0x210, 10, 0x8000_0030);
+        entry(&mut bytes, 0x218, 0x8000_0090, 0x8000_0030);
+
+        // Type 10's names: id 101, whose languages are at 0x250.
+        put16(&mut bytes, 0x230 + 14, 1);
+        entry(&mut bytes, 0x240, 101, 0x8000_0050);
+
+        // Name 101's languages: 0x409, whose data entry is at 0x270.
+        put16(&mut bytes, 0x250 + 14, 1);
+        entry(&mut bytes, 0x260, 0x409, 0x70);
+
+        // The data entry: where the bytes are, and how many.
+        put(&mut bytes, 0x270, 0x300);
+        put(&mut bytes, 0x274, 5);
+
+        // The name `ABC`: a length and then its characters.
+        put16(&mut bytes, 0x290, 3);
+        for (i, c) in "ABC".encode_utf16().enumerate() {
+            put16(&mut bytes, 0x292 + i * 2, c);
+        }
+        bytes[0x300..0x305].copy_from_slice(b"hello");
+        bytes
+    }
+
+    /// A resource is found through its type, its name and its language, and what
+    /// comes back is the image's own data, not a copy.
+    #[test]
+    fn a_resource_is_found_by_its_three_levels_and_loaded() {
+        let bytes = image();
+        let base = bytes.as_ptr() as usize;
+        let module = base as *mut c_void;
+        let found = FindResourceExW(module, 10, 101, 0x409);
+        assert!(!found.is_null(), "type 10 name 101 was not found");
+        // The handle is the image's data entry, as Windows hands out for a mapped
+        // module.
+        assert_eq!(found as usize, base + 0x270);
+
+        let data = LoadResource(module, found);
+        assert_eq!(data as usize, base + 0x300);
+        // SAFETY: the five bytes this test wrote into its own image.
+        assert_eq!(unsafe { std::slice::from_raw_parts(data.cast::<u8>(), 5) }, b"hello");
+
+        // Language zero means any, and the same entry comes back.
+        assert_eq!(FindResourceExW(module, 10, 101, 0), found);
+        // A type given by name, without case.
+        let name: Vec<u16> = "abc\0".encode_utf16().collect();
+        assert_eq!(
+            FindResourceExW(module, name.as_ptr() as usize, 101, 0x409),
+            found
+        );
+    }
+
+    /// Three levels, three reasons: a type, a name and a language that are not
+    /// there are told apart, and a handle that is not one is refused.
+    #[test]
+    fn what_is_missing_is_named() {
+        let bytes = image();
+        let module = bytes.as_ptr() as *mut c_void;
+        assert!(FindResourceExW(module, 11, 101, 0x409).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_RESOURCE_TYPE_NOT_FOUND);
+        assert!(FindResourceExW(module, 10, 102, 0x409).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_RESOURCE_NAME_NOT_FOUND);
+        assert!(FindResourceExW(module, 10, 101, 0x40C).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_RESOURCE_LANG_NOT_FOUND);
+
+        assert!(LoadResource(module, std::ptr::null_mut()).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn the_two_names_are_answered_rather_than_stubbed() {
+        for name in ["FindResourceExW", "LoadResource"] {
+            assert!(
+                lookup("api-ms-win-core-libraryloader-l1-2-0.dll", name).is_some(),
+                "{name} is not answered"
+            );
+        }
     }
 }

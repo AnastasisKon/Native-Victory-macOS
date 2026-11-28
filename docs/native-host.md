@@ -6,6 +6,11 @@ Wine-based work continues on the `test/run-C*` branches. This branch (`native/ho
 
 ## macOS setup and launcher paths
 
+A game folder given to `run-native.sh` is searched for the title's executable through its own manifest first
+(`MicrosoftGame.Config`'s `ExecutableList`, the same file the host reads for the title id and its persistent
+storage), then by the `game_*master.exe` name pattern for a folder without one; the message when neither finds
+anything names the folder and both.
+
 `native-setup.sh` and `run-native.sh` use Cargo's resolved `target_directory`
 from `cargo metadata --format-version 1 --no-deps --offline`. This honors
 `CARGO_TARGET_DIR` and local/global `build.target-dir` configuration, including

@@ -876,6 +876,257 @@ pub extern "system" fn LoadResource(module: *mut c_void, resource: *mut c_void) 
     }
 }
 
+/// `SizeofResource`: the bytes a resource's data entry gives, which is what a title
+/// allocates before `LoadResource`ing it.
+pub extern "system" fn SizeofResource(module: *mut c_void, resource: *mut c_void) -> u32 {
+    if resource.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if resource_base(module) == 0 {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    // SAFETY: `resource` is a data entry of a mapped image: rva at 0, size at 4.
+    unsafe { resource.cast::<u8>().add(4).cast::<u32>().read_unaligned() }
+}
+
+/// `LockResource`: the bytes, which are already in the mapped image - and
+/// [`LoadResource`] hands out that address too, so the two agree.
+pub extern "system" fn LockResource(resource: *mut c_void) -> *mut c_void {
+    if resource.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    resource
+}
+
+/// `FindResourceW`: the same walk as [`FindResourceExW`] with any language, which is
+/// how a title asks for its own version resource.
+pub extern "system" fn FindResourceW(module: *mut c_void, kind: usize, name: usize) -> *mut c_void {
+    FindResourceExW(module, kind, name, 0)
+}
+
+/// `RT_VERSION` and the one name it has: what `version.dll` reads.
+const RT_VERSION: usize = 16;
+const VS_VERSION_INFO_NAME: usize = 1;
+const VS_FIXEDFILEINFO_BYTES: u32 = 52;
+
+/// The version resource of the image at `base`, and its length.
+fn version_resource(base: usize) -> Option<(usize, u32)> {
+    if base == 0 {
+        return None;
+    }
+    let entry = FindResourceExW(base as *mut c_void, RT_VERSION, VS_VERSION_INFO_NAME, 0);
+    if entry.is_null() {
+        return None;
+    }
+    let size = SizeofResource(base as *mut c_void, entry);
+    let data = LoadResource(base as *mut c_void, entry);
+    (!data.is_null() && size >= 6).then_some((data as usize, size))
+}
+
+/// The base of the image `path` names, which is how `version.dll`'s calls address a
+/// file: only an image this host has mapped is answered, since the resource tree is
+/// read out of the mapped image rather than off disk.
+fn version_base(path: *const u16) -> Option<usize> {
+    let path = files::wide_path(path)?;
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    crate::runtime::image_named(&name)
+}
+
+/// `GetFileVersionInfoSizeW`: the bytes `GetFileVersionInfoW` would fill.
+pub extern "system" fn GetFileVersionInfoSizeW(path: *const u16, handle: *mut u32) -> u32 {
+    let Some((_, size)) = version_base(path).and_then(version_resource) else {
+        set_error(ERROR_FILE_NOT_FOUND);
+        return 0;
+    };
+    if !handle.is_null() {
+        // SAFETY: the title's out word. Windows writes the zero it returns here.
+        unsafe { handle.write(0) };
+    }
+    size
+}
+
+/// `GetFileVersionInfoW`: the version resource's bytes, copied into the title's block,
+/// which is what `VerQueryValueW` then looks inside.
+pub extern "system" fn GetFileVersionInfoW(
+    path: *const u16,
+    _handle: u32,
+    len: u32,
+    data: *mut c_void,
+) -> i32 {
+    if data.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some((source, size)) = version_base(path).and_then(version_resource) else {
+        set_error(ERROR_FILE_NOT_FOUND);
+        return 0;
+    };
+    let len = (len as usize).min(size as usize);
+    // SAFETY: the source is `size` bytes of the mapped image, and the title passes a
+    // block of `len`.
+    unsafe { std::ptr::copy_nonoverlapping(source as *const u8, data.cast::<u8>(), len) };
+    1
+}
+
+/// One block of a `VS_VERSIONINFO`: its own header, key and value.
+struct VersionBlock {
+    /// Its whole length (`wLength`), header included.
+    len: usize,
+    /// Where its value starts.
+    value: usize,
+    /// `wValueLength`: bytes for a binary value, characters for a string.
+    value_len: usize,
+    kind: u16,
+    key: String,
+}
+
+impl VersionBlock {
+    /// How many bytes the value takes.
+    fn value_bytes(&self) -> usize {
+        if self.kind == 1 {
+            self.value_len * 2
+        } else {
+            self.value_len
+        }
+    }
+}
+
+/// Reads the block at `at`: `wLength`, `wValueLength`, `wType`, the key, then the
+/// value on the next four-byte boundary.
+fn read_version_block(bytes: &[u8], at: usize) -> Option<VersionBlock> {
+    if at + 6 > bytes.len() {
+        return None;
+    }
+    let len = usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+    let value_len = usize::from(u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]));
+    let kind = u16::from_le_bytes([bytes[at + 4], bytes[at + 5]]);
+    if len < 6 || at + len > bytes.len() {
+        return None;
+    }
+    let mut key = String::new();
+    let mut p = at + 6;
+    loop {
+        if p + 2 > at + len {
+            return None;
+        }
+        let unit = u16::from_le_bytes([bytes[p], bytes[p + 1]]);
+        p += 2;
+        if unit == 0 {
+            break;
+        }
+        key.push(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}'));
+    }
+    while p % 4 != 0 {
+        p += 1;
+    }
+    Some(VersionBlock {
+        len,
+        value: p,
+        value_len,
+        kind,
+        key,
+    })
+}
+
+/// The blocks inside `parent`, in order.
+fn version_children(bytes: &[u8], parent: &VersionBlock) -> Vec<VersionBlock> {
+    let mut children = Vec::new();
+    let mut at = parent.value + parent.value_bytes();
+    while at % 4 != 0 {
+        at += 1;
+    }
+    while at + 6 <= parent.value + parent.value_bytes().max(parent.len) && at < bytes.len() {
+        let Some(block) = read_version_block(bytes, at) else {
+            break;
+        };
+        if block.len == 0 {
+            break;
+        }
+        at += block.len;
+        children.push(block);
+        while at % 4 != 0 {
+            at += 1;
+        }
+    }
+    children
+}
+
+/// `VerQueryValueW`: a value inside the block `GetFileVersionInfoW` filled - the fixed
+/// file info, the translations, or one string of one string table. A string's length
+/// comes back in characters, a binary value's in bytes, as Windows reports them.
+pub extern "system" fn VerQueryValueW(
+    block: *const c_void,
+    sub: *const u16,
+    out: *mut *mut c_void,
+    len: *mut u32,
+) -> i32 {
+    if block.is_null() || sub.is_null() || out.is_null() || len.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: the block's own `wLength` bounds it, and the title filled it.
+    let total = unsafe {
+        let root = block.cast::<u8>();
+        usize::from(u16::from_le_bytes([root.read(), root.add(1).read()]))
+    };
+    if total < 6 {
+        return 0;
+    }
+    // SAFETY: `total` bytes of the title's block.
+    let bytes = unsafe { std::slice::from_raw_parts(block.cast::<u8>(), total) };
+    let Some(root) = read_version_block(bytes, 0) else {
+        return 0;
+    };
+    let mut want = String::new();
+    // SAFETY: the title's NUL-terminated sub-block path.
+    unsafe {
+        let mut p = sub;
+        while *p != 0 {
+            want.push(char::from_u32(u32::from(*p)).unwrap_or('\u{FFFD}'));
+            p = p.add(1);
+        }
+    }
+    let parts: Vec<&str> = want.split('\\').filter(|p| !p.is_empty()).collect();
+    let found: Option<(usize, u32)> = match parts.as_slice() {
+        [] => Some((root.value, VS_FIXEDFILEINFO_BYTES)),
+        ["VarFileInfo", "Translation"] => version_children(bytes, &root)
+            .iter()
+            .find(|b| b.key.eq_ignore_ascii_case("VarFileInfo"))
+            .and_then(|var| {
+                let children = version_children(bytes, var);
+                let translation = children
+                    .iter()
+                    .find(|b| b.key.eq_ignore_ascii_case("Translation"))?;
+                Some((translation.value, translation.value_len as u32))
+            }),
+        ["StringFileInfo", table, key] => version_children(bytes, &root)
+            .iter()
+            .find(|b| b.key.eq_ignore_ascii_case("StringFileInfo"))
+            .and_then(|info| {
+                let tables = version_children(bytes, info);
+                let table = tables
+                    .iter()
+                    .find(|b| b.key.eq_ignore_ascii_case(table))?;
+                let entries = version_children(bytes, table);
+                let entry = entries.iter().find(|b| b.key.eq_ignore_ascii_case(key))?;
+                Some((entry.value, entry.value_len as u32))
+            }),
+        _ => None,
+    };
+    let Some((offset, length)) = found else {
+        return 0;
+    };
+    // SAFETY: both out-pointers are the title's, and the value is inside the block.
+    unsafe {
+        out.write(block.cast::<u8>().add(offset).cast_mut().cast());
+        len.write(length);
+    }
+    1
+}
+
 /// `GetConsoleWindow`: this host writes to the standard streams, so a console
 /// is here and its window is a handle of its own (as `CreateWindowExA` above
 /// answers for a library's message window). Nothing draws on it.
@@ -4449,8 +4700,10 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
     }
     let kernel = dll == "kernel32.dll"
         || dll == "kernelbase.dll"
-        // The `Rtl*` names are ntdll's, and a title imports them from there.
+        // The `Rtl*` names are ntdll's, and a title imports them from there;
+        // `version.dll` reads the version resource this table now serves.
         || dll == "ntdll.dll"
+        || dll == "version.dll"
         || dll.starts_with("api-ms-win-core-")
         || dll.starts_with("api-ms-win-eventing-");
     if kernel {
@@ -4462,6 +4715,12 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             GetStringTypeW,
             GetStringTypeExW,
             FindResourceExW,
+            FindResourceW,
+            SizeofResource,
+            LockResource,
+            GetFileVersionInfoSizeW,
+            GetFileVersionInfoW,
+            VerQueryValueW,
             LoadResource,
             GetCPInfo,
             LCMapStringEx,
@@ -6638,6 +6897,165 @@ mod apartment_and_winrt_tests {
             ("api-ms-win-core-winrt-error-l1-1-0.dll", "SetRestrictedErrorInfo"),
         ] {
             assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
+        }
+    }
+}
+
+#[cfg(test)]
+mod version_resource_tests {
+    use super::*;
+
+    /// One block of a `VS_VERSIONINFO`: header, key, padding, value, padded to four
+    /// bytes so the next block starts aligned.
+    fn block(key: &str, value_len: u16, kind: u16, value: &[u8]) -> Vec<u8> {
+        let mut out = vec![0, 0];
+        out.extend_from_slice(&value_len.to_le_bytes());
+        out.extend_from_slice(&kind.to_le_bytes());
+        for unit in key.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out.extend_from_slice(&[0, 0]);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(value);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        let len = out.len() as u16;
+        out[0..2].copy_from_slice(&len.to_le_bytes());
+        out
+    }
+
+    fn container(key: &str, children: &[Vec<u8>]) -> Vec<u8> {
+        let mut value = Vec::new();
+        for child in children {
+            while value.len() % 4 != 0 {
+                value.push(0);
+            }
+            value.extend_from_slice(child);
+        }
+        block(key, 0, 1, &value)
+    }
+
+    /// A version resource as a linker writes it: the fixed info, one string table with
+    /// one string, and one translation.
+    fn resource() -> Vec<u8> {
+        let mut fixed = Vec::new();
+        fixed.extend_from_slice(&0xFEEF_04BDu32.to_le_bytes()); // dwSignature
+        fixed.extend_from_slice(&0x0001_0000u32.to_le_bytes()); // dwStrucVersion
+        for _ in 0..11 {
+            fixed.extend_from_slice(&0u32.to_le_bytes());
+        }
+        assert_eq!(fixed.len(), 52, "VS_FIXEDFILEINFO is 13 words");
+        let file_version: Vec<u16> = "1.2.3.4\0".encode_utf16().collect();
+        let mut version_bytes = Vec::new();
+        for unit in &file_version {
+            version_bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let table = container(
+            "040904b0",
+            &[block("FileVersion", file_version.len() as u16, 1, &version_bytes)],
+        );
+        let strings = container("StringFileInfo", &[table]);
+        let mut translation = Vec::new();
+        translation.extend_from_slice(&0x0409u16.to_le_bytes());
+        translation.extend_from_slice(&0x04b0u16.to_le_bytes());
+        let vars = container(
+            "VarFileInfo",
+            &[block("Translation", translation.len() as u16, 0, &translation)],
+        );
+        let mut root = block("VS_VERSION_INFO", 52, 0, &fixed);
+        root.extend_from_slice(&strings);
+        root.extend_from_slice(&vars);
+        let len = root.len() as u16;
+        root[0..2].copy_from_slice(&len.to_le_bytes());
+        root
+    }
+
+    fn query(block: &mut [u8], sub: &str) -> Option<(*const u8, u32)> {
+        let sub: Vec<u16> = sub.encode_utf16().chain([0]).collect();
+        let (mut out, mut len) = (std::ptr::null_mut(), 0u32);
+        let ok = VerQueryValueW(
+            block.as_mut_ptr().cast(),
+            sub.as_ptr(),
+            &mut out,
+            &mut len,
+        );
+        (ok != 0).then_some((out.cast::<u8>() as *const u8, len))
+    }
+
+    /// The fixed file info, a string of a string table, and the translations come out of
+    /// the block a title got from `GetFileVersionInfoW`, and a key that is not there is
+    /// not found.
+    #[test]
+    fn the_values_inside_a_version_resource_are_found() {
+        let mut block = resource();
+
+        let (fixed, len) = query(&mut block, r"\").expect("the fixed file info");
+        assert_eq!(len, 52);
+        // SAFETY: 52 bytes of the block, as the query just reported.
+        let signature = unsafe { fixed.cast::<u32>().read_unaligned() };
+        assert_eq!(signature, 0xFEEF_04BD);
+
+        let (value, len) = query(&mut block, r"\StringFileInfo\040904b0\FileVersion")
+            .expect("the file version string");
+        assert_eq!(len, 8, "characters, with the NUL");
+        // SAFETY: `len` UTF-16 units of the block.
+        let units = unsafe { std::slice::from_raw_parts(value.cast::<u16>(), len as usize) };
+        assert_eq!(String::from_utf16_lossy(units), "1.2.3.4\0");
+
+        let (translation, len) = query(&mut block, r"\VarFileInfo\Translation")
+            .expect("the translations");
+        assert_eq!(len, 4);
+        // SAFETY: 4 bytes of the block.
+        let pair = unsafe { std::slice::from_raw_parts(translation.cast::<u16>(), 2) };
+        assert_eq!((pair[0], pair[1]), (0x0409, 0x04b0));
+
+        assert!(query(&mut block, r"\StringFileInfo\040904b0\NoSuchKey").is_none());
+        assert!(query(&mut block, r"\StringFileInfo\040704b0\FileVersion").is_none());
+        assert!(query(&mut block, r"\Nonsense").is_none());
+    }
+
+    /// A resource the image does not have, and a caller that passes nothing, are both
+    /// answered with a failure rather than a guess.
+    #[test]
+    fn a_resource_call_that_cannot_be_answered_fails() {
+        set_error(0);
+        assert_eq!(SizeofResource(std::ptr::null_mut(), std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert!(LockResource(std::ptr::null_mut()).is_null());
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        // No image is mapped in this test, so there is no version resource to find.
+        let mut out = 0u32;
+        let mut path: Vec<u16> = "game.exe".encode_utf16().chain([0]).collect();
+        assert_eq!(GetFileVersionInfoSizeW(path.as_mut_ptr(), &mut out), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_FILE_NOT_FOUND);
+
+        let mut block = [0u8; 156];
+        assert_eq!(VerQueryValueW(
+            block.as_mut_ptr().cast(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut()
+        ), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        for dll in ["kernel32.dll", "version.dll"] {
+            for name in [
+                "FindResourceW",
+                "SizeofResource",
+                "LockResource",
+                "GetFileVersionInfoSizeW",
+                "GetFileVersionInfoW",
+                "VerQueryValueW",
+            ] {
+                assert!(
+                    super::super::lookup(dll, name).is_some(),
+                    "{dll}!{name} is not answered"
+                );
+            }
         }
     }
 }

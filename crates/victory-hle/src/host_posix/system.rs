@@ -22,7 +22,7 @@ use victory_platform::mem::{self, Protect};
 use victory_platform::sync::{Event, Semaphore};
 use victory_platform::thread;
 
-use super::{Object, files, lock, new_handle, set_error};
+use super::{Object, WAIT_OBJECT_0, WAIT_TIMEOUT, Waitable, files, lock, new_handle, set_error};
 
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_ACCESS_DENIED: u32 = 5;
@@ -1731,6 +1731,10 @@ struct PoolState {
     cancel_generation: u64,
     queued: u32,
     running: u32,
+    /// Workers still blocked on a wait object, waiting for it or for the arming
+    /// to be retired. Counted so `WaitForThreadpoolWaitCallbacks` can answer
+    /// "nothing of mine is still armed".
+    armed: u32,
 }
 
 impl PoolState {
@@ -1809,6 +1813,76 @@ impl PoolObject {
         });
     }
 
+    /// Arms one wait on `object`: the callback runs once when the object is
+    /// signalled, or when `timeout` passes, whichever comes first.
+    ///
+    /// A worker of its own performs the wait, because the title arms a wait and
+    /// goes on: the object it waits on may be signalled long after the call
+    /// returns. One callback per arming, as Windows does it - a wait on an
+    /// object that stays signalled would otherwise call back in a loop nobody
+    /// asked for. Arming again, cancelling, or closing retires the wait.
+    fn wait_once(
+        &'static self,
+        state: &mut PoolState,
+        object: Waitable,
+        timeout: Option<Duration>,
+    ) {
+        let generation = state.timer_generation;
+        state.armed += 1;
+        let armed_at = Instant::now();
+        std::thread::spawn(move || {
+            // In slices, so a disarm need not wait for the object to change.
+            const SLICE: Duration = Duration::from_millis(20);
+            let deadline = timeout.map(|t| armed_at + t);
+            let result = loop {
+                if lock(&self.state).timer_generation != generation {
+                    break None;
+                }
+                let slice = match deadline {
+                    None => SLICE,
+                    Some(deadline) => {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            // The title asked for the callback on the timeout too.
+                            break Some(WAIT_TIMEOUT);
+                        }
+                        left.min(SLICE)
+                    }
+                };
+                if object.wait(Some(slice)) {
+                    break Some(WAIT_OBJECT_0);
+                }
+            };
+            let mut state = lock(&self.state);
+            state.armed -= 1;
+            let result = match result {
+                Some(result) if state.timer_generation == generation => result,
+                _ => {
+                    self.changed.notify_all();
+                    return;
+                }
+            };
+            state.running += 1;
+            self.changed.notify_all();
+            drop(state);
+            // SAFETY: the title's TP_WAIT_CALLBACK, called as Windows calls it.
+            unsafe {
+                native::call_win64(
+                    self.callback,
+                    &[
+                        &raw const INSTANCE as u64,
+                        self.context as u64,
+                        self as *const Self as u64,
+                        result as u64,
+                    ],
+                )
+            };
+            let mut state = lock(&self.state);
+            state.running -= 1;
+            self.changed.notify_all();
+        });
+    }
+
     fn wait_idle(&self, cancel: bool) {
         let mut state = lock(&self.state);
         if cancel && state.queued != 0 {
@@ -1818,7 +1892,7 @@ impl PoolObject {
         }
         drop(
             self.changed
-                .wait_while(state, |s| s.queued != 0 || s.running != 0)
+                .wait_while(state, |s| s.queued != 0 || s.running != 0 || s.armed != 0)
                 .unwrap_or_else(|e| e.into_inner()),
         );
     }
@@ -1886,6 +1960,59 @@ pub extern "system" fn WaitForThreadpoolTimerCallbacks(timer: *mut PoolObject, c
 pub extern "system" fn CloseThreadpoolTimer(timer: *mut PoolObject) {
     SetThreadpoolTimer(timer, std::ptr::null(), 0, 0);
     WaitForThreadpoolTimerCallbacks(timer, 1);
+}
+
+pub extern "system" fn CreateThreadpoolWait(
+    callback: usize,
+    context: usize,
+    _environment: *const c_void,
+) -> *mut PoolObject {
+    new_pool_object(callback, context)
+}
+
+pub extern "system" fn SetThreadpoolWait(
+    wait: *mut PoolObject,
+    handle: *mut c_void,
+    timeout: *const i64,
+) {
+    // SAFETY: pool objects live for the life of the process.
+    let o: &'static PoolObject = unsafe { &*wait };
+    let mut state = lock(&o.state);
+    // Arming again retires the wait it replaces, as Windows does.
+    state.timer_generation = state.timer_generation.wrapping_add(1);
+    o.changed.notify_all();
+    if handle.is_null() {
+        // A null handle disarms the wait and is not an error.
+        return;
+    }
+    let Some(object) = Waitable::of(handle) else {
+        // Nothing is armed for a handle that cannot be waited on, and the
+        // callback would describe a wait that never happened.
+        tracing::warn!("SetThreadpoolWait: {handle:p} is not a waitable object");
+        return;
+    };
+    // SAFETY: the title's optional due time, a relative FILETIME.
+    let timeout = (!timeout.is_null()).then(|| until(unsafe { timeout.read_unaligned() }));
+    o.wait_once(&mut state, object, timeout);
+}
+
+pub extern "system" fn WaitForThreadpoolWaitCallbacks(wait: *mut PoolObject, cancel: i32) {
+    // SAFETY: as above.
+    let o = unsafe { &*wait };
+    if cancel != 0 {
+        // Cancelling a wait means the callback will not run: retiring the
+        // arming is how the worker blocked on the object hears it.
+        let mut state = lock(&o.state);
+        state.timer_generation = state.timer_generation.wrapping_add(1);
+        o.changed.notify_all();
+        drop(state);
+    }
+    o.wait_idle(false);
+}
+
+pub extern "system" fn CloseThreadpoolWait(wait: *mut PoolObject) {
+    SetThreadpoolWait(wait, std::ptr::null_mut(), std::ptr::null());
+    WaitForThreadpoolWaitCallbacks(wait, 1);
 }
 
 pub extern "system" fn CallbackMayRunLong(_instance: *const c_void) -> i32 {
@@ -2662,6 +2789,10 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             SetThreadpoolTimer,
             WaitForThreadpoolTimerCallbacks,
             CloseThreadpoolTimer,
+            CreateThreadpoolWait,
+            SetThreadpoolWait,
+            WaitForThreadpoolWaitCallbacks,
+            CloseThreadpoolWait,
             CallbackMayRunLong,
             DisassociateCurrentThreadFromCallback,
             FreeLibraryWhenCallbackReturns,
@@ -3473,5 +3604,116 @@ mod cert_and_fail_fast_tests {
             )
             .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod threadpool_wait_tests {
+    use super::*;
+
+    /// 100 ms and an hour in the unit a due time is given in: 100 ns per tick.
+    const HUNDRED_MS: i64 = -1_000_000;
+    const ONE_HOUR: i64 = -3600 * TICKS_PER_SECOND as i64;
+
+    /// A wait the title armed on an auto-reset event runs its callback once the
+    /// event is signalled, and reports what it saw.
+    #[test]
+    fn a_signalled_object_runs_the_callback_once() {
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static SEEN: AtomicU32 = AtomicU32::new(u32::MAX);
+        extern "C" fn note(_instance: usize, _context: usize, _wait: usize, result: u32) {
+            SEEN.store(result, Ordering::Relaxed);
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let callback = native::host_callbacks(&[(note as *const () as usize, false)]).unwrap()[0];
+        let event = super::super::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        assert!(!event.is_null());
+        let wait = CreateThreadpoolWait(callback, 0, std::ptr::null());
+        SetThreadpoolWait(wait, event, std::ptr::null());
+        assert_eq!(super::super::SetEvent(event), 1);
+        WaitForThreadpoolWaitCallbacks(wait, 0);
+        assert_eq!(
+            (CALLS.load(Ordering::Relaxed), SEEN.load(Ordering::Relaxed)),
+            (1, WAIT_OBJECT_0)
+        );
+
+        // One callback per arming: a signal with nothing armed is not a callback.
+        assert_eq!(super::super::SetEvent(event), 1);
+        WaitForThreadpoolWaitCallbacks(wait, 0);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+
+        CloseThreadpoolWait(wait);
+        super::super::CloseHandle(event);
+    }
+
+    /// An object that is never signalled still calls back when the due time
+    /// passes, and says the wait timed out.
+    #[test]
+    fn a_wait_that_is_never_signalled_runs_the_callback_on_its_due_time() {
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static SEEN: AtomicU32 = AtomicU32::new(u32::MAX);
+        extern "C" fn note(_instance: usize, _context: usize, _wait: usize, result: u32) {
+            SEEN.store(result, Ordering::Relaxed);
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let callback = native::host_callbacks(&[(note as *const () as usize, false)]).unwrap()[0];
+        let event = super::super::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        let wait = CreateThreadpoolWait(callback, 0, std::ptr::null());
+        SetThreadpoolWait(wait, event, &HUNDRED_MS);
+        WaitForThreadpoolWaitCallbacks(wait, 0);
+        assert_eq!(
+            (CALLS.load(Ordering::Relaxed), SEEN.load(Ordering::Relaxed)),
+            (1, WAIT_TIMEOUT)
+        );
+        CloseThreadpoolWait(wait);
+        super::super::CloseHandle(event);
+    }
+
+    /// Cancelling and disarming both return without waiting for the object to
+    /// change, and neither leaves the callback to run later.
+    #[test]
+    fn canceling_or_disarming_a_wait_keeps_its_callback_from_running() {
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn count(_instance: usize, _context: usize, _wait: usize, _result: u32) {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let callback =
+                native::host_callbacks(&[(count as *const () as usize, false)]).unwrap()[0];
+            let event = super::super::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            let wait = CreateThreadpoolWait(callback, 0, std::ptr::null());
+            SetThreadpoolWait(wait, event, &ONE_HOUR);
+            WaitForThreadpoolWaitCallbacks(wait, 1);
+
+            // Disarming is the same call with a null handle.
+            SetThreadpoolWait(wait, event, &ONE_HOUR);
+            SetThreadpoolWait(wait, std::ptr::null_mut(), std::ptr::null());
+            WaitForThreadpoolWaitCallbacks(wait, 0);
+
+            CloseThreadpoolWait(wait);
+            super::super::CloseHandle(event);
+            let _ = done.send(());
+        });
+        result.recv_timeout(Duration::from_millis(750)).unwrap();
+        assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_wait_calls_are_answered_rather_than_stubbed() {
+        for name in [
+            "CreateThreadpoolWait",
+            "SetThreadpoolWait",
+            "WaitForThreadpoolWaitCallbacks",
+            "CloseThreadpoolWait",
+        ] {
+            assert!(
+                lookup("api-ms-win-core-threadpool-l1-2-0.dll", name).is_some(),
+                "{name} is not answered"
+            );
+        }
     }
 }

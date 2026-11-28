@@ -163,6 +163,17 @@ function field(line, key,   re, s) { # value of `key=...` (optionally quoted) in
     x = norm(x)
     if (!(x in ppset)) { ppset[x] = 1; pp[++npp] = x }
   }
+  # VICTORY_SKIP_TITLE_INT3 (diagnostics build, loader): one line per title assert stepped over.
+  # A run that steps over a million of one assert is looping in title code at that assert, which is
+  # what the SGD5 cache-writer analysis in docs/native-host.md describes (#24).
+  if (index(line, "stepped over a title int3")) {
+    skiptot++
+    if (match(line, /rva=0x[0-9a-f]+/)) {
+      r = substr(line, RSTART + 4, RLENGTH - 4)
+      if (!(r in skipn)) skipk[++nskip] = r
+      skipn[r]++
+    }
+  }
   if (line ~ /pass time: frame=/) {
     nptf++
     ftp += field(line, "passes") + 0
@@ -207,6 +218,7 @@ function metrics(   i, k, w, nw, v, r, u, kd, d, end) { # the --compare rows, on
   }
   if (nunm) emit("row", "unmapped levels lines", nunm)
   if (npp) emit("row", "pipelines with no host pipeline", npp + 0)
+  if (skiptot) emit("row", "asserts stepped over", skiptot + 0)
   # Only when the log has them: a log without VICTORY_PASS_TIMING keeps the table as it was.
   if (nptf) {
     emit("row", "pass-timing frames", nptf + 0)
@@ -292,6 +304,14 @@ END {
         printf "    %8.2f ms x%d (max %.2f)  kind=%s pipe=%s work~%s\n", av[ix[i]], pac[a], pam[a], q[1], q[2], paw[a]
       }
     }
+    print ""
+  }
+
+  # Only when a diagnostics build stepped over a title assert (VICTORY_SKIP_TITLE_INT3).
+  if (skiptot) {
+    print "-- asserts stepped over (VICTORY_SKIP_TITLE_INT3)"
+    printf "  %d step%s over %d assert%s (a run driven by one is looping in title code there)\n", skiptot, (skiptot == 1 ? "" : "s"), nskip, (nskip == 1 ? "" : "s")
+    for (i = 1; i <= nskip && i <= 10; i++) printf "  %10d  rva=%s\n", skipn[skipk[i]], skipk[i]
     print ""
   }
 
@@ -427,6 +447,8 @@ self_test() {
 @ESC@[2m2026-01-01T00:00:03.300000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_gpu::list: indirect execution dropped (first time) stride=16 address=Some("0xbeef")
 metal: command buffer failed: NSError { code: 2, "Caused GPU Hang Error (00000003:kIOGPUCommandBufferCallbackErrorHang)" }
 metal: command buffer failed: NSError { code: 8, localizedDescription: "Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)" }
+@ESC@[2m2026-01-01T00:00:03.400000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_loader::native::seh::dispatch: stepped over a title int3 (VICTORY_SKIP_TITLE_INT3) rva=0x1330a44
+@ESC@[2m2026-01-01T00:00:03.500000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_loader::native::seh::dispatch: stepped over a title int3 (VICTORY_SKIP_TITLE_INT3) rva=0x1330a44
 @ESC@[2m2026-01-01T00:00:03.500000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_hle::host_posix::coreaudio: no audio device: sound is mixed and dropped error=AudioQueueStart failed with OSStatus 2003329396
 @ESC@[2m2026-01-01T00:00:04.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_hle::host_posix::wasapi::spatial: WASAPI: spatial audio stream activated static_mask=6
 @ESC@[2m2026-01-01T00:00:04.500000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_hle::host_posix::wasapi: WASAPI: render client released frames in the last second frames=48000
@@ -459,6 +481,8 @@ LOG
   chk 'vs H.*ps H.*into DrawTargets'
   chk 'victory: fatal signal 11 (code 1) at address 0x7ff8deadbeef'
   chk 'the GPU failed 2 command buffers (OutOfMemory=1), last at +3.3s frame~128'
+  chk '2 steps over 1 assert (a run driven by one is looping in title code there)'
+  chk 'rva=0x1330a44'
   chk 'nothing ran after it: the run ended at the GPU failure'
   chk 'frames timed: 1, passes timed: 2, GPU pass time 51.8 ms total, 51.8 ms mean/frame, max frame 51.8 ms'
   chk '42.50 ms  frame=64 rank=1 kind=render pipe=6adfc332b21374b3 work=12'

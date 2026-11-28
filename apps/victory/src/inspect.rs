@@ -165,6 +165,10 @@ mod tests {
     use super::imports_by_dll;
     use victory_pe::ImportSymbol;
     use victory_pe::implib::{LibImport, LibImportKind};
+    use super::dll_flags;
+    use victory_pe::layout::dll_flags as f;
+
+
 
     fn named(dll: &str, name: &str) -> LibImport {
         LibImport {
@@ -202,5 +206,28 @@ mod tests {
     #[test]
     fn no_imports_group_to_nothing() {
         assert!(imports_by_dll(&[]).is_empty());
+    }
+
+    #[test]
+    fn dll_flags_render_names_in_the_table_order_not_bit_order() {
+        assert_eq!(dll_flags(0), "");
+        assert_eq!(dll_flags(0x0001), "", "unknown bits are ignored");
+        assert_eq!(dll_flags(f::DYNAMIC_BASE), "  (dynamic-base)");
+        // GUARD_CF is the highest bit but the table's last name.
+        assert_eq!(
+            dll_flags(f::HIGH_ENTROPY_VA | f::DYNAMIC_BASE | f::GUARD_CF),
+            "  (high-entropy-va, dynamic-base, cfg)"
+        );
+        assert_eq!(
+            dll_flags(
+                f::HIGH_ENTROPY_VA
+                    | f::DYNAMIC_BASE
+                    | f::FORCE_INTEGRITY
+                    | f::NX_COMPAT
+                    | f::APPCONTAINER
+                    | f::GUARD_CF
+            ),
+            "  (high-entropy-va, dynamic-base, force-integrity, nx, appcontainer, cfg)"
+        );
     }
 }

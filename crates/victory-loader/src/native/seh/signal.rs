@@ -158,6 +158,30 @@ fn cache_hint_loop(code: &[u8]) -> Option<(usize, usize, bool, usize)> {
 /// Instructions emulated so far (`clzero`), for the thread dump.
 pub static EMULATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `rdpid r32` (`f3 [rex] 0f c7 /7`, the only form there is: a register, in r/m, with
+/// `/7` as the opcode extension): the thread's TSC_AUX into that register, zero-extended.
+/// Rosetta does not run it. Returns its length and the register's encoding number.
+fn rdpid(code: &[u8]) -> Option<(usize, usize)> {
+    if *code.first()? != 0xF3 {
+        return None;
+    }
+    let mut i = 1;
+    let rex = code.get(i).copied().filter(|b| *b & 0xF0 == 0x40);
+    if rex.is_some() {
+        i += 1;
+    }
+    if [*code.get(i)?, *code.get(i + 1)?] != [0x0F, 0xC7] {
+        return None;
+    }
+    i += 2;
+    let modrm = *code.get(i)?;
+    // `mod` 11 (a register operand) and `reg` 7 (the opcode extension).
+    (modrm >> 6 == 3 && (modrm >> 3) & 7 == 7).then(|| {
+        let reg = usize::from(modrm & 7) | usize::from(rex.unwrap_or(0) & 1) << 3;
+        (i + 1, reg)
+    })
+}
+
 /// Runs an SSE4a `insertq` or `extrq` (AMD, not in Rosetta; register forms
 /// only, as the instructions have no others) at the start of `code` on the
 /// 16 XMM registers, and returns its length. The upper halves of the
@@ -338,6 +362,20 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
             }
             // SAFETY: the saved rip, past the instruction.
             unsafe { mc.add(MC_THREAD + T_RIP * 8).cast::<u64>().write(rip + 3) };
+            return;
+        }
+        if let Some((len, reg)) = rdpid(code) {
+            // rdpid (AMD, not in Rosetta): TSC_AUX into the register. Nothing here pins a
+            // thread to a core, so every thread reports processor 0: a valid number, and the
+            // same one for as long as the thread runs, which is what the title's per-processor
+            // state is indexed by.
+            EMULATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: inside the thread state.
+            unsafe {
+                let set = |i: usize, v: u64| mc.add(MC_THREAD + i * 8).cast::<u64>().write(v);
+                set(slot(reg), 0);
+                set(T_RIP, rip + len as u64);
+            }
             return;
         }
         // The XMM registers in the float state's FXSAVE image (after its 8-byte header).
@@ -521,7 +559,23 @@ unsafe fn chain(signal: i32, info: *mut u8, uc: *mut u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_hint_len, cache_hint_loop, clzero_loop_limit, sse4a};
+    use super::{cache_hint_len, cache_hint_loop, clzero_loop_limit, rdpid, sse4a};
+
+    #[test]
+    fn rdpid_is_recognised_in_its_register_form() {
+        // rdpid rax: f3 0f c7 f8, mod 11 /7, r/m 0.
+        assert_eq!(rdpid(&[0xF3, 0x0F, 0xC7, 0xF8]), Some((4, 0)));
+        // rdpid rdi: r/m 7.
+        assert_eq!(rdpid(&[0xF3, 0x0F, 0xC7, 0xFF]), Some((4, 7)));
+        // rdpid r9: the same r/m 1 with REX.B, one byte longer.
+        assert_eq!(rdpid(&[0xF3, 0x41, 0x0F, 0xC7, 0xF9]), Some((5, 9)));
+        // A memory operand (mod 00) is not the register form, nor is /6 another extension.
+        assert_eq!(rdpid(&[0xF3, 0x0F, 0xC7, 0x38]), None);
+        assert_eq!(rdpid(&[0xF3, 0x0F, 0xC7, 0xF0]), None);
+        // Truncated, or not rdpid at all.
+        assert_eq!(rdpid(&[0xF3, 0x0F, 0xC7]), None);
+        assert_eq!(rdpid(&[0x0F, 0xC7, 0xF8]), None);
+    }
 
     #[test]
     fn cache_hint_loops_are_recognised() {

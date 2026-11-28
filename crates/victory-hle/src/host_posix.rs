@@ -31,6 +31,7 @@ pub(crate) mod files;
 mod heap;
 mod mf;
 mod mixer;
+pub(crate) mod oleaut;
 mod sync;
 mod system;
 pub(crate) mod ucrt;
@@ -1067,6 +1068,7 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         .or_else(|| mf::lookup(&dll, name))
         .or_else(|| xaudio2::lookup(&dll, name))
         .or_else(|| winrt::lookup(&dll, name))
+        .or_else(|| oleaut::lookup(&dll, name))
     {
         return Some(address);
     }

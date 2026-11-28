@@ -42,6 +42,12 @@ impl Default for HostPolicy {
             "api-ms-win-shcore-*",
             "msvcp_win.dll",
             "ole32.dll",
+            // `BSTR` and the `SysString*` calls: the C++ runtime reaches them by
+            // ordinal, which this host answers in `host_posix::oleaut`.
+            "oleaut32.dll",
+            // The WinRT activation and error-info calls, which
+            // `host_posix::system` answers with this host's own apartment.
+            "combase.dll",
             "advapi32.dll",
             "iphlpapi.dll",
             // The title's crash handler writes minidumps with it (loaded by name).

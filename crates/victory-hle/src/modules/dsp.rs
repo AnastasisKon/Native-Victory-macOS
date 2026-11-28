@@ -757,8 +757,20 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
 
+    /// `VICTORY_DUMP_DSP` lives for the whole process, and every stream
+    /// activated while it is set takes the next capture number — the
+    /// activation counter is process-wide too. The two tests that activate
+    /// streams take turns, so the one capturing cannot find another test's
+    /// stream in `stream0_*`.
+    static STREAM_TURNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn stream_turns() -> std::sync::MutexGuard<'static, ()> {
+        STREAM_TURNS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn convolution_stream_as_the_title_drives_it() {
+        let _turn = stream_turns();
         // SAFETY: no other test reads VICTORY_GUESS_DSP.
         unsafe { std::env::set_var("VICTORY_GUESS_DSP", "1") };
         let mut base = vec![0u8; 0x10_0000];
@@ -893,12 +905,14 @@ mod tests {
 
     #[test]
     fn dump_captures_the_titles_ir_blocks_and_output() {
+        let _turn = stream_turns();
         let dir = std::env::temp_dir().join(format!("victory-dsp-dump-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // The dump captures whatever the stream actually wrote, so this
         // test does not touch VICTORY_GUESS_DSP, which the other test
         // toggles.
-        // SAFETY: no other test reads VICTORY_DUMP_DSP.
+        // SAFETY: set under `stream_turns`, which the other test that
+        // activates a stream also takes.
         unsafe { std::env::set_var("VICTORY_DUMP_DSP", &dir) };
         let mut base = vec![0u8; 0x10_0000];
         let mut dsp = std::ptr::null_mut();
@@ -954,7 +968,7 @@ mod tests {
 
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
-        // SAFETY: set at the top of this test; nothing else reads it.
+        // SAFETY: set at the top of this test, still under `stream_turns`.
         unsafe { std::env::remove_var("VICTORY_DUMP_DSP") };
         let _ = std::fs::remove_dir_all(&dir);
     }

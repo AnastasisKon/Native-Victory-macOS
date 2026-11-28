@@ -760,15 +760,16 @@ mod tests {
         // Two distinct addresses in the same stripe: WakeByAddressSingle(a) wakes exactly one `a`
         // waiter, WakeByAddressAll(a) wakes the remaining `a` waiters without waking `b`, and
         // WakeByAddressSingle(b) then wakes `b`.
-        let buf = Box::leak(Box::new([0u64; 48]));
-        let a_addr = buf.as_mut_ptr() as usize;
-        // `addr_stripe` mixes in the page bits, so an address 128 bytes on is
-        // in the same stripe unless it crosses a page boundary: look for one
-        // that is, rather than assuming wherever the allocation landed.
-        let b_addr = (a_addr + (ADDR_STRIPES << 2)..a_addr + (ADDR_STRIPES << 3))
-            .step_by(8)
-            .find(|&candidate| std::ptr::eq(addr_stripe(candidate), addr_stripe(a_addr)))
-            .expect("an address in the same stripe");
+        let buf = Box::leak(Box::new([0u64; 1024]));
+        let a_addr = buf.as_mut_ptr() as usize + 0x1000;
+        // `addr_stripe` mixes in the page bits, so a neighbour is only in the
+        // same stripe while it stays in the same page: take the 128-byte step
+        // on whichever side of `a` still has room in its page.
+        let b_addr = if 0x1000 - (a_addr & 0xfff) > 128 {
+            a_addr + 128
+        } else {
+            a_addr - 128
+        };
         assert!(std::ptr::eq(addr_stripe(a_addr), addr_stripe(b_addr)));
 
         let spawn_waiter = |target: usize, size: usize| {

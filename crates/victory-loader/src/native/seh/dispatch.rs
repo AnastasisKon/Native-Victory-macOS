@@ -1012,8 +1012,3 @@ pub mod api {
         EXCEPTION_CONTINUE_SEARCH_DISPOSITION
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}

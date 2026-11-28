@@ -19,6 +19,7 @@ Two problems stop it, in this order:
    - In both runs that showed it, a Metal assertion came just before: "bytes_per_row >= used_bytes_per_row". It followed the first use of a compute shader refused for "a cross-lane operation between host waves in divergent code".
    - **Leading guess (not proven):** a refused shader's output buffer keeps its initial empty boxes, and the CPU reads it.
    - `VICTORY_TRACE_OWNERS=1` names who owns the memory, and `VICTORY_DUMP_REFUSED=<dir>` dumps the refused shaders.
+  - A dispatch dropped for want of a host pipeline now names the unordered-access textures it would have written (`uavs=` on the drop warning, `glue::first_drop_pipe`): those are the suspect buffers for a stale read, so the next run's log says which to watch rather than leaving it to guesswork.
    - **Ruled out:** linear root views (those shaders go through the page table), pool pages owned twice (fixed by #108; a pool audit finds 0 differences), and GPU command buffers that fail (their signals are now paid on the CPU).
 
 **Start here:** `crates/victory-gpu/src/native/shaders.rs`, `crates/victory-gpu/src/pipeline.rs`, `crates/victory-metal/src/gfx.rs`, and the run-game skill. `tools/macos/run-summary.sh <log>` shows how a run ended. `tools/macos/tester-report.sh` turns a log into a scrubbed attachment and a tester-report body.
@@ -42,9 +43,12 @@ Two problems stop it, in this order:
 
 Refused shaders drop their draws and dispatches. Unique refused shaders in the story load fell from 526 to about 150 on 27 November, and more fixes have landed since. Refusals now name their exact cause. The largest groups left:
 - a descriptor loaded from title memory at an address in a root constant (bindless; needs the host to map the address to a heap index);
-- a lane-mask join of an untracked mask (answered per wave by lockstep's paired form, `VICTORY_PAIRED_WAVES=1`: `split_wave_tests::a_lane_mask_join_read_as_data_answers_per_wave_in_the_paired_form`);
-- cross-lane operations and LDS shared between the two host waves of a console wave, inside real per-lane branches (needs if-conversion so both host waves always arrive);
+- a lane-mask join of an untracked mask - **answered per wave by lockstep's paired form** (`VICTORY_PAIRED_WAVES=1`; `split_wave_tests::a_lane_mask_join_read_as_data_answers_per_wave_in_the_paired_form`);
+- cross-lane operations and LDS shared between the two host waves of a console wave, inside real per-lane branches - **answered the same way** (no if-conversion needed): eleven GPU tests pin the console's per-wave answers for these shapes, listed on [#376](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/376);
+- a `vccz`/`vccnz` branch on a lane mask the halves can see differently - **answered by the strict structuriser** (`VICTORY_STRICT_VCCZ_BRANCH=1`, [#527](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/527));
 - a whole-wave section step the simulation does not follow.
+
+Both switches are off by default and change nothing the fast path already translates: where a program would be refused, the retry runs in lockstep instead. What decides their becoming the default is a measurement of the shaders a run kept, not an opinion: `victory translate --cache --compare-switches` (`warm::switch_delta`) translates each kept container both ways and reports what the switches recover, what they lose, and the refusal reasons of what stays refused, most common first. A flip is safe when "lost" is 0; the histogram says which refusal to take next.
 
 Fixed on 27 November: compute root constants, sized from the root signature's `Num32BitValues` (#114); `v_pk_fmac_f16` constants; wave64 lane-mask joins; `s_absdiff_i32`; signed BC6H; ExecuteIndirect with a count buffer. A batch on `fix/shader-refusals-2` also covers samplers built from constant bit masks, the thread-group info SGPR, and LDS behind uniform branches; it is being merged.
 

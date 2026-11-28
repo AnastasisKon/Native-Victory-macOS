@@ -1738,6 +1738,150 @@ pub extern "system" fn SetThreadStackGuarantee(guarantee: *mut u32) -> i32 {
     1
 }
 
+// shortcut: one error mode for the process. Windows keeps a thread mode beside the
+// process one; a title that sets one and reads the other sees one value here.
+static ERROR_MODE: AtomicU32 = AtomicU32::new(0);
+
+pub extern "system" fn GetErrorMode() -> u32 {
+    ERROR_MODE.load(Ordering::Relaxed)
+}
+
+pub extern "system" fn SetErrorMode(mode: u32) -> u32 {
+    ERROR_MODE.swap(mode, Ordering::Relaxed)
+}
+
+pub extern "system" fn SetThreadErrorMode(mode: u32, old: *mut u32) -> i32 {
+    let previous = ERROR_MODE.swap(mode, Ordering::Relaxed);
+    if !old.is_null() {
+        // SAFETY: the title's out word.
+        unsafe { old.write(previous) };
+    }
+    1
+}
+
+// shortcut: the priority class is remembered, not applied. Raising a process's own
+/// scheduling class on macOS is a privileged operation, and a title only reads back
+/// what it set (some print it in their crash logs).
+static PRIORITY_CLASS: AtomicU32 = AtomicU32::new(NORMAL_PRIORITY_CLASS);
+const IDLE_PRIORITY_CLASS: u32 = 0x40;
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x4000;
+const NORMAL_PRIORITY_CLASS: u32 = 0x20;
+const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x8000;
+const HIGH_PRIORITY_CLASS: u32 = 0x80;
+const REALTIME_PRIORITY_CLASS: u32 = 0x100;
+
+const PRIORITY_CLASSES: [u32; 6] = [
+    IDLE_PRIORITY_CLASS,
+    BELOW_NORMAL_PRIORITY_CLASS,
+    NORMAL_PRIORITY_CLASS,
+    ABOVE_NORMAL_PRIORITY_CLASS,
+    HIGH_PRIORITY_CLASS,
+    REALTIME_PRIORITY_CLASS,
+];
+
+/// `IMAGE_FILE_MACHINE_AMD64`: the machine whose code this host runs.
+const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+
+/// Whether `process` names this process: the pseudo handle is the only one a title
+/// can hold here, since no process handle is ever created.
+fn is_this_process(process: *mut c_void) -> bool {
+    process as isize == GetCurrentProcess()
+}
+
+pub extern "system" fn SetPriorityClass(process: *mut c_void, class: u32) -> i32 {
+    if !is_this_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if !PRIORITY_CLASSES.contains(&class) {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    PRIORITY_CLASS.store(class, Ordering::Relaxed);
+    1
+}
+
+pub extern "system" fn GetPriorityClass(process: *mut c_void) -> u32 {
+    if !is_this_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    PRIORITY_CLASS.load(Ordering::Relaxed)
+}
+
+/// `IsWow64Process2`: this process is the machine's own code, so it is not a 32-bit
+/// process under emulation. The native machine is reported as AMD64 because that is
+/// the machine whose code runs here: a title told otherwise takes paths (arm64
+/// binaries, different threading) that this host does not serve.
+pub extern "system" fn IsWow64Process2(
+    process: *mut c_void,
+    process_machine: *mut u16,
+    native_machine: *mut u16,
+) -> i32 {
+    if !is_this_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    // SAFETY: the title's out words, either of which it may leave null.
+    unsafe {
+        if !process_machine.is_null() {
+            process_machine.write(0);
+        }
+        if !native_machine.is_null() {
+            native_machine.write(IMAGE_FILE_MACHINE_AMD64);
+        }
+    }
+    1
+}
+
+/// `QueryFullProcessImageNameW`: the title image's path, in the caller's buffer with
+/// its NUL, and the length without it back in `size`. A buffer that is too small is
+/// `ERROR_INSUFFICIENT_BUFFER`, as Windows reports it, and is not filled.
+pub extern "system" fn QueryFullProcessImageNameW(
+    process: *mut c_void,
+    _flags: u32,
+    out: *mut u16,
+    size: *mut u32,
+) -> i32 {
+    if !is_this_process(process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if out.is_null() || size.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut name = vec![0u16; 4096];
+    let written =
+        crate::modules::kernel::GetModuleFileNameW(std::ptr::null_mut(), name.as_mut_ptr(), 4096)
+            as usize;
+    let path: Vec<u16> = if written > 0 {
+        name.truncate(written);
+        name
+    } else {
+        std::env::current_exe()
+            .map(|p| p.to_string_lossy().encode_utf16().collect())
+            .unwrap_or_default()
+    };
+    // SAFETY: the title's in/out size.
+    let capacity = unsafe { size.read() } as usize;
+    if path.is_empty() {
+        set_error(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
+    if path.len() + 1 > capacity {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    // SAFETY: a buffer of `capacity` units, which holds the path and its NUL.
+    unsafe {
+        std::ptr::copy_nonoverlapping(path.as_ptr(), out, path.len());
+        out.add(path.len()).write(0);
+        size.write(path.len() as u32);
+    }
+    1
+}
+
 pub extern "system" fn SetThreadIdealProcessorEx(
     _thread: *mut c_void,
     _ideal: *const u8,
@@ -4260,6 +4404,13 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             GetActiveProcessorCount,
             GetCurrentProcessorNumber,
             SetProcessPriorityBoost,
+            GetErrorMode,
+            SetErrorMode,
+            SetThreadErrorMode,
+            SetPriorityClass,
+            GetPriorityClass,
+            IsWow64Process2,
+            QueryFullProcessImageNameW,
             SetThreadIdealProcessorEx,
             GetThreadGroupAffinity,
             SetThreadGroupAffinity,
@@ -6461,6 +6612,100 @@ mod apartment_and_winrt_tests {
             ("api-ms-win-core-winrt-error-l1-1-0.dll", "SetRestrictedErrorInfo"),
         ] {
             assert!(lookup(dll, name).is_some(), "{dll}!{name} is not answered");
+        }
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    /// The error mode a title sets at startup is the one it and everything else in
+    /// the process reads back.
+    #[test]
+    fn the_error_mode_round_trips_and_reports_what_it_replaced() {
+        let original = GetErrorMode();
+        assert_eq!(SetErrorMode(0x1 | 0x2), original);
+        assert_eq!(GetErrorMode(), 0x1 | 0x2);
+        let mut replaced = 0u32;
+        assert_eq!(SetThreadErrorMode(0x8000, &mut replaced), 1);
+        assert_eq!(replaced, 0x1 | 0x2);
+        assert_eq!(GetErrorMode(), 0x8000);
+        // A caller that wants no old value passes no pointer.
+        assert_eq!(SetThreadErrorMode(original, std::ptr::null_mut()), 1);
+        assert_eq!(GetErrorMode(), original);
+    }
+
+    /// The priority class is the one the title set, an unknown class is refused, and
+    /// a handle that is not this process is not answered.
+    #[test]
+    fn the_priority_class_is_remembered_and_validated() {
+        let process = GetCurrentProcess() as usize as *mut c_void;
+        let original = GetPriorityClass(process);
+        assert!(PRIORITY_CLASSES.contains(&original));
+        assert_eq!(SetPriorityClass(process, ABOVE_NORMAL_PRIORITY_CLASS), 1);
+        assert_eq!(GetPriorityClass(process), ABOVE_NORMAL_PRIORITY_CLASS);
+        set_error(0);
+        assert_eq!(SetPriorityClass(process, 0x1234), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(GetPriorityClass(process), ABOVE_NORMAL_PRIORITY_CLASS);
+        assert_eq!(SetPriorityClass(process, original), 1);
+        assert_eq!(GetPriorityClass(0xdead as *mut c_void), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
+    }
+
+    /// The title is the machine's own code, not a 32-bit process under emulation,
+    /// and its image path comes back with its length in the caller's buffer.
+    #[test]
+    fn the_process_is_amd64_and_knows_where_its_image_is() {
+        let process = GetCurrentProcess() as usize as *mut c_void;
+        let (mut machine, mut native) = (0xFFFFu16, 0u16);
+        assert_eq!(IsWow64Process2(process, &mut machine, &mut native), 1);
+        assert_eq!((machine, native), (0, 0x8664));
+        assert_eq!(
+            IsWow64Process2(process, std::ptr::null_mut(), std::ptr::null_mut()),
+            1,
+            "both outputs are optional"
+        );
+        assert_eq!(
+            IsWow64Process2(0xdead as *mut c_void, &mut machine, &mut native),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
+
+        let mut buffer = [0u16; 4096];
+        let mut size = buffer.len() as u32;
+        assert_eq!(
+            QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size),
+            1
+        );
+        assert!(size > 0 && (size as usize) < buffer.len());
+        let text = String::from_utf16_lossy(&buffer[..size as usize]);
+        assert!(!text.is_empty(), "no image path");
+        assert_eq!(buffer[size as usize], 0, "the path is NUL-terminated");
+        assert_eq!(text.len(), size as usize, "the length excludes the NUL");
+
+        let mut small = [0u16; 2];
+        let mut too_small = 2u32;
+        set_error(0);
+        assert_eq!(
+            QueryFullProcessImageNameW(process, 0, small.as_mut_ptr(), &mut too_small),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+
+        for dll in ["kernel32.dll", "api-ms-win-core-processthreads-l1-1-0.dll"] {
+            for name in [
+                "GetErrorMode",
+                "SetErrorMode",
+                "SetThreadErrorMode",
+                "SetPriorityClass",
+                "GetPriorityClass",
+                "IsWow64Process2",
+                "QueryFullProcessImageNameW",
+            ] {
+                assert!(super::super::lookup(dll, name).is_some(), "{dll}!{name}");
+            }
         }
     }
 }
